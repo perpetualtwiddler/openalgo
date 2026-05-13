@@ -41,7 +41,7 @@ UNDERLYING = os.getenv("UNDERLYING", "NIFTY")
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NFO"))
 INDEX_EXCHANGE = os.getenv("INDEX_EXCHANGE", "NSE_INDEX")
 LOT_SIZE = int(os.getenv("LOT_SIZE", "65"))
-LOTS = int(os.getenv("LOTS", "9"))
+LOTS = int(os.getenv("LOTS", "4"))
 QUANTITY = LOT_SIZE * LOTS
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
@@ -365,7 +365,11 @@ class ShortStraddleBot:
             pe_gone = self.pe_symbol and self.pe_symbol not in held_symbols
 
             if ce_gone and pe_gone:
-                print(f"\n[SYNC] Both legs gone (manual exit?) — resetting")
+                now = datetime.now()
+                near_squareoff = (now.hour > SQUAREOFF_HOUR or
+                                  (now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE - 2))
+                reason = "EOD auto square-off" if near_squareoff else "manual exit?"
+                print(f"\n[SYNC] Both legs gone ({reason}) — resetting")
                 self.is_positioned = False
                 self.ce_symbol = None
                 self.pe_symbol = None
