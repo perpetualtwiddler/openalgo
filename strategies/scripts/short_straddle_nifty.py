@@ -22,7 +22,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openalgo import api
@@ -45,13 +45,22 @@ LOTS = int(os.getenv("LOTS", "4"))
 QUANTITY = LOT_SIZE * LOTS
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
+# Trend filter — skip if opening range breakout signals a trend day
+SKIP_TREND_DAY = os.getenv("SKIP_TREND_DAY", "true").lower() == "true"
+ORB_MINUTES = int(os.getenv("ORB_MINUTES", "15"))
+ORB_BREAKOUT_PCT = float(os.getenv("ORB_BREAKOUT_PCT", "0.5"))
+
+# Gap-open filter — skip if index gaps > threshold from previous close
+SKIP_GAP_OPEN = os.getenv("SKIP_GAP_OPEN", "true").lower() == "true"
+GAP_THRESHOLD_PCT = float(os.getenv("GAP_THRESHOLD_PCT", "1.0"))
+
 # OTM hedge — converts naked straddle to iron butterfly
 ENABLE_HEDGE = os.getenv("ENABLE_HEDGE", "true").lower() == "true"
 HEDGE_OFFSET = os.getenv("HEDGE_OFFSET", "OTM4")
 
 # Entry time (HH:MM in IST)
 ENTRY_HOUR = int(os.getenv("ENTRY_HOUR", "9"))
-ENTRY_MINUTE = int(os.getenv("ENTRY_MINUTE", "20"))
+ENTRY_MINUTE = int(os.getenv("ENTRY_MINUTE", "35"))
 
 # VIX threshold — skip entry if India VIX > this value
 VIX_THRESHOLD = float(os.getenv("VIX_THRESHOLD", "25.0"))
@@ -67,7 +76,10 @@ EVENT_CALENDAR_FILE = Path(os.getenv("EVENT_CALENDAR_FILE",
 
 # P&L targets (as % of total premium collected)
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "60"))    # exit at 60% profit
-STOPLOSS_PCT = float(os.getenv("STOPLOSS_PCT", "60"))            # exit at 100% loss
+STOPLOSS_PCT = float(os.getenv("STOPLOSS_PCT", "50"))            # exit at 50% loss
+
+# Consecutive SL cooldown — skip entry after N consecutive SL days
+CONSECUTIVE_SL_LIMIT = int(os.getenv("CONSECUTIVE_SL_LIMIT", "2"))
 
 # Square-off time
 SQUAREOFF_HOUR = int(os.getenv("SQUAREOFF_HOUR", "15"))
@@ -80,6 +92,7 @@ STRATEGY_NAME = os.getenv("STRATEGY_NAME", "SHORT_STRADDLE_NIFTY")
 
 STATE_DIR = Path(os.getenv("STATE_DIR", "/root/data/openalgo/strategies/state"))
 STATE_FILE = STATE_DIR / f"{STRATEGY_NAME}_state.json"
+HISTORY_FILE = STATE_DIR / f"{STRATEGY_NAME}_history.json"
 
 
 # =============================================================================
@@ -187,6 +200,46 @@ class ShortStraddleBot:
             print(f"[STATE ERROR] Clear failed: {e}")
 
     # -------------------------------------------------------------------------
+    # Trade history — tracks exit reasons across days
+    # -------------------------------------------------------------------------
+
+    def record_trade(self, reason, pnl):
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            history = []
+            if HISTORY_FILE.exists():
+                history = json.loads(HISTORY_FILE.read_text())
+            history.append({
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "reason": reason,
+                "pnl": round(pnl, 2),
+            })
+            history = history[-30:]
+            HISTORY_FILE.write_text(json.dumps(history))
+        except Exception as e:
+            print(f"[HISTORY ERROR] {e}")
+
+    def check_consecutive_sl(self):
+        if CONSECUTIVE_SL_LIMIT <= 0:
+            return False
+        try:
+            if not HISTORY_FILE.exists():
+                return False
+            history = json.loads(HISTORY_FILE.read_text())
+            recent = history[-CONSECUTIVE_SL_LIMIT:]
+            if len(recent) < CONSECUTIVE_SL_LIMIT:
+                return False
+            all_sl = all(t.get("reason") == "STOPLOSS" for t in recent)
+            if all_sl:
+                dates = [t.get("date") for t in recent]
+                print(f"[COOLDOWN] Last {CONSECUTIVE_SL_LIMIT} trades were SL hits ({dates}) — skipping today")
+                return True
+            return False
+        except Exception as e:
+            print(f"[COOLDOWN ERROR] {e}")
+            return False
+
+    # -------------------------------------------------------------------------
     # VIX Check
     # -------------------------------------------------------------------------
 
@@ -255,6 +308,82 @@ class ShortStraddleBot:
             return False
         except Exception as e:
             print(f"[EVENT CHECK ERROR] {e} — proceeding with caution")
+            return False
+
+    # -------------------------------------------------------------------------
+    # Gap-open check
+    # -------------------------------------------------------------------------
+
+    def check_gap_open(self):
+        if not SKIP_GAP_OPEN:
+            return False
+        try:
+            resp = self.client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
+            if resp.get("status") != "success":
+                print(f"[GAP] Could not fetch quote: {resp} — proceeding")
+                return False
+            data = resp.get("data", {})
+            ltp = float(data.get("ltp", 0))
+            prev_close = float(data.get("close", 0) or data.get("prev_close", 0))
+            if prev_close <= 0:
+                print("[GAP] Previous close not available — proceeding")
+                return False
+            gap_pct = abs(ltp - prev_close) / prev_close * 100
+            direction = "UP" if ltp > prev_close else "DOWN"
+            print(f"[GAP] {UNDERLYING}: {prev_close:.2f} → {ltp:.2f} ({direction} {gap_pct:.2f}%) | Threshold: {GAP_THRESHOLD_PCT}%")
+            if gap_pct >= GAP_THRESHOLD_PCT:
+                print(f"[GAP] Gap {gap_pct:.2f}% exceeds {GAP_THRESHOLD_PCT}% — skipping straddle")
+                return True
+            return False
+        except Exception as e:
+            print(f"[GAP CHECK ERROR] {e} — proceeding with caution")
+            return False
+
+    # -------------------------------------------------------------------------
+    # Trend filter — Opening Range Breakout
+    # -------------------------------------------------------------------------
+
+    def check_trend(self):
+        if not SKIP_TREND_DAY:
+            return False
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            data = self.client.history(
+                symbol=UNDERLYING, exchange=INDEX_EXCHANGE, interval="5m",
+                start_date=today, end_date=today,
+            )
+            if data is None or len(data) < 2:
+                print("[TREND] Not enough intraday data — proceeding")
+                return False
+
+            orb_end = datetime.now().replace(hour=9, minute=15 + ORB_MINUTES, second=0)
+            orb_candles = data[data.index <= orb_end] if hasattr(data.index, 'hour') else data.head(ORB_MINUTES // 5)
+
+            if len(orb_candles) < 1:
+                print("[TREND] No ORB candles found — proceeding")
+                return False
+
+            orb_high = float(orb_candles["high"].max())
+            orb_low = float(orb_candles["low"].min())
+            orb_range = orb_high - orb_low
+            orb_mid = (orb_high + orb_low) / 2
+
+            current_price = float(data.iloc[-1]["close"])
+
+            breakout_up = (current_price - orb_high) / orb_mid * 100 if current_price > orb_high else 0
+            breakout_down = (orb_low - current_price) / orb_mid * 100 if current_price < orb_low else 0
+            breakout_pct = max(breakout_up, breakout_down)
+
+            status = "ABOVE" if breakout_up > 0 else "BELOW" if breakout_down > 0 else "INSIDE"
+            print(f"[TREND] ORB({ORB_MINUTES}m): {orb_low:.2f} — {orb_high:.2f} (range {orb_range:.0f}pts)")
+            print(f"[TREND] Price: {current_price:.2f} | {status} range | Breakout: {breakout_pct:.2f}% | Threshold: {ORB_BREAKOUT_PCT}%")
+
+            if breakout_pct >= ORB_BREAKOUT_PCT:
+                print(f"[TREND] ORB breakout {breakout_pct:.2f}% — trend day likely, skipping straddle")
+                return True
+            return False
+        except Exception as e:
+            print(f"[TREND CHECK ERROR] {e} — proceeding with caution")
             return False
 
     # -------------------------------------------------------------------------
@@ -518,11 +647,12 @@ class ShortStraddleBot:
                 print(f"\n[TARGET] Profit {pnl_pct:.1f}% >= {PROFIT_TARGET_PCT}% — closing straddle")
                 threading.Thread(target=self.close_straddle, args=("PROFIT_TARGET",), daemon=True).start()
 
-            # Stop-loss hit
+            # Stop-loss hit (% of premium)
             elif pnl_pct <= -STOPLOSS_PCT and not self.exit_in_progress:
                 self.exit_in_progress = True
                 print(f"\n[STOPLOSS] Loss {pnl_pct:.1f}% exceeds -{STOPLOSS_PCT}% — closing straddle")
                 threading.Thread(target=self.close_straddle, args=("STOPLOSS",), daemon=True).start()
+
 
             time.sleep(PNL_CHECK_INTERVAL)
 
@@ -605,6 +735,7 @@ class ShortStraddleBot:
         self.hedge_ce_symbol = None
         self.hedge_pe_symbol = None
         self.exit_in_progress = False
+        self.record_trade(reason, total_pnl)
         self.clear_state()
 
     # -------------------------------------------------------------------------
@@ -640,12 +771,18 @@ class ShortStraddleBot:
 
                     self.entry_done_today = True
 
-                    if self.is_expiry_day():
+                    if self.check_consecutive_sl():
+                        print("[SKIP] Consecutive SL cooldown — no trade today")
+                    elif self.is_expiry_day():
                         print("[SKIP] Expiry day — no trade today")
                     elif self.is_event_day():
                         print("[SKIP] Event day — no trade today")
+                    elif self.check_gap_open():
+                        print("[SKIP] Gap open too large — no trade today")
                     elif not self.check_vix():
                         print("[SKIP] VIX too high — no trade today")
+                    elif self.check_trend():
+                        print("[SKIP] Trend day (ORB breakout) — no trade today")
                     else:
                         self.place_straddle()
 
