@@ -56,6 +56,11 @@ SKIP_VIX_CHECK = os.getenv("SKIP_VIX_CHECK", "false").lower() == "true"
 # Skip trading on expiry day (gamma risk)
 SKIP_EXPIRY_DAY = os.getenv("SKIP_EXPIRY_DAY", "true").lower() == "true"
 
+# Skip trading on high-volatility event days (RBI, FOMC, CPI, etc.)
+SKIP_EVENT_DAYS = os.getenv("SKIP_EVENT_DAYS", "true").lower() == "true"
+EVENT_CALENDAR_FILE = Path(os.getenv("EVENT_CALENDAR_FILE",
+    str(Path(__file__).parent / "event_calendar.json")))
+
 # P&L targets (as % of total premium collected)
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "60"))    # exit at 60% profit
 STOPLOSS_PCT = float(os.getenv("STOPLOSS_PCT", "60"))            # exit at 100% loss
@@ -207,6 +212,29 @@ class ShortStraddleBot:
             return False
         except Exception as e:
             print(f"[EXPIRY CHECK ERROR] {e} — proceeding with caution")
+            return False
+
+    # -------------------------------------------------------------------------
+    # Event calendar check
+    # -------------------------------------------------------------------------
+
+    def is_event_day(self):
+        if not SKIP_EVENT_DAYS:
+            return False
+        try:
+            if not EVENT_CALENDAR_FILE.exists():
+                print(f"[EVENT] Calendar not found: {EVENT_CALENDAR_FILE}")
+                return False
+            cal = json.loads(EVENT_CALENDAR_FILE.read_text())
+            today = datetime.now().strftime("%Y-%m-%d")
+            for entry in cal.get("events", []):
+                if entry.get("date") == today:
+                    print(f"[EVENT] Today is a high-volatility event day: {entry.get('event')} — skipping straddle")
+                    return True
+            print(f"[EVENT] No events today ({today}) — proceeding")
+            return False
+        except Exception as e:
+            print(f"[EVENT CHECK ERROR] {e} — proceeding with caution")
             return False
 
     # -------------------------------------------------------------------------
@@ -544,6 +572,8 @@ class ShortStraddleBot:
 
                     if self.is_expiry_day():
                         print("[SKIP] Expiry day — no trade today")
+                    elif self.is_event_day():
+                        print("[SKIP] Event day — no trade today")
                     elif not self.check_vix():
                         print("[SKIP] VIX too high — no trade today")
                     else:

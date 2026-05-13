@@ -1,0 +1,21 @@
+{
+  "description": "High-volatility event days — short straddle skips entry on these dates",
+  "events": [
+    {"date": "2026-06-05", "event": "RBI MPC announcement"},
+    {"date": "2026-06-10", "event": "US CPI release"},
+    {"date": "2026-06-17", "event": "FOMC rate decision"},
+    {"date": "2026-07-14", "event": "US CPI release"},
+    {"date": "2026-07-29", "event": "FOMC rate decision"},
+    {"date": "2026-08-05", "event": "RBI MPC announcement"},
+    {"date": "2026-08-12", "event": "US CPI release"},
+    {"date": "2026-09-11", "event": "US CPI release"},
+    {"date": "2026-09-16", "event": "FOMC rate decision"},
+    {"date": "2026-10-07", "event": "RBI MPC announcement"},
+    {"date": "2026-10-14", "event": "US CPI release"},
+    {"date": "2026-10-28", "event": "FOMC rate decision"},
+    {"date": "2026-11-10", "event": "US CPI release"},
+    {"date": "2026-12-04", "event": "RBI MPC announcement"},
+    {"date": "2026-12-09", "event": "FOMC rate decision"},
+    {"date": "2026-12-10", "event": "US CPI release"}
+  ]
+}
