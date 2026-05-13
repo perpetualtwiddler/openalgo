@@ -45,6 +45,10 @@ LOTS = int(os.getenv("LOTS", "4"))
 QUANTITY = LOT_SIZE * LOTS
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
+# OTM hedge — converts naked straddle to iron butterfly
+ENABLE_HEDGE = os.getenv("ENABLE_HEDGE", "true").lower() == "true"
+HEDGE_OFFSET = os.getenv("HEDGE_OFFSET", "OTM4")
+
 # Entry time (HH:MM in IST)
 ENTRY_HOUR = int(os.getenv("ENTRY_HOUR", "9"))
 ENTRY_MINUTE = int(os.getenv("ENTRY_MINUTE", "20"))
@@ -96,6 +100,12 @@ class ShortStraddleBot:
         self.pe_entry_price = 0.0
         self.total_premium = 0.0
 
+        # Hedge leg state (iron butterfly)
+        self.hedge_ce_symbol = None
+        self.hedge_pe_symbol = None
+        self.hedge_ce_price = 0.0
+        self.hedge_pe_price = 0.0
+
         # Real-time LTP tracking
         self.ce_ltp = 0.0
         self.pe_ltp = 0.0
@@ -105,9 +115,11 @@ class ShortStraddleBot:
         self.load_state()
 
         print(f"[INIT] {STRATEGY_NAME}")
-        print(f"[INIT] {UNDERLYING} ATM Straddle | {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty")
+        mode = "Iron Butterfly" if ENABLE_HEDGE else "ATM Straddle"
+        print(f"[INIT] {UNDERLYING} {mode} | {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty")
         print(f"[INIT] Entry: {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} IST | Exit: {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d} IST")
         print(f"[INIT] VIX threshold: {'disabled' if SKIP_VIX_CHECK else f'< {VIX_THRESHOLD}'}")
+        print(f"[INIT] Hedge: {'ON — ' + HEDGE_OFFSET + ' wings (iron butterfly)' if ENABLE_HEDGE else 'OFF (naked straddle)'}")
         print(f"[INIT] Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
         print(f"[INIT] Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
         if self.is_positioned:
@@ -129,6 +141,10 @@ class ShortStraddleBot:
                 "pe_entry_price": self.pe_entry_price,
                 "total_premium": self.total_premium,
                 "entry_done_today": self.entry_done_today,
+                "hedge_ce_symbol": self.hedge_ce_symbol,
+                "hedge_pe_symbol": self.hedge_pe_symbol,
+                "hedge_ce_price": self.hedge_ce_price,
+                "hedge_pe_price": self.hedge_pe_price,
             }
             STATE_FILE.write_text(json.dumps(state))
             print(f"[STATE] Saved: positioned={self.is_positioned}")
@@ -151,6 +167,10 @@ class ShortStraddleBot:
             self.pe_entry_price = state.get("pe_entry_price", 0.0)
             self.total_premium = state.get("total_premium", 0.0)
             self.entry_done_today = state.get("entry_done_today", False)
+            self.hedge_ce_symbol = state.get("hedge_ce_symbol")
+            self.hedge_pe_symbol = state.get("hedge_pe_symbol")
+            self.hedge_ce_price = state.get("hedge_ce_price", 0.0)
+            self.hedge_pe_price = state.get("hedge_pe_price", 0.0)
             if self.ce_entry_price > 0:
                 self.ce_ltp = self.ce_entry_price
             if self.pe_entry_price > 0:
@@ -275,7 +295,22 @@ class ShortStraddleBot:
             print(f"[ENTRY ERROR] Spot fetch: {e}")
             return False
 
-        print(f"[ENTRY] Placing ATM short straddle — expiry {expiry}, qty {QUANTITY}")
+        mode = "iron butterfly" if ENABLE_HEDGE else "short straddle"
+        print(f"[ENTRY] Placing ATM {mode} — expiry {expiry}, qty {QUANTITY}")
+
+        legs = [
+            {"offset": "ATM", "option_type": "CE", "action": "SELL",
+             "quantity": QUANTITY, "product": PRODUCT},
+            {"offset": "ATM", "option_type": "PE", "action": "SELL",
+             "quantity": QUANTITY, "product": PRODUCT},
+        ]
+        if ENABLE_HEDGE:
+            legs.extend([
+                {"offset": HEDGE_OFFSET, "option_type": "CE", "action": "BUY",
+                 "quantity": QUANTITY, "product": PRODUCT},
+                {"offset": HEDGE_OFFSET, "option_type": "PE", "action": "BUY",
+                 "quantity": QUANTITY, "product": PRODUCT},
+            ])
 
         try:
             resp = self.client.optionsmultiorder(
@@ -283,22 +318,7 @@ class ShortStraddleBot:
                 underlying=UNDERLYING,
                 exchange=INDEX_EXCHANGE,
                 expiry_date=expiry,
-                legs=[
-                    {
-                        "offset": "ATM",
-                        "option_type": "CE",
-                        "action": "SELL",
-                        "quantity": QUANTITY,
-                        "product": PRODUCT,
-                    },
-                    {
-                        "offset": "ATM",
-                        "option_type": "PE",
-                        "action": "SELL",
-                        "quantity": QUANTITY,
-                        "product": PRODUCT,
-                    },
-                ],
+                legs=legs,
             )
 
             print(f"[ENTRY] Response: {resp}")
@@ -308,18 +328,29 @@ class ShortStraddleBot:
                 return False
 
             results = resp.get("results", [])
-            if len(results) < 2:
-                print(f"[ENTRY] Unexpected response: {resp}")
+            expected_legs = 4 if ENABLE_HEDGE else 2
+            if len(results) < expected_legs:
+                print(f"[ENTRY] Unexpected response (expected {expected_legs} legs): {resp}")
                 return False
 
-            # Match results by option_type since order may be rearranged
-            ce_result = next((r for r in results if r.get("option_type") == "CE"), results[0])
-            pe_result = next((r for r in results if r.get("option_type") == "PE"), results[1])
+            # Match SELL results by option_type
+            sell_results = [r for r in results if r.get("action") == "SELL"]
+            ce_result = next((r for r in sell_results if r.get("option_type") == "CE"), sell_results[0])
+            pe_result = next((r for r in sell_results if r.get("option_type") == "PE"), sell_results[1])
             self.ce_symbol = ce_result.get("symbol")
             self.pe_symbol = pe_result.get("symbol")
 
-            print(f"[ENTRY] CE: {self.ce_symbol} | Order: {ce_result.get('orderid')}")
-            print(f"[ENTRY] PE: {self.pe_symbol} | Order: {pe_result.get('orderid')}")
+            print(f"[ENTRY] CE SELL: {self.ce_symbol} | Order: {ce_result.get('orderid')}")
+            print(f"[ENTRY] PE SELL: {self.pe_symbol} | Order: {pe_result.get('orderid')}")
+
+            if ENABLE_HEDGE:
+                buy_results = [r for r in results if r.get("action") == "BUY"]
+                hedge_ce = next((r for r in buy_results if r.get("option_type") == "CE"), buy_results[0])
+                hedge_pe = next((r for r in buy_results if r.get("option_type") == "PE"), buy_results[1])
+                self.hedge_ce_symbol = hedge_ce.get("symbol")
+                self.hedge_pe_symbol = hedge_pe.get("symbol")
+                print(f"[HEDGE] CE BUY:  {self.hedge_ce_symbol} | Order: {hedge_ce.get('orderid')}")
+                print(f"[HEDGE] PE BUY:  {self.hedge_pe_symbol} | Order: {hedge_pe.get('orderid')}")
 
             time.sleep(3)
 
@@ -329,17 +360,32 @@ class ShortStraddleBot:
             if ce_price and pe_price:
                 self.ce_entry_price = ce_price
                 self.pe_entry_price = pe_price
-                self.total_premium = (ce_price + pe_price) * QUANTITY
+                gross_premium = (ce_price + pe_price) * QUANTITY
+
+                hedge_cost = 0.0
+                if ENABLE_HEDGE:
+                    hce_price = self._get_fill_price(hedge_ce.get("orderid"))
+                    hpe_price = self._get_fill_price(hedge_pe.get("orderid"))
+                    self.hedge_ce_price = hce_price or 0.0
+                    self.hedge_pe_price = hpe_price or 0.0
+                    hedge_cost = (self.hedge_ce_price + self.hedge_pe_price) * QUANTITY
+
+                self.total_premium = gross_premium - hedge_cost
                 self.is_positioned = True
                 self.ce_ltp = ce_price
                 self.pe_ltp = pe_price
 
                 print("=" * 65)
-                print("  STRADDLE POSITIONED")
+                mode = "IRON BUTTERFLY" if ENABLE_HEDGE else "STRADDLE"
+                print(f"  {mode} POSITIONED")
                 print("=" * 65)
-                print(f"  CE: {self.ce_symbol} SELL @ {ce_price:.2f}")
-                print(f"  PE: {self.pe_symbol} SELL @ {pe_price:.2f}")
-                print(f"  Total premium collected: {self.total_premium:.0f}")
+                print(f"  CE SELL: {self.ce_symbol} @ {ce_price:.2f}")
+                print(f"  PE SELL: {self.pe_symbol} @ {pe_price:.2f}")
+                if ENABLE_HEDGE:
+                    print(f"  CE BUY:  {self.hedge_ce_symbol} @ {self.hedge_ce_price:.2f}")
+                    print(f"  PE BUY:  {self.hedge_pe_symbol} @ {self.hedge_pe_price:.2f}")
+                    print(f"  Gross premium: {gross_premium:.0f} | Hedge cost: {hedge_cost:.0f}")
+                print(f"  Net premium collected: {self.total_premium:.0f}")
                 print(f"  Profit target ({PROFIT_TARGET_PCT}%): +{self.total_premium * PROFIT_TARGET_PCT / 100:.0f}")
                 print(f"  Stop-loss ({STOPLOSS_PCT}%): -{self.total_premium * STOPLOSS_PCT / 100:.0f}")
                 print("=" * 65)
@@ -401,6 +447,8 @@ class ShortStraddleBot:
                 self.is_positioned = False
                 self.ce_symbol = None
                 self.pe_symbol = None
+                self.hedge_ce_symbol = None
+                self.hedge_pe_symbol = None
                 self.exit_in_progress = False
                 self.clear_state()
         except Exception as e:
@@ -487,7 +535,8 @@ class ShortStraddleBot:
             self.exit_in_progress = False
             return
 
-        print(f"\n[EXIT] Closing straddle — reason: {reason}")
+        mode = "iron butterfly" if ENABLE_HEDGE else "straddle"
+        print(f"\n[EXIT] Closing {mode} — reason: {reason}")
 
         ce_exit = pe_exit = None
 
@@ -519,13 +568,29 @@ class ShortStraddleBot:
             except Exception as e:
                 print(f"[EXIT PE ERROR] {e}")
 
+        if ENABLE_HEDGE:
+            for sym, label in [(self.hedge_ce_symbol, "HEDGE CE"), (self.hedge_pe_symbol, "HEDGE PE")]:
+                if sym:
+                    try:
+                        resp = self.client.placeorder(
+                            strategy=STRATEGY_NAME, symbol=sym, exchange="NFO",
+                            action="SELL", quantity=QUANTITY, price_type="MARKET", product=PRODUCT,
+                        )
+                        if resp.get("status") == "success":
+                            hprice = self._get_fill_price(resp.get("orderid"))
+                            print(f"[EXIT] {label} closed: {sym} @ {hprice or 'pending'}")
+                        else:
+                            print(f"[EXIT {label} FAILED] {resp}")
+                    except Exception as e:
+                        print(f"[EXIT {label} ERROR] {e}")
+
         ce_pnl = (self.ce_entry_price - (ce_exit or self.ce_ltp)) * QUANTITY
         pe_pnl = (self.pe_entry_price - (pe_exit or self.pe_ltp)) * QUANTITY
         total_pnl = ce_pnl + pe_pnl
         sign = "+" if total_pnl > 0 else ""
 
         print("=" * 65)
-        print("  STRADDLE CLOSED")
+        print(f"  {mode.upper()} CLOSED")
         print("=" * 65)
         print(f"  Reason: {reason}")
         print(f"  CE: sold @ {self.ce_entry_price:.2f}, bought @ {ce_exit or self.ce_ltp:.2f} -> {'+' if ce_pnl > 0 else ''}{ce_pnl:.0f}")
@@ -537,6 +602,8 @@ class ShortStraddleBot:
         self.is_positioned = False
         self.ce_symbol = None
         self.pe_symbol = None
+        self.hedge_ce_symbol = None
+        self.hedge_pe_symbol = None
         self.exit_in_progress = False
         self.clear_state()
 
@@ -546,8 +613,11 @@ class ShortStraddleBot:
 
     def run(self):
         print("=" * 65)
-        print(f"  9:20 AM SHORT STRADDLE — {UNDERLYING}")
+        mode = "IRON BUTTERFLY" if ENABLE_HEDGE else "SHORT STRADDLE"
+        print(f"  9:20 AM {mode} — {UNDERLYING}")
         print(f"  {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty | Product: {PRODUCT}")
+        if ENABLE_HEDGE:
+            print(f"  Hedge: {HEDGE_OFFSET} wings (capped max loss)")
         print(f"  VIX threshold: {'disabled' if SKIP_VIX_CHECK else f'< {VIX_THRESHOLD}'}")
         print(f"  Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
         print(f"  Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
