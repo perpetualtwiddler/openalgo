@@ -356,8 +356,7 @@ class ShortStraddleBot:
                 print("[TREND] Not enough intraday data — proceeding")
                 return False
 
-            orb_end = datetime.now().replace(hour=9, minute=15 + ORB_MINUTES, second=0)
-            orb_candles = data[data.index <= orb_end] if hasattr(data.index, 'hour') else data.head(ORB_MINUTES // 5)
+            orb_candles = data.head(ORB_MINUTES // 5)
 
             if len(orb_candles) < 1:
                 print("[TREND] No ORB candles found — proceeding")
