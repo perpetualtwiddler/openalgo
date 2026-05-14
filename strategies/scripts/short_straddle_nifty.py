@@ -56,7 +56,7 @@ GAP_THRESHOLD_PCT = float(os.getenv("GAP_THRESHOLD_PCT", "1.0"))
 
 # OTM hedge — converts naked straddle to iron butterfly
 ENABLE_HEDGE = os.getenv("ENABLE_HEDGE", "true").lower() == "true"
-HEDGE_OFFSET = os.getenv("HEDGE_OFFSET", "OTM4")
+HEDGE_OFFSET = os.getenv("HEDGE_OFFSET", "OTM8")
 
 # Entry time (HH:MM in IST)
 ENTRY_HOUR = int(os.getenv("ENTRY_HOUR", "9"))
@@ -75,7 +75,7 @@ EVENT_CALENDAR_FILE = Path(os.getenv("EVENT_CALENDAR_FILE",
     str(Path(__file__).parent / "event_calendar.json")))
 
 # P&L targets (as % of total premium collected)
-PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "60"))    # exit at 60% profit
+PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "25"))    # exit at 25% profit
 STOPLOSS_PCT = float(os.getenv("STOPLOSS_PCT", "50"))            # exit at 50% loss
 
 # Consecutive SL cooldown — skip entry after N consecutive SL days

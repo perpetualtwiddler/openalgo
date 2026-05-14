@@ -13,16 +13,16 @@
 
 ### Structure
 - **SELL** ATM CE + ATM PE (collect premium)
-- **BUY** OTM4 CE + OTM4 PE (~200 points out, cap max loss)
+- **BUY** OTM8 CE + OTM8 PE (~400 points out, cap max loss)
 - Product: MIS (intraday), auto square-off before deadline
 
 ### Position Sizing
 | Parameter | Value |
 |-----------|-------|
 | Lot size | 65 |
-| Lots | 4 |
-| Quantity | 260 per leg |
-| Estimated margin | ~52,000-70,000 INR |
+| Lots | 3 |
+| Quantity | 195 per leg |
+| Estimated margin | ~40,000-55,000 INR |
 
 ### Entry Rules
 Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All checks must pass in order:
@@ -39,13 +39,13 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 ### Exit Rules
 | Trigger | Threshold | Action |
 |---------|-----------|--------|
-| Profit target | +60% of net premium | Close all 4 legs |
+| Profit target | +25% of net premium | Close all 4 legs |
 | Stop-loss | -50% of net premium | Close all 4 legs |
 | EOD square-off | 15:15 IST | Close all 4 legs |
 | Position sync | Every 5 seconds | Detect manual/system exits |
 
 ### Safety Features
-- **Iron butterfly hedge:** OTM4 wings cap maximum loss to spread width minus net premium
+- **Iron butterfly hedge:** OTM8 wings (~400pts) cap maximum loss; wider wings retain more theta profit on calm days
 - **Event calendar:** `event_calendar.json` with 16 confirmed high-volatility dates (Jun–Dec 2026) covering RBI MPC, FOMC, US CPI
 - **Consecutive SL cooldown:** Pauses after 2 straight stop-loss days
 - **Trade history:** Last 30 trades recorded in `_history.json` for cooldown logic
@@ -133,6 +133,24 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 | May 11 | +2,798 (1 lot debug) | No trade | Debug mode test |
 | May 12 | -52,065 (9 lots, SL hit) | No trade | Expiry day, PE exploded |
 | May 13 | +4,621 (9 lots) | No trade | Recovered from -15k dip |
+| May 14 | +39 (4 lots, OTM4) | No trade (insufficient funds) | Flat day, hedge ate 96% of profit; EMA crossover blocked by margin |
+
+---
+
+## Changelog
+
+### May 14 — Hedge width & profit target tuning
+
+**Problem:** OTM4 hedge wings (200 points) cost 58% of gross premium. On calm days, hedge theta decay nearly matches short leg decay, wiping out profits. May 14 backtest showed naked straddle earned +5,265 but iron butterfly only +195 (hedge absorbed 96%).
+
+**Changes:**
+| Setting | Before | After | Rationale |
+|---------|--------|-------|-----------|
+| Hedge offset | OTM4 (200pts) | OTM8 (400pts) | Reduces hedge cost from 58% to 31% of gross; retains more theta profit |
+| Profit target | 60% of net premium | 25% of net premium | 60% almost never hit intraday; 25% is realistic theta capture |
+| Lots | 4 | 3 | Free margin for EMA crossover (4 lots used ~2L, blocking BNKF futures) |
+
+**Trade-off:** OTM8 has higher max loss (~400pts spread vs 200pts) but significantly better daily P&L on range-bound days. Stop-loss at 50% still caps adverse moves.
 
 ---
 
