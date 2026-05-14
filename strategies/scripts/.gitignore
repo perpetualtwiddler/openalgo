@@ -4,6 +4,19 @@
 # But keep this .gitignore file
 !.gitignore
 
+# Keep our strategy and tooling scripts
+!short_straddle_nifty.py
+!ema_crossover_banknifty.py
+!capture_trade_data.py
+!backtest_offline.py
+!backtest_straddle_today.py
+!analyze_hedge_cost.py
+!sim_ema_today.py
+!test_straddle_filters.py
+
+# Keep docs
+!STRATEGIES.md
+
 # Ignore log files if any
 *.log
 
