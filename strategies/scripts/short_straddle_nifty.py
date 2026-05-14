@@ -41,7 +41,7 @@ UNDERLYING = os.getenv("UNDERLYING", "NIFTY")
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NFO"))
 INDEX_EXCHANGE = os.getenv("INDEX_EXCHANGE", "NSE_INDEX")
 LOT_SIZE = int(os.getenv("LOT_SIZE", "65"))
-LOTS = int(os.getenv("LOTS", "4"))
+LOTS = int(os.getenv("LOTS", "3"))
 QUANTITY = LOT_SIZE * LOTS
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
