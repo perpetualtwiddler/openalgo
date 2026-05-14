@@ -122,6 +122,8 @@ class ShortStraddleBot:
         # Real-time LTP tracking
         self.ce_ltp = 0.0
         self.pe_ltp = 0.0
+        self.hedge_ce_ltp = 0.0
+        self.hedge_pe_ltp = 0.0
         self.exit_in_progress = False
         self.entry_done_today = False
 
@@ -188,6 +190,10 @@ class ShortStraddleBot:
                 self.ce_ltp = self.ce_entry_price
             if self.pe_entry_price > 0:
                 self.pe_ltp = self.pe_entry_price
+            if self.hedge_ce_price > 0:
+                self.hedge_ce_ltp = self.hedge_ce_price
+            if self.hedge_pe_price > 0:
+                self.hedge_pe_ltp = self.hedge_pe_price
         except Exception as e:
             print(f"[STATE ERROR] Load failed: {e}")
 
@@ -619,24 +625,42 @@ class ShortStraddleBot:
                     pe_quote = self.client.quotes(symbol=self.pe_symbol, exchange="NFO")
                     if pe_quote.get("status") == "success":
                         self.pe_ltp = float(pe_quote["data"].get("ltp", self.pe_ltp))
+
+                if ENABLE_HEDGE:
+                    if self.hedge_ce_symbol:
+                        hce_quote = self.client.quotes(symbol=self.hedge_ce_symbol, exchange="NFO")
+                        if hce_quote.get("status") == "success":
+                            self.hedge_ce_ltp = float(hce_quote["data"].get("ltp", self.hedge_ce_ltp))
+                    if self.hedge_pe_symbol:
+                        hpe_quote = self.client.quotes(symbol=self.hedge_pe_symbol, exchange="NFO")
+                        if hpe_quote.get("status") == "success":
+                            self.hedge_pe_ltp = float(hpe_quote["data"].get("ltp", self.hedge_pe_ltp))
             except Exception as e:
                 print(f"\n[QUOTE ERROR] {e}")
                 time.sleep(PNL_CHECK_INTERVAL)
                 continue
 
-            # Short position P&L: profit when prices DROP from entry
+            # Short legs P&L: profit when prices DROP from entry
             ce_pnl = (self.ce_entry_price - self.ce_ltp) * QUANTITY
             pe_pnl = (self.pe_entry_price - self.pe_ltp) * QUANTITY
-            total_pnl = ce_pnl + pe_pnl
+            short_pnl = ce_pnl + pe_pnl
+
+            # Hedge legs P&L: profit when prices RISE from entry (we bought them)
+            hedge_pnl = 0.0
+            if ENABLE_HEDGE:
+                hedge_pnl = ((self.hedge_ce_ltp - self.hedge_ce_price) +
+                             (self.hedge_pe_ltp - self.hedge_pe_price)) * QUANTITY
+
+            total_pnl = short_pnl + hedge_pnl
 
             pnl_pct = (total_pnl / self.total_premium * 100) if self.total_premium > 0 else 0
             sign = "+" if total_pnl > 0 else ""
 
             print(
                 f"\r[{now.strftime('%H:%M:%S')}] "
-                f"CE: {self.ce_ltp:.2f} (entry {self.ce_entry_price:.2f}) | "
-                f"PE: {self.pe_ltp:.2f} (entry {self.pe_entry_price:.2f}) | "
-                f"P&L: {sign}{total_pnl:.0f} ({sign}{pnl_pct:.1f}%)    ",
+                f"CE: {self.ce_ltp:.2f} | PE: {self.pe_ltp:.2f} | "
+                f"Net P&L: {sign}{total_pnl:.0f} ({sign}{pnl_pct:.1f}%)"
+                f"{f' [short:{short_pnl:+.0f} hedge:{hedge_pnl:+.0f}]' if ENABLE_HEDGE else ''}    ",
                 end="",
             )
 
