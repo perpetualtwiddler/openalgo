@@ -89,10 +89,11 @@ SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "15"))
 PNL_CHECK_INTERVAL = int(os.getenv("PNL_CHECK_INTERVAL", "5"))
 
 STRATEGY_NAME = os.getenv("STRATEGY_NAME", "SHORT_STRADDLE_NIFTY")
+STRATEGY_TAG = STRATEGY_NAME.replace("/", "_").replace(" ", "_")
 
 STATE_DIR = Path(os.getenv("STATE_DIR", "/root/data/openalgo/strategies/state"))
-STATE_FILE = STATE_DIR / f"{STRATEGY_NAME}_state.json"
-HISTORY_FILE = STATE_DIR / f"{STRATEGY_NAME}_history.json"
+STATE_FILE = STATE_DIR / f"{STRATEGY_TAG}_state.json"
+HISTORY_FILE = STATE_DIR / f"{STRATEGY_TAG}_history.json"
 
 
 # =============================================================================

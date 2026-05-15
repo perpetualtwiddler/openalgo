@@ -58,9 +58,10 @@ SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
 MAX_LOSS_PER_DAY = float(os.getenv("MAX_LOSS_PER_DAY", "5000"))  # daily circuit breaker
 
 STRATEGY_NAME = os.getenv("STRATEGY_NAME", "EMA_9_21_BANKNIFTY")
+STRATEGY_TAG = STRATEGY_NAME.replace("/", "_").replace(" ", "_")
 
 STATE_DIR = Path(os.getenv("STATE_DIR", "/root/data/openalgo/strategies/state"))
-STATE_FILE = STATE_DIR / f"{STRATEGY_NAME}_state.json"
+STATE_FILE = STATE_DIR / f"{STRATEGY_TAG}_state.json"
 
 
 def resolve_futures_symbol(client, underlying, exchange):

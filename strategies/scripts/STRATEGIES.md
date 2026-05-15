@@ -134,6 +134,7 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 | May 12 | -52,065 (9 lots, SL hit) | No trade | Expiry day, PE exploded |
 | May 13 | +4,621 (9 lots) | No trade | Recovered from -15k dip |
 | May 14 | +39 (4 lots, OTM4) | No trade (insufficient funds) | Flat day, hedge ate 96% of profit; EMA crossover blocked by margin |
+| May 15 | Running (3 lots, OTM8) | SELL filled then lost by analyzer | Analyzer positionbook bug lost 3/5 positions; EMA state file path bug fixed |
 
 ---
 
@@ -151,6 +152,16 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 | Lots | 4 | 3 | Free margin for EMA crossover (4 lots used ~2L, blocking BNKF futures) |
 
 **Trade-off:** OTM8 has higher max loss (~400pts spread vs 200pts) but significantly better daily P&L on range-bound days. Stop-loss at 50% still caps adverse moves.
+
+### May 15 — State file path fix + analyzer positionbook bug
+
+**Bug 1 (fixed): State file path with special characters.**
+OpenAlgo scheduler injects the web UI display name as `STRATEGY_NAME` env var (e.g., `EMA 9/21 Crossover - BankNifty 5min`). The `/` in `9/21` created an invalid subdirectory path, causing state save to fail silently. EMA crossover could not persist state across restarts.
+
+**Fix:** Both strategies now sanitize `STRATEGY_NAME` → `STRATEGY_TAG` (replacing `/` and spaces with `_`) before using it in file paths. Applied to `short_straddle_nifty.py` and `ema_crossover_banknifty.py`.
+
+**Bug 2 (OpenAlgo platform): Analyzer positionbook drops positions.**
+On May 15, all 5 orders (4 straddle + 1 EMA) filled successfully per orderbook, but positionbook only showed 2 of 4 straddle legs. EMA crossover position vanished immediately, triggering position sync reset. This is an analyzer (sandbox) mode issue — not a strategy bug.
 
 ---
 
