@@ -83,7 +83,7 @@ CONSECUTIVE_SL_LIMIT = int(os.getenv("CONSECUTIVE_SL_LIMIT", "2"))
 
 # Square-off time
 SQUAREOFF_HOUR = int(os.getenv("SQUAREOFF_HOUR", "15"))
-SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "15"))
+SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "14"))
 
 # P&L check interval (seconds)
 PNL_CHECK_INTERVAL = int(os.getenv("PNL_CHECK_INTERVAL", "5"))
@@ -812,6 +812,14 @@ class ShortStraddleBot:
 
                 if now.hour >= 16:
                     self.entry_done_today = False
+
+                if (now.hour > SQUAREOFF_HOUR or
+                        (now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE + 5)):
+                    if not self.is_positioned:
+                        print(f"\n[EOD] Post-squareoff — strategy finished for the day.")
+                        self.running = False
+                        self.stop_event.set()
+                        break
 
                 time.sleep(1)
 

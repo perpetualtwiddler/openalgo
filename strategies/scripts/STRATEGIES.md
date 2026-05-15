@@ -41,7 +41,7 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 |---------|-----------|--------|
 | Profit target | +25% of net premium | Close all 4 legs |
 | Stop-loss | -50% of net premium | Close all 4 legs |
-| EOD square-off | 15:15 IST | Close all 4 legs |
+| EOD square-off | 15:14 IST | Close all 4 legs (before analyzer 15:15 cutoff) |
 | Position sync | Every 5 seconds | Detect manual/system exits |
 
 ### Safety Features
@@ -88,7 +88,7 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 |---------|--------|
 | Opposite crossover | Reverse position |
 | Trailing stop-loss | Monitors via WebSocket LTP feed |
-| EOD square-off | Close before MIS deadline |
+| EOD square-off | Close at 15:14 IST (before analyzer 15:15 cutoff) |
 | Position sync | Detect manual exits from web UI |
 
 ### Safety Features
@@ -118,7 +118,7 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 ## Deployment Workflow
 
 1. Edit strategy files locally at `/home/mandar/data/programs/marketcalls/openalgo/strategies/scripts/`
-2. Commit to `mandar/strategies` branch in local git repo
+2. Commit to `mock/strategies` branch in local git repo
 3. Deploy via SCP: `scp <local_file> root@109.123.248.99:<server_path>`
 4. Strategies auto-start via OpenAlgo scheduler at 9:15 AM IST daily
 5. Zerodha authentication must be done manually before 9:15 AM IST each day
@@ -134,7 +134,7 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 | May 12 | -52,065 (9 lots, SL hit) | No trade | Expiry day, PE exploded |
 | May 13 | +4,621 (9 lots) | No trade | Recovered from -15k dip |
 | May 14 | +39 (4 lots, OTM4) | No trade (insufficient funds) | Flat day, hedge ate 96% of profit; EMA crossover blocked by margin |
-| May 15 | Running (3 lots, OTM8) | SELL filled, settled by catch-up bug | Catch-up processor killed 3/5 reopened positions on web UI login at 12:32; state file path bug fixed; catch-up filter bug fixed |
+| May 15 | EXIT FAILED at 15:15 (3 lots, OTM8) | SELL filled, settled by catch-up bug | Catch-up processor killed 3/5 positions; EOD exit blocked by analyzer 15:15 cutoff; strategy hung post-market |
 
 ---
 
@@ -166,6 +166,17 @@ On May 15, all 5 orders filled at 09:35 IST. Positions ran normally until 12:32 
 **Impact:** 3 positions force-settled mid-day: NIFTY 23750CE (short), NIFTY 23350PE (hedge), BANKNIFTY FUT. Margin released, P&L locked at settlement LTP. EMA crossover's position sync detected the missing position and reset to FLAT. Straddle continued monitoring on internal state (unaffected operationally but 2 of 4 legs invisible in positionbook).
 
 **Fix:** Added `SandboxPositions.updated_at < today_start` to the filter in `sandbox/catch_up_processor.py:63`. The execution engine's reopen path commits via ORM, which bumps `updated_at` to today. The daily PnL reset uses raw SQL to avoid bumping `updated_at`. So reopened positions have today's `updated_at` and are excluded from catch-up settlement. Deployed to server (takes effect on next web UI login, no restart needed).
+
+### May 15 — EOD square-off timing + strategy termination
+
+**Bug 3 (fixed): Analyzer blocks MIS orders at exactly 15:15 IST.**
+Both strategies attempted EOD square-off at 15:15 IST, but the analyzer's MIS auto-squareoff runs at the same time and rejects new orders. The straddle's EXIT orders failed with "EXIT FAILED" and the strategy hung indefinitely post-market (still running at 22:00+ IST).
+
+**Fix (both strategies):**
+- Moved EOD square-off from 15:15 to **15:14 IST** (1 minute before the analyzer cutoff)
+- Added **post-squareoff termination**: strategies now set `running = False` and exit cleanly ~5 minutes after squareoff time if no position remains
+- Straddle: `SQUAREOFF_MINUTE` default changed from `"15"` to `"14"`, termination at squareoff+5
+- EMA crossover: EOD check changed from `>= 15` to `>= 14`, termination at minute >= 19
 
 ---
 

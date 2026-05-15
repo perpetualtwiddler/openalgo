@@ -419,11 +419,16 @@ class EMACrossoverBot:
                 if now.hour < 9 or (now.hour == 9 and now.minute < 15):
                     time.sleep(30)
                     continue
-                if now.hour >= 15 and now.minute >= 15:
+                if now.hour >= 15 and now.minute >= 14:
                     if self.position:
-                        print("\n[EOD] 15:15 — closing position for end of day")
+                        print("\n[EOD] 15:14 — closing position for end of day")
                         self.place_exit("EOD_SQUAREOFF")
                     self.clear_state()
+                    if now.minute >= 19:
+                        print(f"\n[EOD] Post-squareoff — strategy finished for the day.")
+                        self.running = False
+                        self.stop_event.set()
+                        return
                     time.sleep(60)
                     continue
 
