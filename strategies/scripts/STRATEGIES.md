@@ -134,7 +134,7 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 | May 12 | -52,065 (9 lots, SL hit) | No trade | Expiry day, PE exploded |
 | May 13 | +4,621 (9 lots) | No trade | Recovered from -15k dip |
 | May 14 | +39 (4 lots, OTM4) | No trade (insufficient funds) | Flat day, hedge ate 96% of profit; EMA crossover blocked by margin |
-| May 15 | Running (3 lots, OTM8) | SELL filled then lost by analyzer | Analyzer positionbook bug lost 3/5 positions; EMA state file path bug fixed |
+| May 15 | Running (3 lots, OTM8) | SELL filled, settled by catch-up bug | Catch-up processor killed 3/5 reopened positions on web UI login at 12:32; state file path bug fixed; catch-up filter bug fixed |
 
 ---
 
@@ -160,8 +160,12 @@ OpenAlgo scheduler injects the web UI display name as `STRATEGY_NAME` env var (e
 
 **Fix:** Both strategies now sanitize `STRATEGY_NAME` → `STRATEGY_TAG` (replacing `/` and spaces with `_`) before using it in file paths. Applied to `short_straddle_nifty.py` and `ema_crossover_banknifty.py`.
 
-**Bug 2 (OpenAlgo platform): Analyzer positionbook drops positions.**
-On May 15, all 5 orders (4 straddle + 1 EMA) filled successfully per orderbook, but positionbook only showed 2 of 4 straddle legs. EMA crossover position vanished immediately, triggering position sync reset. This is an analyzer (sandbox) mode issue — not a strategy bug.
+**Bug 2 (fixed): Catch-up processor kills reopened positions on web UI login.**
+On May 15, all 5 orders filled at 09:35 IST. Positions ran normally until 12:32 IST, when a web UI login triggered the `catch_up_processor.catch_up_mis_squareoff()`. This function settles "stale MIS" positions where `created_at < today`. However, 3 of 5 position rows were originally created on previous days and later reopened today by the execution engine. The catch-up processor only checked `created_at` (original row creation) and ignored that the positions were actively traded today.
+
+**Impact:** 3 positions force-settled mid-day: NIFTY 23750CE (short), NIFTY 23350PE (hedge), BANKNIFTY FUT. Margin released, P&L locked at settlement LTP. EMA crossover's position sync detected the missing position and reset to FLAT. Straddle continued monitoring on internal state (unaffected operationally but 2 of 4 legs invisible in positionbook).
+
+**Fix:** Added `SandboxPositions.updated_at < today_start` to the filter in `sandbox/catch_up_processor.py:63`. The execution engine's reopen path commits via ORM, which bumps `updated_at` to today. The daily PnL reset uses raw SQL to avoid bumping `updated_at`. So reopened positions have today's `updated_at` and are excluded from catch-up settlement. Deployed to server (takes effect on next web UI login, no restart needed).
 
 ---
 

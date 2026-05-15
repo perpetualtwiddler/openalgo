@@ -57,10 +57,18 @@ def catch_up_mis_squareoff():
         today_start = datetime.combine(today, datetime.min.time())
         today_start = IST.localize(today_start)
 
-        # Find MIS positions from previous days (created before today)
+        # Find MIS positions from previous days that were NOT reopened today.
+        # A position row created days ago may have been reopened by the execution
+        # engine today (new order for the same symbol).  The reopen path commits
+        # via ORM, which bumps updated_at to today.  Checking only created_at
+        # would incorrectly settle those active positions.
         stale_mis_positions = (
             SandboxPositions.query.filter_by(product="MIS")
-            .filter(SandboxPositions.quantity != 0, SandboxPositions.created_at < today_start)
+            .filter(
+                SandboxPositions.quantity != 0,
+                SandboxPositions.created_at < today_start,
+                SandboxPositions.updated_at < today_start,
+            )
             .all()
         )
 
