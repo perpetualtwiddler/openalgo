@@ -9,6 +9,7 @@ Usage:
     python backtest_offline.py 2026-05-14 --ema-only
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -23,7 +24,8 @@ FLAGS = set(sys.argv[2:])
 RUN_STRADDLE = "--ema-only" not in FLAGS
 RUN_EMA = "--straddle-only" not in FLAGS
 
-BASE_DIR = Path("/root/data/zerodha/trade-data") / DATE
+SCRIPT_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(os.environ.get("TRADE_DATA_DIR", SCRIPT_DIR / "backtest_data")) / DATE
 
 if not BASE_DIR.exists():
     print(f"ERROR: No data for {DATE} at {BASE_DIR}")
@@ -72,7 +74,7 @@ def run_straddle_backtest():
     PROFIT_TARGET_PCT = 25.0
     STOPLOSS_PCT = 50.0
     ENTRY_TIME = "09:35"
-    SQUAREOFF_TIME = "15:15"
+    SQUAREOFF_TIME = "15:14"
 
     atm = meta.get("atm_strike")
     expiry_tag = meta.get("nifty_expiry_tag")
@@ -155,7 +157,7 @@ def run_straddle_backtest():
             if pnl_pct <= -STOPLOSS_PCT:
                 exit_time, exit_reason, exit_pnl, exit_pct = t, "STOPLOSS", total_pnl, pnl_pct
                 break
-            if ts.hour > 15 or (ts.hour == 15 and ts.minute >= 15):
+            if ts.hour > 15 or (ts.hour == 15 and ts.minute >= 14):
                 exit_time, exit_reason, exit_pnl, exit_pct = t, "EOD_SQUAREOFF", total_pnl, pnl_pct
                 break
 
@@ -189,91 +191,176 @@ def run_ema_backtest():
     QTY = 60  # 2 lots x 30
     EMA_FAST = 9
     EMA_SLOW = 21
+    VOL_MULT = 1.5
+    VOL_SMA = 20
+    TRAILING_SL_PCT = 0.5
 
-    data = load_csv(BASE_DIR / "banknifty_fut_5m.csv")
-    if data is None:
+    data_today = load_csv(BASE_DIR / "banknifty_fut_5m.csv")
+    if data_today is None:
         print("  SKIP — no BANKNIFTY futures data")
         return
 
+    # Load previous day's data for EMA warmup (live strategy fetches multi-day history)
+    from datetime import datetime, timedelta
+    prev_date = (datetime.strptime(DATE, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    warmup_dir = SCRIPT_DIR / "backtest_data" / prev_date
+    prev_data = load_csv(warmup_dir / "banknifty_fut_5m.csv") if warmup_dir.exists() else None
+    warmup_candles = 0
+    if prev_data is not None:
+        data = pd.concat([prev_data, data_today])
+        warmup_candles = len(prev_data)
+    else:
+        data = data_today
+
     data["ema9"] = data["close"].ewm(span=EMA_FAST, adjust=False).mean()
     data["ema21"] = data["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    data["vol_sma"] = data["volume"].rolling(window=VOL_SMA).mean()
 
-    print(f"  Data: {len(data)} candles (5m)")
-    print(f"  EMA({EMA_FAST}/{EMA_SLOW}) | Qty: {QTY}")
+    warmup_note = f" (+ {warmup_candles} warmup from {prev_date})" if warmup_candles else " (NO warmup — EMAs cold-start!)"
+    print(f"  Data: {len(data_today)} candles (5m){warmup_note}")
+    print(f"  EMA({EMA_FAST}/{EMA_SLOW}) | Qty: {QTY} | Vol filter: >{VOL_MULT}x SMA({VOL_SMA})")
+    print(f"  Trailing SL: {TRAILING_SL_PCT}%")
 
-    # Find crossovers
-    crossovers = []
-    for i in range(1, len(data)):
-        pf = data.iloc[i - 1]["ema9"]
-        ps = data.iloc[i - 1]["ema21"]
-        cf = data.iloc[i]["ema9"]
-        cs = data.iloc[i]["ema21"]
+    # Find crossovers on the target date only (warmup feeds EMA accuracy)
+    today_mask = data.index >= f"{DATE} 09:15"
+    today_indices = data.index[today_mask]
+    all_crossovers = []
+    for ts in today_indices:
+        idx = data.index.get_loc(ts)
+        if idx < 1:
+            continue
+        pf = data.iloc[idx - 1]["ema9"]
+        ps = data.iloc[idx - 1]["ema21"]
+        cf = data.iloc[idx]["ema9"]
+        cs = data.iloc[idx]["ema21"]
+        vol = float(data.iloc[idx]["volume"])
+        vol_sma = float(data.iloc[idx]["vol_sma"]) if pd.notna(data.iloc[idx]["vol_sma"]) else 0
+        vol_ok = vol > VOL_MULT * vol_sma if vol_sma > 0 else False
         if pf < ps and cf >= cs:
-            crossovers.append(("BUY", data.index[i], float(data.iloc[i]["close"])))
+            all_crossovers.append(("BUY", ts, float(data.iloc[idx]["close"]), vol, vol_sma, vol_ok))
         elif pf >= ps and cf < cs:
-            crossovers.append(("SELL", data.index[i], float(data.iloc[i]["close"])))
+            all_crossovers.append(("SELL", ts, float(data.iloc[idx]["close"]), vol, vol_sma, vol_ok))
 
-    if not crossovers:
+    if not all_crossovers:
         print("  No crossovers detected — no trades")
         return
 
-    print(f"\n  Crossovers:")
-    for sig, ts, price in crossovers:
-        print(f"    {sig} at {ts.strftime('%H:%M')} | Price: {price:.2f}")
+    print(f"\n  All Crossovers (with volume check):")
+    for sig, ts, price, vol, vsma, vok in all_crossovers:
+        status = "PASS" if vok else "REJECTED"
+        ratio = vol / vsma if vsma > 0 else 0
+        print(f"    {sig} at {ts.strftime('%H:%M')} | Price: {price:.2f} | Vol: {vol:.0f} vs {VOL_MULT}x SMA: {vsma * VOL_MULT:.0f} ({ratio:.2f}x) -> {status}")
 
-    # Simulate trades
-    print(f"\n  Trades:")
+    # Use only today's candles for trade simulation
+    data_sim = data[data.index >= f"{DATE} 09:15"]
+
+    # --- Run A: WITHOUT volume filter ---
+    print(f"\n  {'─'*60}")
+    print(f"  RUN A: WITHOUT volume filter (all crossovers traded)")
+    print(f"  {'─'*60}")
+    _run_ema_trades([(s, t, p) for s, t, p, _, _, _ in all_crossovers], data_sim, QTY, TRAILING_SL_PCT)
+
+    # --- Run B: WITH volume filter ---
+    filtered = [(s, t, p) for s, t, p, _, _, vok in all_crossovers if vok]
+    print(f"\n  {'─'*60}")
+    print(f"  RUN B: WITH volume filter (>{VOL_MULT}x SMA({VOL_SMA}))")
+    print(f"  {'─'*60}")
+    if not filtered:
+        print("    No crossovers passed volume filter — no trades")
+    else:
+        _run_ema_trades(filtered, data_sim, QTY, TRAILING_SL_PCT)
+
+
+def _run_ema_trades(crossovers, data, qty, trailing_sl_pct):
     trades = []
-    position = None  # (direction, entry_price, entry_time)
+    position = None  # (direction, entry_price, entry_time, peak_price, trailing_sl)
 
-    for sig, ts, price in crossovers:
-        if position is None:
-            position = (sig, price, ts)
-        elif position[0] != sig:
-            # Close existing, open new
-            entry_dir, entry_price, entry_time = position
-            if entry_dir == "BUY":
-                pnl = (price - entry_price) * QTY
-            else:
-                pnl = (entry_price - price) * QTY
-            trades.append({
-                "entry": entry_dir,
-                "entry_time": entry_time.strftime("%H:%M"),
-                "entry_price": entry_price,
-                "exit_time": ts.strftime("%H:%M"),
-                "exit_price": price,
-                "pnl": pnl,
-            })
-            sign = "+" if pnl >= 0 else ""
-            print(f"    {entry_dir} @ {entry_price:.2f} ({entry_time.strftime('%H:%M')}) "
-                  f"-> exit @ {price:.2f} ({ts.strftime('%H:%M')}) | P&L: {sign}{pnl:,.0f}")
-            position = (sig, price, ts)
-
-    # Close final position at EOD
-    if position:
-        entry_dir, entry_price, entry_time = position
-        eod_price = float(data.iloc[-1]["close"])
-        eod_time = data.index[-1]
+    def close_position(pos, exit_price, exit_time_str, reason):
+        entry_dir, entry_price, entry_time, _, _ = pos
         if entry_dir == "BUY":
-            pnl = (eod_price - entry_price) * QTY
+            pnl = (exit_price - entry_price) * qty
         else:
-            pnl = (entry_price - eod_price) * QTY
-        trades.append({
+            pnl = (entry_price - exit_price) * qty
+        trade = {
             "entry": entry_dir,
             "entry_time": entry_time.strftime("%H:%M"),
             "entry_price": entry_price,
-            "exit_time": eod_time.strftime("%H:%M"),
-            "exit_price": eod_price,
+            "exit_time": exit_time_str,
+            "exit_price": exit_price,
             "pnl": pnl,
-            "eod": True,
-        })
+            "reason": reason,
+        }
+        trades.append(trade)
         sign = "+" if pnl >= 0 else ""
         print(f"    {entry_dir} @ {entry_price:.2f} ({entry_time.strftime('%H:%M')}) "
-              f"-> EOD @ {eod_price:.2f} ({eod_time.strftime('%H:%M')}) | P&L: {sign}{pnl:,.0f}")
+              f"-> {reason} @ {exit_price:.2f} ({exit_time_str}) | P&L: {sign}{pnl:,.0f}")
+        return pnl
+
+    # Walk candle by candle to handle trailing SL between crossovers
+    cross_idx = 0
+    cross_times = {c[1]: c for c in crossovers}
+
+    for i in range(1, len(data)):
+        ts = data.index[i]
+        row = data.iloc[i]
+
+        # EOD check at 15:14
+        if ts.hour > 15 or (ts.hour == 15 and ts.minute >= 14):
+            if position:
+                close_position(position, float(row["close"]), ts.strftime("%H:%M"), "EOD")
+                position = None
+            break
+
+        # Trailing SL check
+        if position:
+            d, ep, et, peak, sl = position
+            if d == "BUY":
+                if float(row["high"]) > peak:
+                    peak = float(row["high"])
+                    sl = round(peak * (1 - trailing_sl_pct / 100), 2)
+                    position = (d, ep, et, peak, sl)
+                if float(row["low"]) <= sl:
+                    close_position(position, sl, ts.strftime("%H:%M"), "TRAILING_SL")
+                    position = None
+            else:
+                if float(row["low"]) < peak:
+                    peak = float(row["low"])
+                    sl = round(peak * (1 + trailing_sl_pct / 100), 2)
+                    position = (d, ep, et, peak, sl)
+                if float(row["high"]) >= sl:
+                    close_position(position, sl, ts.strftime("%H:%M"), "TRAILING_SL")
+                    position = None
+
+        # Crossover signal at this candle?
+        if ts in cross_times:
+            sig, _, price = cross_times[ts]
+            if position and position[0] != sig:
+                close_position(position, price, ts.strftime("%H:%M"), "REVERSE")
+                position = None
+            if not position:
+                ep = price
+                peak = ep
+                if sig == "BUY":
+                    sl = round(ep * (1 - trailing_sl_pct / 100), 2)
+                else:
+                    sl = round(ep * (1 + trailing_sl_pct / 100), 2)
+                position = (sig, ep, ts, peak, sl)
+
+    # Close any remaining position at last candle
+    if position:
+        last = data.iloc[-1]
+        close_position(position, float(last["close"]), data.index[-1].strftime("%H:%M"), "END_OF_DATA")
+        position = None
+
+    if not trades:
+        print("    No trades")
+        return
 
     total = sum(t["pnl"] for t in trades)
+    winners = [t for t in trades if t["pnl"] > 0]
+    losers = [t for t in trades if t["pnl"] <= 0]
     sign = "+" if total >= 0 else ""
-    print(f"\n  Total: {sign}{total:,.0f} INR across {len(trades)} trade(s)")
+    print(f"\n    Summary: {sign}{total:,.0f} INR | {len(trades)} trade(s) | W:{len(winners)} L:{len(losers)}")
 
 
 # =========================================================================
