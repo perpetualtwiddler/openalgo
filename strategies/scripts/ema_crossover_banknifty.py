@@ -346,8 +346,17 @@ class EMACrossoverBot:
             self.exit_in_progress = False
             return
 
-        exit_action = "SELL" if self.position == "BUY" else "BUY"
-        print(f"\n[EXIT] Closing {self.position} — reason: {reason}")
+        # Snapshot position state BEFORE placing order. The sync_position poll
+        # runs concurrently and resets self.position / self.entry_price the
+        # moment the analyzer reflects the closed position. Without the snapshot,
+        # the P&L calculation below reads entry_price=0 and produces garbage
+        # like -3,302,640 which then poisons daily_pnl and trips the daily-loss
+        # circuit breaker for the rest of the day.
+        position = self.position
+        entry_price = self.entry_price
+
+        exit_action = "SELL" if position == "BUY" else "BUY"
+        print(f"\n[EXIT] Closing {position} — reason: {reason}")
 
         try:
             resp = self.client.placeorder(
@@ -358,10 +367,10 @@ class EMACrossoverBot:
                 order_id = resp.get("orderid")
                 exit_price = self.get_fill_price(order_id)
                 if exit_price:
-                    if self.position == "BUY":
-                        pnl = (exit_price - self.entry_price) * QUANTITY
+                    if position == "BUY":
+                        pnl = (exit_price - entry_price) * QUANTITY
                     else:
-                        pnl = (self.entry_price - exit_price) * QUANTITY
+                        pnl = (entry_price - exit_price) * QUANTITY
                     self.daily_pnl += pnl
                     sign = "+" if pnl > 0 else ""
                     print(f"[EXIT] Filled @ {exit_price:.2f} | P&L: {sign}{pnl:.0f} | Day total: {self.daily_pnl:.0f}")
