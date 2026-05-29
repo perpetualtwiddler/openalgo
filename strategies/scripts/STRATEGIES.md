@@ -125,6 +125,36 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 
 ---
 
+## Operational Timers (systemd)
+
+Two systemd timers keep the trading server hands-off:
+
+| Timer | Schedule | Purpose |
+|-------|----------|---------|
+| `openalgo-restart.timer` | Daily 08:00 IST | Restart openalgo to dodge APScheduler executor death |
+| `openalgo-capture-trade-data.timer` | Mon-Fri 15:35 IST | Auto-archive day's intraday data for backtesting |
+
+**Why daily restart at 08:00 IST?** APScheduler's `ThreadPoolExecutor` enters a "shutdown" state after ~2 days of uptime — the scheduler logs `"all checks passed, starting"` at 09:15 IST but the subprocess never spawns. Restarting daily at 08:00 IST (75 min before market open, after master contract cutoff) keeps the executor healthy. Observed twice in May 2026 (26th, 29th) before this timer was put in place.
+
+**Setup:** run `setup_systemd_timers.sh` on the server with `OPENALGO_API_KEY` set. Script is idempotent — safe to re-run.
+
+```bash
+OPENALGO_API_KEY=<key> ./strategies/scripts/setup_systemd_timers.sh
+```
+
+**Inspection commands:**
+
+```bash
+systemctl list-timers --no-pager
+journalctl -u openalgo-restart.service --since today --no-pager
+journalctl -u openalgo-capture-trade-data.service --since today --no-pager
+systemctl start openalgo-capture-trade-data.service   # manual on-demand capture
+```
+
+Captured data lands in `/root/data/zerodha/trade-data/YYYY-MM-DD/`. Holidays produce empty/incomplete directories (script logs `no data` warnings, exits 0).
+
+---
+
 ## Trading Results
 
 | Date | Straddle | EMA Crossover | Notes |
