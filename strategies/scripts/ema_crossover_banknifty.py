@@ -6,7 +6,8 @@ Buys/sells BANKNIFTY futures on EMA crossover with volume confirmation.
 
 Entry : EMA(9) crosses EMA(21) on 5-min candles
 Filter: Volume > 1.5x SMA(20) of volume
-Exit  : Trailing stop-loss 0.5% OR reverse crossover signal
+Exit  : APPE adaptive profit-protection (trails the P&L curve) OR trailing
+        stop-loss 0.5% OR reverse crossover signal — first to fire wins
 Product: MIS (intraday, auto square-off by broker at 3:15 PM)
 
 Run standalone:
@@ -18,9 +19,11 @@ Run via OpenAlgo /python strategy runner:
 """
 
 import json
+import math
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -51,6 +54,16 @@ VOLUME_FILTER_MULT = float(os.getenv("VOLUME_FILTER_MULT", "1.5"))
 VOLUME_SMA_PERIOD = int(os.getenv("VOLUME_SMA_PERIOD", "20"))
 
 TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5%
+
+# --- Adaptive Profit-Protection Exit (APPE) — see ADAPTIVE_PROFIT_EXIT_DESIGN.md ---
+# Trails the *profit curve* (not price): once profit peaks past the arm threshold, exit when it
+# gives back a peak-scaled budget AND the smoothed P&L slope confirms a down-drift (held H sec).
+APPE_ENABLED = os.getenv("APPE_ENABLED", "true").lower() == "true"
+PROFIT_ARM_THRESHOLD = float(os.getenv("PROFIT_ARM_THRESHOLD", "15000"))  # ₹ profit before APPE arms (Gate 1)
+GIVEBACK_K = float(os.getenv("GIVEBACK_K", "30"))             # give-back budget G = k·√P_max (Gate 2)
+TREND_WINDOW_SEC = float(os.getenv("TREND_WINDOW_SEC", "180"))    # slope lookback (Gate 3a)
+TREND_CONFIRM_SEC = float(os.getenv("TREND_CONFIRM_SEC", "30"))   # breach hold / patience (Gate 3b)
+HARD_MULT = float(os.getenv("HARD_MULT", "2.0"))             # catastrophic give-back multiple (Gate 4)
 
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
@@ -94,6 +107,12 @@ class EMACrossoverBot:
         self.stop_event = threading.Event()
         self.daily_pnl = 0.0
         self.trade_count = 0
+        # APPE state (profit-protection trailing exit). appe_peak/appe_armed persist across
+        # same-day restarts; breach timer + slope window rebuild from live ticks.
+        self.appe_peak = 0.0           # P_max — peak unrealized profit this trade
+        self.appe_armed = False
+        self.appe_breach_start = None  # time.monotonic() when the floor breach began
+        self.pnl_window = deque()      # (monotonic_ts, unrealized) over TREND_WINDOW_SEC
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
 
         self.load_state()
@@ -102,6 +121,11 @@ class EMACrossoverBot:
         print(f"[INIT] {self.symbol} on {EXCHANGE} | EMA({FAST_EMA}/{SLOW_EMA}) | {CANDLE_TIMEFRAME}")
         print(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
         print(f"[INIT] Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
+        if APPE_ENABLED:
+            print(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} | G={GIVEBACK_K:g}·√peak | "
+                  f"trend {TREND_WINDOW_SEC:.0f}s | confirm {TREND_CONFIRM_SEC:.0f}s | hard ×{HARD_MULT:g}")
+        else:
+            print("[INIT] APPE off — price trailing-SL only")
         print(f"[INIT] Qty: {QUANTITY} | Product: {PRODUCT} | Direction: {TRADE_DIRECTION}")
         if self.position:
             print(f"[INIT] Resumed {self.position} @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}")
@@ -122,6 +146,8 @@ class EMACrossoverBot:
                 "peak_price": self.peak_price,
                 "daily_pnl": self.daily_pnl,
                 "trade_count": self.trade_count,
+                "appe_peak": self.appe_peak,
+                "appe_armed": self.appe_armed,
             }
             STATE_FILE.write_text(json.dumps(state))
             print(f"[STATE] Saved: {self.position} @ {self.entry_price:.2f}")
@@ -147,6 +173,8 @@ class EMACrossoverBot:
             self.peak_price = state.get("peak_price", 0.0)
             self.daily_pnl = state.get("daily_pnl", 0.0)
             self.trade_count = state.get("trade_count", 0)
+            self.appe_peak = state.get("appe_peak", 0.0)
+            self.appe_armed = state.get("appe_armed", False)
         except Exception as e:
             print(f"[STATE ERROR] Load failed: {e}")
 
@@ -194,10 +222,100 @@ class EMACrossoverBot:
             end="",
         )
 
+        # APPE — adaptive profit-protection exit. First-to-fire vs the price trail below.
+        if not self.exit_in_progress:
+            appe_reason = self._appe_evaluate(unrealized, time.monotonic())
+            if appe_reason:
+                self.exit_in_progress = True
+                threading.Thread(target=self.place_exit, args=(appe_reason,), daemon=True).start()
+                return
+
         if hit_sl and not self.exit_in_progress:
             self.exit_in_progress = True
             print(f"\n[ALERT] Trailing SL hit at {self.ltp:.2f} (SL was {self.trailing_sl:.2f})")
             threading.Thread(target=self.place_exit, args=("TRAILING_SL",), daemon=True).start()
+
+    # -------------------------------------------------------------------------
+    # APPE — Adaptive Profit-Protection Exit (see ADAPTIVE_PROFIT_EXIT_DESIGN.md)
+    # -------------------------------------------------------------------------
+
+    def _reset_appe(self):
+        self.appe_peak = 0.0
+        self.appe_armed = False
+        self.appe_breach_start = None
+        self.pnl_window.clear()
+
+    def _pnl_slope_negative(self):
+        """Linear-regression slope of unrealized P&L over the window; True if drifting down (Gate 3a)."""
+        pts = self.pnl_window
+        if len(pts) < 5:
+            return False
+        span = pts[-1][0] - pts[0][0]
+        if span < TREND_WINDOW_SEC * 0.5:
+            return False  # window doesn't yet cover enough time — don't act without evidence
+        n = len(pts)
+        t0 = pts[0][0]
+        xs = [p[0] - t0 for p in pts]
+        ys = [p[1] for p in pts]
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        den = sum((x - mx) ** 2 for x in xs)
+        if den == 0:
+            return False
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+        return slope < 0
+
+    def _appe_evaluate(self, unrealized, now):
+        """Return an exit reason ('APPE_HARD' / 'APPE_RATCHET') or None. Design doc §4."""
+        if not APPE_ENABLED:
+            return None
+
+        # Track peak (MFE) and feed/trim the slope window every tick
+        if unrealized > self.appe_peak:
+            self.appe_peak = unrealized
+        self.pnl_window.append((now, unrealized))
+        cutoff = now - TREND_WINDOW_SEC
+        while self.pnl_window and self.pnl_window[0][0] < cutoff:
+            self.pnl_window.popleft()
+
+        # Gate 1 — arm
+        if not self.appe_armed:
+            if self.appe_peak >= PROFIT_ARM_THRESHOLD:
+                self.appe_armed = True
+                print(f"\n[APPE] Armed — peak ₹{self.appe_peak:.0f} ≥ arm ₹{PROFIT_ARM_THRESHOLD:.0f}")
+            else:
+                return None
+
+        budget = GIVEBACK_K * math.sqrt(max(self.appe_peak, 0.0))
+        floor = self.appe_peak - budget
+        giveback = self.appe_peak - unrealized
+
+        # Gate 4 — catastrophic give-back: exit immediately, skip confirmation
+        if giveback >= HARD_MULT * budget:
+            print(f"\n[APPE] HARD exit — give-back ₹{giveback:.0f} ≥ {HARD_MULT:g}×budget ₹{budget:.0f} "
+                  f"(peak ₹{self.appe_peak:.0f}, U ₹{unrealized:.0f})")
+            return "APPE_HARD"
+
+        # Gate 2 — breached the protective floor?
+        if unrealized < floor:
+            # Gate 3a — only if the profit curve is genuinely drifting down
+            if self._pnl_slope_negative():
+                # Gate 3b — confirm-and-hold for TREND_CONFIRM_SEC
+                if self.appe_breach_start is None:
+                    self.appe_breach_start = now
+                    print(f"\n[APPE] Breach floor ₹{floor:.0f} (U ₹{unrealized:.0f}, peak ₹{self.appe_peak:.0f}) "
+                          f"+ trend down — confirming {TREND_CONFIRM_SEC:.0f}s...")
+                elif now - self.appe_breach_start >= TREND_CONFIRM_SEC:
+                    print(f"\n[APPE] Confirmed (held {now - self.appe_breach_start:.0f}s) — exit @ U ₹{unrealized:.0f}")
+                    return "APPE_RATCHET"
+            else:
+                # below floor but trend not down (a dip in an up-leg) — don't arm the timer
+                self.appe_breach_start = None
+        else:
+            # recovered above floor — cancel any pending confirmation
+            self.appe_breach_start = None
+
+        return None
 
     def start_websocket(self):
         while not self.stop_event.is_set():
@@ -325,6 +443,7 @@ class EMACrossoverBot:
                     self.position = signal
                     self.entry_price = price
                     self.peak_price = price
+                    self._reset_appe()
                     if signal == "BUY":
                         self.trailing_sl = round(price * (1 - TRAILING_SL_PCT / 100), 2)
                     else:
@@ -381,6 +500,7 @@ class EMACrossoverBot:
                 self.entry_price = 0.0
                 self.trailing_sl = 0.0
                 self.peak_price = 0.0
+                self._reset_appe()
                 self.exit_in_progress = False
                 self.save_state()
             else:
@@ -410,6 +530,7 @@ class EMACrossoverBot:
                 self.entry_price = 0.0
                 self.trailing_sl = 0.0
                 self.peak_price = 0.0
+                self._reset_appe()
                 self.exit_in_progress = False
                 self.save_state()
         except Exception as e:
