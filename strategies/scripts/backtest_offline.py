@@ -270,6 +270,19 @@ def run_ema_backtest():
     else:
         _run_ema_trades(filtered, data_sim, QTY, TRAILING_SL_PCT)
 
+    # --- Run C: APPE comparison (price-trail vs APPE), on the volume-filtered trades ---
+    print(f"\n  {'─'*60}")
+    print(f"  RUN C: APPE vs current price-trail (1-min replay)")
+    print(f"  {'─'*60}")
+    if not filtered:
+        print("    No trades to compare")
+    else:
+        data_1m = load_csv(BASE_DIR / "banknifty_fut_1m.csv")
+        if data_1m is None:
+            print("    SKIP — no banknifty_fut_1m.csv (needed for intra-trade P&L replay)")
+        else:
+            _compare_appe(filtered, data_1m, QTY, TRAILING_SL_PCT)
+
 
 def _run_ema_trades(crossovers, data, qty, trailing_sl_pct):
     trades = []
@@ -361,6 +374,139 @@ def _run_ema_trades(crossovers, data, qty, trailing_sl_pct):
     losers = [t for t in trades if t["pnl"] <= 0]
     sign = "+" if total >= 0 else ""
     print(f"\n    Summary: {sign}{total:,.0f} INR | {len(trades)} trade(s) | W:{len(winners)} L:{len(losers)}")
+
+
+# =========================================================================
+# APPE comparison (mirrors ema_crossover_banknifty.py APPE; see design doc §4)
+# NOTE: approximated on 1-min bars — the live 30s patience collapses to ~1 bar
+# and the 180s slope to ~3 bars, and bar-close understates intrabar wiggle.
+# Directional/magnitude guidance, not exact rupee precision (design §8 caveat).
+# =========================================================================
+import math
+
+APPE_ARM = 15000.0      # PROFIT_ARM_THRESHOLD
+APPE_K = 30.0           # GIVEBACK_K  (G = k·√peak)
+APPE_TREND_BARS = 3     # ~180s / 60s
+APPE_HARD_MULT = 2.0
+
+
+def _u(direction, price, entry_price, qty):
+    return (price - entry_price) * qty if direction == "BUY" else (entry_price - price) * qty
+
+
+def _simulate_day_1m(bars, sig_list, qty, sl_pct, use_appe, eod_ts):
+    """Full-day 1m simulation. Processes the volume-filtered signals as entries/reverses,
+    exits via trailing-SL (always) and APPE (if use_appe, first-to-fire), and re-enters on
+    later signals when flat. Returns the trade list. This is the fair comparison: each
+    exit policy gets its own re-entry sequence."""
+    sig_map = {ts: d for d, ts, p in sig_list}
+    trades = []
+    pos = None
+
+    def open_pos(d, ts, price):
+        return {"dir": d, "ep": price, "ets": ts, "peak_price": price,
+                "sl": price * (1 - sl_pct / 100) if d == "BUY" else price * (1 + sl_pct / 100),
+                "appe_peak": 0.0, "armed": False, "breach_prev": False, "us": []}
+
+    def close_pos(p, ts, price, reason):
+        trades.append({"dir": p["dir"], "ets": p["ets"], "ep": p["ep"],
+                       "xts": ts, "xprice": price, "reason": reason,
+                       "pnl": _u(p["dir"], price, p["ep"], qty)})
+
+    for i in range(len(bars)):
+        ts = bars.index[i]
+        if ts > eod_ts:
+            break
+        row = bars.iloc[i]
+        hi, lo, close = float(row["high"]), float(row["low"]), float(row["close"])
+
+        if pos:
+            d = pos["dir"]
+            # Trailing SL (intrabar high/low) — takes precedence within the bar
+            if d == "BUY":
+                if hi > pos["peak_price"]:
+                    pos["peak_price"] = hi; pos["sl"] = round(pos["peak_price"] * (1 - sl_pct / 100), 2)
+                trail_hit, trail_price = lo <= pos["sl"], pos["sl"]
+            else:
+                if lo < pos["peak_price"]:
+                    pos["peak_price"] = lo; pos["sl"] = round(pos["peak_price"] * (1 + sl_pct / 100), 2)
+                trail_hit, trail_price = hi >= pos["sl"], pos["sl"]
+
+            appe_hit, appe_reason = False, None
+            if use_appe and not trail_hit:
+                u = _u(d, close, pos["ep"], qty)
+                if u > pos["appe_peak"]:
+                    pos["appe_peak"] = u
+                pos["us"].append(u)
+                if not pos["armed"] and pos["appe_peak"] >= APPE_ARM:
+                    pos["armed"] = True
+                if pos["armed"]:
+                    budget = APPE_K * math.sqrt(max(pos["appe_peak"], 0.0))
+                    floor = pos["appe_peak"] - budget
+                    gb = pos["appe_peak"] - u
+                    if gb >= APPE_HARD_MULT * budget:
+                        appe_hit, appe_reason = True, "APPE_HARD"
+                    elif u < floor:
+                        w = pos["us"][-APPE_TREND_BARS:]
+                        if len(w) >= 2 and (w[-1] - w[0]) < 0:
+                            if pos["breach_prev"]:
+                                appe_hit, appe_reason = True, "APPE_RATCHET"
+                            pos["breach_prev"] = True
+                        else:
+                            pos["breach_prev"] = False
+                    else:
+                        pos["breach_prev"] = False
+
+            if trail_hit:
+                close_pos(pos, ts, trail_price, "TRAILING_SL"); pos = None
+            elif appe_hit:
+                close_pos(pos, ts, close, appe_reason); pos = None
+
+        # Signal at this bar (entry / reverse)
+        if ts in sig_map:
+            sd = sig_map[ts]
+            if pos and pos["dir"] != sd:
+                close_pos(pos, ts, close, "REVERSE"); pos = None
+            if pos is None:
+                pos = open_pos(sd, ts, close)
+
+    if pos is not None:
+        eod_bars = bars[bars.index <= eod_ts]
+        if len(eod_bars):
+            close_pos(pos, eod_bars.index[-1], float(eod_bars.iloc[-1]["close"]), "EOD")
+    return trades
+
+
+def _compare_appe(crossovers, data_1m, qty, sl_pct):
+    eod_ts = pd.Timestamp(f"{DATE} 15:14", tz=data_1m.index.tz) if data_1m.index.tz \
+        else pd.Timestamp(f"{DATE} 15:14")
+    bars = data_1m[data_1m.index >= f"{DATE} 09:15"]
+    if len(bars) == 0:
+        print("    No 1m bars in session")
+        return
+
+    base = _simulate_day_1m(bars, crossovers, qty, sl_pct, False, eod_ts)
+    appe = _simulate_day_1m(bars, crossovers, qty, sl_pct, True, eod_ts)
+
+    def show(label, trades):
+        tot = sum(t["pnl"] for t in trades)
+        print(f"\n    {label}:")
+        if not trades:
+            print("      (no trades)")
+        for t in trades:
+            s = "+" if t["pnl"] >= 0 else ""
+            print(f"      {t['dir']:<4} {t['ets'].strftime('%H:%M')} @ {t['ep']:>9.0f} -> "
+                  f"{t['reason']:<13} {t['xts'].strftime('%H:%M')} @ {t['xprice']:>9.0f} | {s}{t['pnl']:>9,.0f}")
+        ss = "+" if tot >= 0 else ""
+        print(f"      Total: {ss}{tot:,.0f} INR ({len(trades)} trade(s))")
+        return tot
+
+    bt = show("WITHOUT APPE (price-trail only)", base)
+    at = show("WITH APPE (first-to-fire)", appe)
+    d = at - bt
+    ds = "+" if d >= 0 else ""
+    print(f"\n    APPE delta: {ds}{d:,.0f} INR")
+    print("    (1-min approximation — patience≈1 bar, slope≈3 bars, bar-close understates intrabar wiggle)")
 
 
 # =========================================================================
