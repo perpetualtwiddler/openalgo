@@ -1,0 +1,46 @@
+{
+  "ema_crossover_banknifty_20260507020538": {
+    "name": "EMA 9/21 Crossover - BankNifty 5min",
+    "file_path": "strategies/scripts/ema_crossover_banknifty_20260507020538.py",
+    "file_name": "ema_crossover_banknifty_20260507020538.py",
+    "exchange": "NFO",
+    "is_running": false,
+    "is_scheduled": true,
+    "created_at": "2026-05-07T02:05:38.950173+05:30",
+    "user_id": "admin",
+    "schedule_start": "09:15",
+    "schedule_stop": "15:15",
+    "schedule_days": [
+      "mon",
+      "tue",
+      "wed",
+      "thu",
+      "fri"
+    ],
+    "last_started": "2026-06-01T09:15:00.020133+05:30",
+    "pid": null,
+    "last_stopped": "2026-06-01T15:15:00.027202+05:30"
+  },
+  "short_straddle_nifty_20260507020539": {
+    "name": "9:20 AM Short Straddle - Nifty ATM",
+    "file_path": "strategies/scripts/short_straddle_nifty_20260507020539.py",
+    "file_name": "short_straddle_nifty_20260507020539.py",
+    "exchange": "NFO",
+    "is_running": false,
+    "is_scheduled": true,
+    "created_at": "2026-05-07T02:05:39.950173+05:30",
+    "user_id": "admin",
+    "schedule_start": "09:15",
+    "schedule_stop": "15:20",
+    "schedule_days": [
+      "mon",
+      "tue",
+      "wed",
+      "thu",
+      "fri"
+    ],
+    "last_started": "2026-06-01T09:15:00.073314+05:30",
+    "pid": null,
+    "last_stopped": "2026-05-14T15:20:00.024624+05:30"
+  }
+}
