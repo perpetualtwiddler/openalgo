@@ -21,6 +21,7 @@ from time import monotonic, sleep
 
 import psutil
 import pytz
+from apscheduler.executors.debug import DebugExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import (
@@ -107,9 +108,22 @@ def init_scheduler():
     """Initialize the APScheduler with IST timezone"""
     global SCHEDULER
     if SCHEDULER is None:
-        SCHEDULER = BackgroundScheduler(daemon=True, timezone=IST)
+        # Use a synchronous (DebugExecutor) executor instead of the default
+        # concurrent.futures ThreadPoolExecutor. Under gunicorn's eventlet
+        # worker, eventlet monkey-patches threading and the ThreadPoolExecutor's
+        # module-global _shutdown flag gets set (via the _python_exit atexit
+        # handler firing in the green-thread context), after which every
+        # submit() raises "cannot schedule new futures after interpreter
+        # shutdown" — silently killing market_hours_enforcer / cleanup_dead_processes
+        # within ~30s of every start. These jobs are tiny and fast, so running
+        # them synchronously in the scheduler's own thread is safe and sidesteps
+        # concurrent.futures entirely. See ADAPTIVE_PROFIT_EXIT_DESIGN.md notes /
+        # strategies/scripts STRATEGIES.md changelog.
+        SCHEDULER = BackgroundScheduler(
+            daemon=True, timezone=IST, executors={"default": DebugExecutor()}
+        )
         SCHEDULER.start()
-        logger.debug(f"Scheduler initialized with IST timezone on {OS_TYPE}")
+        logger.debug(f"Scheduler initialized (DebugExecutor, eventlet-safe) with IST timezone on {OS_TYPE}")
 
         # Add daily trading day check job - runs at 00:01 IST every day
         # This stops scheduled strategies on weekends/holidays
