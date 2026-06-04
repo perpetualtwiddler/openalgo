@@ -79,6 +79,12 @@ STATE_DIR = Path(os.getenv("STATE_DIR", "/root/data/openalgo/strategies/state"))
 STATE_FILE = STATE_DIR / f"{STRATEGY_TAG}_state.json"
 
 
+def log(msg):
+    """Timestamped, append-mode log — no \r, no overwriting, safe outside a TTY."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts}  {msg}", flush=True)
+
+
 def resolve_futures_symbol(client, underlying, exchange):
     """Fetch nearest expiry and build the futures symbol (e.g. BANKNIFTY26MAY26FUT)."""
     resp = client.expiry(symbol=underlying, exchange=exchange, instrumenttype="futures")
@@ -87,7 +93,7 @@ def resolve_futures_symbol(client, underlying, exchange):
     nearest = resp["data"][0]
     day, mon, yr = nearest.split("-")
     symbol = f"{underlying}{day}{mon}{yr}FUT"
-    print(f"[SYMBOL] Resolved {underlying} -> {symbol} (expiry {nearest})")
+    log(f"[SYMBOL] Resolved {underlying} -> {symbol} (expiry {nearest})")
     return symbol
 
 
@@ -119,18 +125,18 @@ class EMACrossoverBot:
 
         self.load_state()
 
-        print(f"[INIT] {STRATEGY_NAME}")
-        print(f"[INIT] {self.symbol} on {EXCHANGE} | EMA({FAST_EMA}/{SLOW_EMA}) | {CANDLE_TIMEFRAME}")
-        print(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
-        print(f"[INIT] Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
+        log(f"[INIT] {STRATEGY_NAME}")
+        log(f"[INIT] {self.symbol} on {EXCHANGE} | EMA({FAST_EMA}/{SLOW_EMA}) | {CANDLE_TIMEFRAME}")
+        log(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
+        log(f"[INIT] Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
         if APPE_ENABLED:
-            print(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} | G={GIVEBACK_K:g}·√peak | "
+            log(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} | G={GIVEBACK_K:g}·√peak | "
                   f"trend {TREND_WINDOW_SEC:.0f}s | confirm {TREND_CONFIRM_SEC:.0f}s | hard ×{HARD_MULT:g}")
         else:
-            print("[INIT] APPE off — price trailing-SL only")
-        print(f"[INIT] Qty: {QUANTITY} | Product: {PRODUCT} | Direction: {TRADE_DIRECTION}")
+            log("[INIT] APPE off — price trailing-SL only")
+        log(f"[INIT] Qty: {QUANTITY} | Product: {PRODUCT} | Direction: {TRADE_DIRECTION}")
         if self.position:
-            print(f"[INIT] Resumed {self.position} @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}")
+            log(f"[INIT] Resumed {self.position} @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}")
 
     # -------------------------------------------------------------------------
     # State persistence
@@ -152,9 +158,9 @@ class EMACrossoverBot:
                 "appe_armed": self.appe_armed,
             }
             STATE_FILE.write_text(json.dumps(state))
-            print(f"[STATE] Saved: {self.position} @ {self.entry_price:.2f}")
+            log(f"[STATE] Saved: {self.position} @ {self.entry_price:.2f}")
         except Exception as e:
-            print(f"[STATE ERROR] Save failed: {e}")
+            log(f"[STATE ERROR] Save failed: {e}")
 
     def load_state(self):
         try:
@@ -162,11 +168,11 @@ class EMACrossoverBot:
                 return
             state = json.loads(STATE_FILE.read_text())
             if state.get("date") != datetime.now().strftime("%Y-%m-%d"):
-                print("[STATE] Stale state from previous day — ignoring")
+                log("[STATE] Stale state from previous day — ignoring")
                 self.clear_state()
                 return
             if state.get("symbol") != self.symbol:
-                print(f"[STATE] Symbol mismatch ({state.get('symbol')} vs {self.symbol}) — ignoring")
+                log(f"[STATE] Symbol mismatch ({state.get('symbol')} vs {self.symbol}) — ignoring")
                 self.clear_state()
                 return
             self.position = state.get("position")
@@ -178,15 +184,15 @@ class EMACrossoverBot:
             self.appe_peak = state.get("appe_peak", 0.0)
             self.appe_armed = state.get("appe_armed", False)
         except Exception as e:
-            print(f"[STATE ERROR] Load failed: {e}")
+            log(f"[STATE ERROR] Load failed: {e}")
 
     def clear_state(self):
         try:
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
-                print("[STATE] Cleared")
+                log("[STATE] Cleared")
         except Exception as e:
-            print(f"[STATE ERROR] Clear failed: {e}")
+            log(f"[STATE ERROR] Clear failed: {e}")
 
     # -------------------------------------------------------------------------
     # WebSocket — real-time price + trailing stop-loss
@@ -197,10 +203,9 @@ class EMACrossoverBot:
             return
 
         self.ltp = float(data["data"]["ltp"])
-        now = datetime.now().strftime("%H:%M:%S")
 
         if not self.position or self.exit_in_progress:
-            print(f"\r[{now}] LTP: {self.ltp:.2f} | No position | Day P&L: {self.daily_pnl:.2f}    ", end="")
+            log(f"[LTP] {self.ltp:.2f} | No position | Day P&L: {self.daily_pnl:.2f}")
             return
 
         # Update trailing stop-loss.
@@ -227,10 +232,9 @@ class EMACrossoverBot:
             hit_sl = self.ltp >= self.trailing_sl
 
         sign = "+" if unrealized > 0 else ""
-        print(
-            f"\r[{now}] LTP: {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
-            f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}    ",
-            end="",
+        log(
+            f"[LTP] {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
+            f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}"
         )
 
         # APPE — adaptive profit-protection exit. First-to-fire vs the price trail below.
@@ -243,7 +247,7 @@ class EMACrossoverBot:
 
         if hit_sl and not self.exit_in_progress:
             self.exit_in_progress = True
-            print(f"\n[ALERT] Trailing SL hit at {self.ltp:.2f} (SL was {self.trailing_sl:.2f})")
+            log(f"[ALERT] Trailing SL hit at {self.ltp:.2f} (SL was {self.trailing_sl:.2f})")
             threading.Thread(target=self.place_exit, args=("TRAILING_SL",), daemon=True).start()
 
     # -------------------------------------------------------------------------
@@ -293,7 +297,7 @@ class EMACrossoverBot:
         if not self.appe_armed:
             if self.appe_peak >= PROFIT_ARM_THRESHOLD:
                 self.appe_armed = True
-                print(f"\n[APPE] Armed — peak ₹{self.appe_peak:.0f} ≥ arm ₹{PROFIT_ARM_THRESHOLD:.0f}")
+                log(f"[APPE] Armed — peak ₹{self.appe_peak:.0f} ≥ arm ₹{PROFIT_ARM_THRESHOLD:.0f}")
             else:
                 return None
 
@@ -303,7 +307,7 @@ class EMACrossoverBot:
 
         # Gate 4 — catastrophic give-back: exit immediately, skip confirmation
         if giveback >= HARD_MULT * budget:
-            print(f"\n[APPE] HARD exit — give-back ₹{giveback:.0f} ≥ {HARD_MULT:g}×budget ₹{budget:.0f} "
+            log(f"[APPE] HARD exit — give-back ₹{giveback:.0f} ≥ {HARD_MULT:g}×budget ₹{budget:.0f} "
                   f"(peak ₹{self.appe_peak:.0f}, U ₹{unrealized:.0f})")
             return "APPE_HARD"
 
@@ -314,10 +318,10 @@ class EMACrossoverBot:
                 # Gate 3b — confirm-and-hold for TREND_CONFIRM_SEC
                 if self.appe_breach_start is None:
                     self.appe_breach_start = now
-                    print(f"\n[APPE] Breach floor ₹{floor:.0f} (U ₹{unrealized:.0f}, peak ₹{self.appe_peak:.0f}) "
+                    log(f"[APPE] Breach floor ₹{floor:.0f} (U ₹{unrealized:.0f}, peak ₹{self.appe_peak:.0f}) "
                           f"+ trend down — confirming {TREND_CONFIRM_SEC:.0f}s...")
                 elif now - self.appe_breach_start >= TREND_CONFIRM_SEC:
-                    print(f"\n[APPE] Confirmed (held {now - self.appe_breach_start:.0f}s) — exit @ U ₹{unrealized:.0f}")
+                    log(f"[APPE] Confirmed (held {now - self.appe_breach_start:.0f}s) — exit @ U ₹{unrealized:.0f}")
                     return "APPE_RATCHET"
             else:
                 # below floor but trend not down (a dip in an up-leg) — don't arm the timer
@@ -333,11 +337,11 @@ class EMACrossoverBot:
             try:
                 self.client.connect()
                 self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
-                print(f"[WS] Connected — monitoring {self.symbol}")
+                log(f"[WS] Connected — monitoring {self.symbol}")
                 while not self.stop_event.is_set():
                     time.sleep(1)
             except Exception as e:
-                print(f"\n[WS ERROR] {e}")
+                log(f"[WS ERROR] {e}")
             finally:
                 try:
                     self.client.unsubscribe_ltp(self.instrument)
@@ -345,7 +349,7 @@ class EMACrossoverBot:
                 except Exception:
                     pass
             if not self.stop_event.is_set():
-                print("[WS] Reconnecting in 5s...")
+                log("[WS] Reconnecting in 5s...")
                 time.sleep(5)
 
     # -------------------------------------------------------------------------
@@ -363,7 +367,7 @@ class EMACrossoverBot:
             if data is not None and len(data) > 0:
                 return data
         except Exception as e:
-            print(f"\n[DATA ERROR] {e}")
+            log(f"[DATA ERROR] {e}")
         return None
 
     def check_signal(self, df):
@@ -380,8 +384,8 @@ class EMACrossoverBot:
 
         vol_ok = last["volume"] > VOLUME_FILTER_MULT * last["vol_sma"] if last["vol_sma"] > 0 else False
 
-        print(
-            f"\n[SIGNAL CHECK] EMA({FAST_EMA}): {last['ema_fast']:.2f} | "
+        log(
+            f"[SIGNAL CHECK] EMA({FAST_EMA}): {last['ema_fast']:.2f} | "
             f"EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
             f"Vol: {last['volume']:.0f} vs {VOLUME_FILTER_MULT}x SMA: {last['vol_sma'] * VOLUME_FILTER_MULT:.0f} | "
             f"Vol OK: {vol_ok}"
@@ -390,18 +394,18 @@ class EMACrossoverBot:
         # Bullish crossover
         if prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]:
             if vol_ok and TRADE_DIRECTION in ("LONG", "BOTH"):
-                print("[SIGNAL] BUY — EMA fast crossed above slow with volume confirmation")
+                log("[SIGNAL] BUY — EMA fast crossed above slow with volume confirmation")
                 return "BUY"
             elif not vol_ok:
-                print("[SIGNAL] BUY crossover detected but volume filter not met — skipping")
+                log("[SIGNAL] BUY crossover detected but volume filter not met — skipping")
 
         # Bearish crossover
         if prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"]:
             if vol_ok and TRADE_DIRECTION in ("SHORT", "BOTH"):
-                print("[SIGNAL] SELL — EMA fast crossed below slow with volume confirmation")
+                log("[SIGNAL] SELL — EMA fast crossed below slow with volume confirmation")
                 return "SELL"
             elif not vol_ok:
-                print("[SIGNAL] SELL crossover detected but volume filter not met — skipping")
+                log("[SIGNAL] SELL crossover detected but volume filter not met — skipping")
 
         return None
 
@@ -421,26 +425,26 @@ class EMACrossoverBot:
                         if price > 0:
                             return price
                     elif d.get("order_status") in ("rejected", "cancelled"):
-                        print(f"[ORDER] {d.get('order_status')}: {d.get('status_message', '')}")
+                        log(f"[ORDER] {d.get('order_status')}: {d.get('status_message', '')}")
                         return None
             except Exception as e:
-                print(f"[ORDER STATUS ERROR] {e}")
+                log(f"[ORDER STATUS ERROR] {e}")
         return None
 
     def place_entry(self, signal):
         if self.daily_pnl <= -MAX_LOSS_PER_DAY:
-            print(f"[CIRCUIT BREAKER] Daily loss {self.daily_pnl:.0f} exceeds limit {MAX_LOSS_PER_DAY} — no new trades")
+            log(f"[CIRCUIT BREAKER] Daily loss {self.daily_pnl:.0f} exceeds limit {MAX_LOSS_PER_DAY} — no new trades")
             return False
 
         if self.position and self.position != signal:
-            print(f"[REVERSE] Closing {self.position} before entering {signal}")
+            log(f"[REVERSE] Closing {self.position} before entering {signal}")
             self.place_exit("REVERSE_SIGNAL")
             time.sleep(1)
 
         if self.position:
             return False
 
-        print(f"\n[ENTRY] Placing {signal} for {QUANTITY} qty of {self.symbol}")
+        log(f"[ENTRY] Placing {signal} for {QUANTITY} qty of {self.symbol}")
         try:
             resp = self.client.placeorder(
                 strategy=STRATEGY_NAME, symbol=self.symbol, exchange=EXCHANGE,
@@ -448,7 +452,7 @@ class EMACrossoverBot:
             )
             if resp.get("status") == "success":
                 order_id = resp.get("orderid")
-                print(f"[ENTRY] Order placed: {order_id}")
+                log(f"[ENTRY] Order placed: {order_id}")
                 price = self.get_fill_price(order_id)
                 if price:
                     self.position = signal
@@ -462,13 +466,13 @@ class EMACrossoverBot:
                     self.exit_in_progress = False
                     self.trade_count += 1
                     self.save_state()
-                    print(f"[ENTRY] Filled @ {price:.2f} | TSL: {self.trailing_sl:.2f} | Trade #{self.trade_count}")
+                    log(f"[ENTRY] Filled @ {price:.2f} | TSL: {self.trailing_sl:.2f} | Trade #{self.trade_count}")
                     return True
-                print("[ENTRY] Could not confirm fill price")
+                log("[ENTRY] Could not confirm fill price")
             else:
-                print(f"[ENTRY FAILED] {resp}")
+                log(f"[ENTRY FAILED] {resp}")
         except Exception as e:
-            print(f"[ENTRY ERROR] {e}")
+            log(f"[ENTRY ERROR] {e}")
         return False
 
     def place_exit(self, reason="Manual"):
@@ -486,7 +490,7 @@ class EMACrossoverBot:
         entry_price = self.entry_price
 
         exit_action = "SELL" if position == "BUY" else "BUY"
-        print(f"\n[EXIT] Closing {position} — reason: {reason}")
+        log(f"[EXIT] Closing {position} — reason: {reason}")
 
         try:
             resp = self.client.placeorder(
@@ -503,9 +507,9 @@ class EMACrossoverBot:
                         pnl = (entry_price - exit_price) * QUANTITY
                     self.daily_pnl += pnl
                     sign = "+" if pnl > 0 else ""
-                    print(f"[EXIT] Filled @ {exit_price:.2f} | P&L: {sign}{pnl:.0f} | Day total: {self.daily_pnl:.0f}")
+                    log(f"[EXIT] Filled @ {exit_price:.2f} | P&L: {sign}{pnl:.0f} | Day total: {self.daily_pnl:.0f}")
                 else:
-                    print("[EXIT] Order placed but could not confirm fill")
+                    log("[EXIT] Order placed but could not confirm fill")
 
                 self.position = None
                 self.entry_price = 0.0
@@ -515,10 +519,10 @@ class EMACrossoverBot:
                 self.exit_in_progress = False
                 self.save_state()
             else:
-                print(f"[EXIT FAILED] {resp}")
+                log(f"[EXIT FAILED] {resp}")
                 self.exit_in_progress = False
         except Exception as e:
-            print(f"[EXIT ERROR] {e}")
+            log(f"[EXIT ERROR] {e}")
             self.exit_in_progress = False
 
     # -------------------------------------------------------------------------
@@ -536,7 +540,7 @@ class EMACrossoverBot:
                 if p.get("symbol") == self.symbol and p.get("product") == PRODUCT:
                     net_qty += int(p.get("quantity", 0))
             if net_qty == 0 and self.position:
-                print(f"\n[SYNC] Position gone (manual exit?) — resetting from {self.position}")
+                log(f"[SYNC] Position gone (manual exit?) — resetting from {self.position}")
                 self.position = None
                 self.entry_price = 0.0
                 self.trailing_sl = 0.0
@@ -545,14 +549,14 @@ class EMACrossoverBot:
                 self.exit_in_progress = False
                 self.save_state()
         except Exception as e:
-            print(f"[SYNC ERROR] {e}")
+            log(f"[SYNC ERROR] {e}")
 
     # -------------------------------------------------------------------------
     # Strategy Loop
     # -------------------------------------------------------------------------
 
     def strategy_loop(self):
-        print("[STRATEGY] Loop started")
+        log("[STRATEGY] Loop started")
         while not self.stop_event.is_set():
             try:
                 now = datetime.now()
@@ -562,11 +566,11 @@ class EMACrossoverBot:
                     continue
                 if now.hour >= 15 and now.minute >= 14:
                     if self.position:
-                        print("\n[EOD] 15:14 — closing position for end of day")
+                        log("[EOD] 15:14 — closing position for end of day")
                         self.place_exit("EOD_SQUAREOFF")
                     self.clear_state()
                     if now.minute >= 19:
-                        print(f"\n[EOD] Post-squareoff — strategy finished for the day.")
+                        log(f"[EOD] Post-squareoff — strategy finished for the day.")
                         self.running = False
                         self.stop_event.set()
                         return
@@ -576,7 +580,7 @@ class EMACrossoverBot:
                 if self.daily_pnl <= -MAX_LOSS_PER_DAY:
                     if self.position:
                         self.place_exit("DAILY_LOSS_LIMIT")
-                    print(f"\r[PAUSED] Daily loss limit hit: {self.daily_pnl:.0f}    ", end="")
+                    log(f"[PAUSED] Daily loss limit hit: {self.daily_pnl:.0f}")
                     time.sleep(60)
                     continue
 
@@ -604,7 +608,7 @@ class EMACrossoverBot:
                             )
                         )
                         if tsl_hit:
-                            print(f"\n[SIGNAL] Reverse signal but TSL already breached "
+                            log(f"[SIGNAL] Reverse signal but TSL already breached "
                                   f"(LTP {self.ltp:.2f} vs TSL {self.trailing_sl:.2f}) — "
                                   f"exiting as TRAILING_SL, skipping reverse entry")
                             self.place_exit("TRAILING_SL")
@@ -616,7 +620,7 @@ class EMACrossoverBot:
                 time.sleep(SIGNAL_CHECK_INTERVAL)
 
             except Exception as e:
-                print(f"\n[STRATEGY ERROR] {e}")
+                log(f"[STRATEGY ERROR] {e}")
                 time.sleep(10)
 
     # -------------------------------------------------------------------------
@@ -624,12 +628,12 @@ class EMACrossoverBot:
     # -------------------------------------------------------------------------
 
     def run(self):
-        print("=" * 65)
-        print(f"  EMA({FAST_EMA}/{SLOW_EMA}) CROSSOVER — {self.symbol} {CANDLE_TIMEFRAME}")
-        print(f"  Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
-        print(f"  Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
-        print(f"  Direction: {TRADE_DIRECTION} | Qty: {QUANTITY} | Product: {PRODUCT}")
-        print("=" * 65)
+        log("=" * 65)
+        log(f"  EMA({FAST_EMA}/{SLOW_EMA}) CROSSOVER — {self.symbol} {CANDLE_TIMEFRAME}")
+        log(f"  Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
+        log(f"  Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
+        log(f"  Direction: {TRADE_DIRECTION} | Qty: {QUANTITY} | Product: {PRODUCT}")
+        log("=" * 65)
 
         ws_t = threading.Thread(target=self.start_websocket, daemon=True)
         ws_t.start()
@@ -642,14 +646,14 @@ class EMACrossoverBot:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("\n\n[SHUTDOWN] Stopping bot...")
+            log("[SHUTDOWN] Stopping bot...")
             self.running = False
             self.stop_event.set()
             if self.position and not self.exit_in_progress:
                 self.place_exit("SHUTDOWN")
             ws_t.join(timeout=5)
             strat_t.join(timeout=5)
-            print(f"[SHUTDOWN] Done. Trades: {self.trade_count} | Day P&L: {self.daily_pnl:.0f}")
+            log(f"[SHUTDOWN] Done. Trades: {self.trade_count} | Day P&L: {self.daily_pnl:.0f}")
 
 
 if __name__ == "__main__":
