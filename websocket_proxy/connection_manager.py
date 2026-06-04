@@ -15,11 +15,13 @@ import os
 import threading
 from collections import defaultdict
 from collections.abc import Callable
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import zmq
 
 from utils.logging import get_logger
+
+from .market_data_recorder import close_market_data_recorder, record_market_data
 
 logger = get_logger(__name__)
 
@@ -188,6 +190,7 @@ class SharedZmqPublisher:
 
         with self._publish_lock:
             try:
+                record_market_data(topic, data, source="shared_zmq_publisher")
                 self.socket.send_multipart(
                     [topic.encode("utf-8"), json.dumps(data).encode("utf-8")]
                 )
@@ -219,6 +222,7 @@ class SharedZmqPublisher:
         self._initialized = False
         SharedZmqPublisher._instance = None
         self.logger.info("Shared ZMQ publisher cleaned up")
+        close_market_data_recorder()
 
 
 class ConnectionPool:
@@ -439,7 +443,7 @@ class ConnectionPool:
                 # - {"success": False, "error": "..."} (ConnectionPool format)
                 # - {"status": "error", "code": "...", "message": "..."} (Adapter format)
                 is_error = (
-                    (result and result.get("success") == False) or
+                    (result and not result.get("success")) or
                     (result and result.get("status") == "error")
                 )
                 if is_error:
@@ -577,7 +581,7 @@ class ConnectionPool:
                     # - {"success": False, "error": "..."} (ConnectionPool format)
                     # - {"status": "error", "code": "...", "message": "..."} (Adapter format)
                     is_error = (
-                        (result and result.get("success") == False) or
+                        (result and not result.get("success")) or
                         (result and result.get("status") == "error")
                     )
                     if is_error:
