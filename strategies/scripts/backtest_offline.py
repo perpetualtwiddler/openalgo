@@ -203,7 +203,7 @@ def run_ema_backtest():
     # Load previous day's data for EMA warmup (live strategy fetches multi-day history)
     from datetime import datetime, timedelta
     prev_date = (datetime.strptime(DATE, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-    warmup_dir = SCRIPT_DIR / "backtest_data" / prev_date
+    warmup_dir = BASE_DIR.parent / prev_date  # same root as the day's data (respects TRADE_DATA_DIR)
     prev_data = load_csv(warmup_dir / "banknifty_fut_5m.csv") if warmup_dir.exists() else None
     warmup_candles = 0
     if prev_data is not None:
@@ -384,7 +384,7 @@ def _run_ema_trades(crossovers, data, qty, trailing_sl_pct):
 # =========================================================================
 import math
 
-APPE_ARM = 15000.0      # PROFIT_ARM_THRESHOLD
+APPE_ARM = float(os.getenv("APPE_ARM", "10000"))  # default 5000×(60/30); set env to sweep
 APPE_K = 30.0           # GIVEBACK_K  (G = k·√peak)
 APPE_TREND_BARS = 3     # ~180s / 60s
 APPE_HARD_MULT = 2.0
@@ -399,7 +399,10 @@ def _simulate_day_1m(bars, sig_list, qty, sl_pct, use_appe, eod_ts):
     exits via trailing-SL (always) and APPE (if use_appe, first-to-fire), and re-enters on
     later signals when flat. Returns the trade list. This is the fair comparison: each
     exit policy gets its own re-entry sequence."""
-    sig_map = {ts: d for d, ts, p in sig_list}
+    # A 5m crossover on the bar timestamped T is only known at its close (T+5m),
+    # which is when the live strategy acts. Enter at the T+5m 1-min bar, not T's
+    # open bar — otherwise entries land at the wrong intrabar price.
+    sig_map = {ts + pd.Timedelta(minutes=5): d for d, ts, p in sig_list}
     trades = []
     pos = None
 
