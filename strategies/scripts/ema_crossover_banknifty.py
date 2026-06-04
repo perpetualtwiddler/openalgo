@@ -76,6 +76,16 @@ TREND_WINDOW_SEC = float(os.getenv("TREND_WINDOW_SEC", "180"))    # slope lookba
 TREND_CONFIRM_SEC = float(os.getenv("TREND_CONFIRM_SEC", "30"))   # breach hold / patience (Gate 3b)
 HARD_MULT = float(os.getenv("HARD_MULT", "2.0"))             # catastrophic give-back multiple (Gate 4)
 
+# Feed-health guard: if no WS ticks arrive for this long during market hours, the feed is
+# considered stale — trailing-SL & APPE (both tick-driven) are inactive, so we log ERROR and
+# refuse new entries rather than trade blind (June 3: 0 ticks all day -> unprotected -20,760).
+FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
+
+
+def log_error(msg):
+    """Emit a clearly-marked, flushed ERROR line for abnormal conditions (greppable)."""
+    print(f"\n[ERROR] [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
 
@@ -124,6 +134,8 @@ class EMACrossoverBot:
         self.appe_armed = False
         self.appe_breach_start = None  # time.monotonic() when the floor breach began
         self.pnl_window = deque()      # (monotonic_ts, unrealized) over TREND_WINDOW_SEC
+        self.last_tick_ts = None       # time.monotonic() of last on_ltp_update (feed-health)
+        self.feed_stale = False        # True while the WS tick feed is stale
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
 
         self.load_state()
@@ -206,6 +218,11 @@ class EMACrossoverBot:
         if data.get("type") != "market_data" or data.get("symbol") != self.symbol:
             return
 
+        self.last_tick_ts = time.monotonic()   # feed-health heartbeat
+        if self.feed_stale:
+            print(f"\n[FEED] Recovered — market-data ticks resumed")
+            self.feed_stale = False
+
         self.ltp = float(data["data"]["ltp"])
         now = datetime.now().strftime("%H:%M:%S")
 
@@ -250,6 +267,28 @@ class EMACrossoverBot:
     # -------------------------------------------------------------------------
     # APPE — Adaptive Profit-Protection Exit (see ADAPTIVE_PROFIT_EXIT_DESIGN.md)
     # -------------------------------------------------------------------------
+
+    def _feed_age(self):
+        """Seconds since the last WS tick, or None if none received yet."""
+        return None if self.last_tick_ts is None else (time.monotonic() - self.last_tick_ts)
+
+    def _feed_ok(self):
+        age = self._feed_age()
+        return age is not None and age <= FEED_STALE_SEC
+
+    def _check_feed_health(self):
+        """During market hours, log ERROR (once per stale episode) if ticks have stopped."""
+        if self._feed_ok():
+            return
+        if not self.feed_stale:
+            self.feed_stale = True
+            age = self._feed_age()
+            age_str = "no ticks yet" if age is None else f"no ticks for {age:.0f}s"
+            log_error(
+                f"Market-data feed STALE ({age_str}, >{FEED_STALE_SEC:.0f}s) — trailing-SL & "
+                f"APPE are INACTIVE; blocking new entries"
+                + ("; a POSITION IS OPEN AND UNPROTECTED — consider manual square-off." if self.position else ".")
+            )
 
     def _reset_appe(self):
         self.appe_peak = 0.0
@@ -338,7 +377,7 @@ class EMACrossoverBot:
                 while not self.stop_event.is_set():
                     time.sleep(1)
             except Exception as e:
-                print(f"\n[WS ERROR] {e}")
+                log_error(f"WebSocket connection error: {e}")
             finally:
                 try:
                     self.client.unsubscribe_ltp(self.instrument)
@@ -433,6 +472,14 @@ class EMACrossoverBot:
             print(f"[CIRCUIT BREAKER] Daily loss {self.daily_pnl:.0f} exceeds limit {MAX_LOSS_PER_DAY} — no new trades")
             return False
 
+        # Feed-health guard: never enter without a live tick feed (no trailing-SL/APPE otherwise)
+        if not self._feed_ok():
+            age = self._feed_age()
+            age_str = "no ticks yet" if age is None else f"no ticks for {age:.0f}s"
+            log_error(f"Skipping {signal} entry — market-data feed stale ({age_str}); "
+                      f"refusing to trade blind without trailing-SL/APPE protection.")
+            return False
+
         if self.position and self.position != signal:
             print(f"[REVERSE] Closing {self.position} before entering {signal}")
             self.place_exit("REVERSE_SIGNAL")
@@ -465,11 +512,11 @@ class EMACrossoverBot:
                     self.save_state()
                     print(f"[ENTRY] Filled @ {price:.2f} | TSL: {self.trailing_sl:.2f} | Trade #{self.trade_count}")
                     return True
-                print("[ENTRY] Could not confirm fill price")
+                log_error(f"ENTRY {signal} placed (order {order_id}) but fill price NOT confirmed — position state uncertain.")
             else:
-                print(f"[ENTRY FAILED] {resp}")
+                log_error(f"ENTRY {signal} order REJECTED/failed: {resp}")
         except Exception as e:
-            print(f"[ENTRY ERROR] {e}")
+            log_error(f"ENTRY {signal} exception: {e}")
         return False
 
     def place_exit(self, reason="Manual"):
@@ -506,7 +553,7 @@ class EMACrossoverBot:
                     sign = "+" if pnl > 0 else ""
                     print(f"[EXIT] Filled @ {exit_price:.2f} | P&L: {sign}{pnl:.0f} | Day total: {self.daily_pnl:.0f}")
                 else:
-                    print("[EXIT] Order placed but could not confirm fill")
+                    log_error(f"EXIT {position} ({reason}) placed (order {order_id}) but fill NOT confirmed — verify square-off manually.")
 
                 self.position = None
                 self.entry_price = 0.0
@@ -516,10 +563,10 @@ class EMACrossoverBot:
                 self.exit_in_progress = False
                 self.save_state()
             else:
-                print(f"[EXIT FAILED] {resp}")
+                log_error(f"EXIT {position} ({reason}) order REJECTED/failed — POSITION MAY STILL BE OPEN: {resp}")
                 self.exit_in_progress = False
         except Exception as e:
-            print(f"[EXIT ERROR] {e}")
+            log_error(f"EXIT {position} ({reason}) exception — POSITION MAY STILL BE OPEN: {e}")
             self.exit_in_progress = False
 
     # -------------------------------------------------------------------------
@@ -581,6 +628,9 @@ class EMACrossoverBot:
                     time.sleep(60)
                     continue
 
+                # Feed-health watchdog (market hours): logs ERROR if ticks have stopped
+                self._check_feed_health()
+
                 if self.position:
                     self.sync_position()
 
@@ -601,7 +651,7 @@ class EMACrossoverBot:
                 time.sleep(SIGNAL_CHECK_INTERVAL)
 
             except Exception as e:
-                print(f"\n[STRATEGY ERROR] {e}")
+                log_error(f"Strategy loop exception: {e}")
                 time.sleep(10)
 
     # -------------------------------------------------------------------------

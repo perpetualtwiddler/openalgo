@@ -88,6 +88,15 @@ SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "14"))
 # P&L check interval (seconds)
 PNL_CHECK_INTERVAL = int(os.getenv("PNL_CHECK_INTERVAL", "5"))
 
+# Feed-health guard: if option quotes stop succeeding for this long while positioned, PT/SL are
+# evaluating on stale prices (position effectively unprotected) — log ERROR so we can intervene.
+FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
+
+
+def log_error(msg):
+    """Emit a clearly-marked, flushed ERROR line for abnormal conditions (greppable)."""
+    print(f"\n[ERROR] [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
 STRATEGY_NAME = os.getenv("STRATEGY_NAME", "SHORT_STRADDLE_NIFTY")
 STRATEGY_TAG = STRATEGY_NAME.replace("/", "_").replace(" ", "_")
 
@@ -105,6 +114,10 @@ class ShortStraddleBot:
         self.client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)
         self.running = True
         self.stop_event = threading.Event()
+
+        # Feed-health (quote-poll) tracking
+        self.last_quote_ts = None   # time.monotonic() of last successful option quote
+        self.feed_stale = False
 
         # Position state
         self.is_positioned = False
@@ -424,10 +437,10 @@ class ShortStraddleBot:
                 spot = float(quote["data"].get("ltp", 0))
                 print(f"[ENTRY] {UNDERLYING} spot: {spot:.2f}")
             else:
-                print(f"[ENTRY] Could not fetch spot: {quote}")
+                log_error(f"ENTRY aborted — could not fetch {UNDERLYING} spot (feed issue): {quote}")
                 return False
         except Exception as e:
-            print(f"[ENTRY ERROR] Spot fetch: {e}")
+            log_error(f"ENTRY aborted — spot fetch exception (feed issue): {e}")
             return False
 
         mode = "iron butterfly" if ENABLE_HEDGE else "short straddle"
@@ -459,13 +472,13 @@ class ShortStraddleBot:
             print(f"[ENTRY] Response: {resp}")
 
             if resp.get("status") != "success":
-                print(f"[ENTRY FAILED] {resp}")
+                log_error(f"ENTRY straddle order REJECTED/failed — no position taken: {resp}")
                 return False
 
             results = resp.get("results", [])
             expected_legs = 4 if ENABLE_HEDGE else 2
             if len(results) < expected_legs:
-                print(f"[ENTRY] Unexpected response (expected {expected_legs} legs): {resp}")
+                log_error(f"ENTRY straddle returned {len(results)}/{expected_legs} legs — partial fill risk: {resp}")
                 return False
 
             # Match SELL results by option_type
@@ -617,15 +630,16 @@ class ShortStraddleBot:
 
             # Fetch current option LTPs
             try:
+                got_quote = False
                 if self.ce_symbol:
                     ce_quote = self.client.quotes(symbol=self.ce_symbol, exchange="NFO")
                     if ce_quote.get("status") == "success":
-                        self.ce_ltp = float(ce_quote["data"].get("ltp", self.ce_ltp))
+                        self.ce_ltp = float(ce_quote["data"].get("ltp", self.ce_ltp)); got_quote = True
 
                 if self.pe_symbol:
                     pe_quote = self.client.quotes(symbol=self.pe_symbol, exchange="NFO")
                     if pe_quote.get("status") == "success":
-                        self.pe_ltp = float(pe_quote["data"].get("ltp", self.pe_ltp))
+                        self.pe_ltp = float(pe_quote["data"].get("ltp", self.pe_ltp)); got_quote = True
 
                 if ENABLE_HEDGE:
                     if self.hedge_ce_symbol:
@@ -636,10 +650,23 @@ class ShortStraddleBot:
                         hpe_quote = self.client.quotes(symbol=self.hedge_pe_symbol, exchange="NFO")
                         if hpe_quote.get("status") == "success":
                             self.hedge_pe_ltp = float(hpe_quote["data"].get("ltp", self.hedge_pe_ltp))
+                if got_quote:
+                    self.last_quote_ts = time.monotonic()
+                    if self.feed_stale:
+                        print("\n[FEED] Recovered — option quotes resuming")
+                        self.feed_stale = False
             except Exception as e:
-                print(f"\n[QUOTE ERROR] {e}")
+                log_error(f"Option quote fetch exception: {e}")
                 time.sleep(PNL_CHECK_INTERVAL)
                 continue
+
+            # Feed-health: PT/SL rely on fresh quotes — if none for FEED_STALE_SEC, position is unprotected
+            age = None if self.last_quote_ts is None else (time.monotonic() - self.last_quote_ts)
+            if age is not None and age > FEED_STALE_SEC and not self.feed_stale:
+                self.feed_stale = True
+                log_error(f"Option-quote feed STALE (no successful quote for {age:.0f}s, >{FEED_STALE_SEC:.0f}s) "
+                          f"— PT/SL evaluating on stale prices; straddle position is effectively UNPROTECTED. "
+                          f"Consider manual square-off.")
 
             # Short legs P&L: profit when prices DROP from entry
             ce_pnl = (self.ce_entry_price - self.ce_ltp) * QUANTITY
@@ -704,9 +731,9 @@ class ShortStraddleBot:
                     ce_exit = self._get_fill_price(resp.get("orderid"))
                     print(f"[EXIT] CE closed: {self.ce_symbol} @ {ce_exit or 'pending'}")
                 else:
-                    print(f"[EXIT CE FAILED] {resp}")
+                    log_error(f"EXIT CE leg ({reason}) FAILED — {self.ce_symbol} MAY STILL BE OPEN (short): {resp}")
             except Exception as e:
-                print(f"[EXIT CE ERROR] {e}")
+                log_error(f"EXIT CE leg ({reason}) exception — {self.ce_symbol} MAY STILL BE OPEN (short): {e}")
 
         if self.pe_symbol:
             try:
@@ -718,9 +745,9 @@ class ShortStraddleBot:
                     pe_exit = self._get_fill_price(resp.get("orderid"))
                     print(f"[EXIT] PE closed: {self.pe_symbol} @ {pe_exit or 'pending'}")
                 else:
-                    print(f"[EXIT PE FAILED] {resp}")
+                    log_error(f"EXIT PE leg ({reason}) FAILED — {self.pe_symbol} MAY STILL BE OPEN (short): {resp}")
             except Exception as e:
-                print(f"[EXIT PE ERROR] {e}")
+                log_error(f"EXIT PE leg ({reason}) exception — {self.pe_symbol} MAY STILL BE OPEN (short): {e}")
 
         if ENABLE_HEDGE:
             for sym, label in [(self.hedge_ce_symbol, "HEDGE CE"), (self.hedge_pe_symbol, "HEDGE PE")]:
@@ -734,9 +761,9 @@ class ShortStraddleBot:
                             hprice = self._get_fill_price(resp.get("orderid"))
                             print(f"[EXIT] {label} closed: {sym} @ {hprice or 'pending'}")
                         else:
-                            print(f"[EXIT {label} FAILED] {resp}")
+                            log_error(f"EXIT {label} leg ({reason}) FAILED — {sym} hedge MAY STILL BE OPEN (long): {resp}")
                     except Exception as e:
-                        print(f"[EXIT {label} ERROR] {e}")
+                        log_error(f"EXIT {label} leg ({reason}) exception — {sym} hedge MAY STILL BE OPEN (long): {e}")
 
         ce_pnl = (self.ce_entry_price - (ce_exit or self.ce_ltp)) * QUANTITY
         pe_pnl = (self.pe_entry_price - (pe_exit or self.pe_ltp)) * QUANTITY
