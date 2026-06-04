@@ -680,15 +680,16 @@ def stop_strategy_process(strategy_id):
                         except ProcessLookupError:
                             pass  # Process already dead
             elif hasattr(process, "terminate"):
-                # For psutil.Process objects
-                try:
-                    process.terminate()
-                    process.wait(timeout=5)
-                except psutil.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass  # Process already dead or no permission
+                # For psutil.Process objects (e.g. strategies adopted by PID after
+                # an app restart). Delegate to terminate_process_cross_platform,
+                # which polls is_running() with sleeps. Do NOT call psutil's
+                # process.wait() here: under the gunicorn+eventlet worker it calls
+                # select.poll() (via pidfd), which eventlet's monkey-patched select
+                # does not expose on Linux -> AttributeError. That aborted the stop
+                # before is_running/RUNNING_STRATEGIES were cleared, breaking UI
+                # stop/restart and leaving a stale is_running=True (which then made
+                # the 08:00 restart restore the strategy early).
+                terminate_process_cross_platform(pid)
             else:
                 # Fallback: use PID directly
                 terminate_process_cross_platform(pid)
