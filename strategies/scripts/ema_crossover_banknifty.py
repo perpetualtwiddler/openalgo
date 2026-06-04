@@ -111,6 +111,11 @@ class EMACrossoverBot:
         self.peak_price = 0.0      # tracks best price for trailing SL
         self.ltp = None
         self.exit_in_progress = False
+        self.entry_pending = False
+        self.pending_entry_signal = None
+        self.pending_entry_order_id = None
+        self.pending_exit_order_id = None
+        self.pending_exit_reason = None
         self.running = True
         self.stop_event = threading.Event()
         self.daily_pnl = 0.0
@@ -202,6 +207,11 @@ class EMACrossoverBot:
         if data.get("type") != "market_data" or data.get("symbol") != self.symbol:
             return
 
+        self.last_tick_ts = time.monotonic()   # feed-health heartbeat
+        if self.feed_stale:
+            print("\n[FEED] Recovered — market-data ticks resumed")
+            self.feed_stale = False
+
         self.ltp = float(data["data"]["ltp"])
 
         if not self.position or self.exit_in_progress:
@@ -277,7 +287,7 @@ class EMACrossoverBot:
         den = sum((x - mx) ** 2 for x in xs)
         if den == 0:
             return False
-        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False)) / den
         return slope < 0
 
     def _appe_evaluate(self, unrealized, now):
@@ -431,6 +441,103 @@ class EMACrossoverBot:
                 log(f"[ORDER STATUS ERROR] {e}")
         return None
 
+    def get_position_snapshot(self):
+        try:
+            resp = self.client.positionbook()
+            if resp.get("status") != "success":
+                return None
+            net_qty = 0
+            avg_price = 0.0
+            for p in resp.get("data", []):
+                if p.get("symbol") == self.symbol and p.get("product") == PRODUCT:
+                    qty = int(p.get("quantity", 0))
+                    net_qty += qty
+                    if qty != 0:
+                        avg_price = float(p.get("average_price", 0) or avg_price)
+            return {"net_qty": net_qty, "average_price": avg_price}
+        except Exception as e:
+            log(f"[SYNC ERROR] Position snapshot failed: {e}")
+            return None
+
+    def initialize_position_from_snapshot(self, signal, snapshot):
+        price = snapshot.get("average_price") or self.ltp
+        if not price:
+            log_error(f"Cannot initialize {signal} state — position exists but no average price/LTP available")
+            return False
+        self.position = signal
+        self.entry_price = float(price)
+        self.peak_price = self.entry_price
+        self._reset_appe()
+        if signal == "BUY":
+            self.trailing_sl = round(self.entry_price * (1 - TRAILING_SL_PCT / 100), 2)
+        else:
+            self.trailing_sl = round(self.entry_price * (1 + TRAILING_SL_PCT / 100), 2)
+        self.entry_pending = False
+        self.pending_entry_signal = None
+        self.pending_entry_order_id = None
+        self.exit_in_progress = False
+        self.trade_count += 1
+        self.save_state()
+        log(f"[ENTRY] Reconciled {signal} position @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f}")
+        return True
+
+    def reconcile_pending_entry(self):
+        if not self.entry_pending or not self.pending_entry_signal:
+            return
+        snapshot = self.get_position_snapshot()
+        if snapshot is None:
+            return
+        net_qty = snapshot.get("net_qty", 0)
+        expected_side = 1 if self.pending_entry_signal == "BUY" else -1
+        if net_qty * expected_side > 0:
+            self.initialize_position_from_snapshot(self.pending_entry_signal, snapshot)
+            return
+
+        if self.pending_entry_order_id:
+            try:
+                resp = self.client.orderstatus(order_id=self.pending_entry_order_id, strategy=STRATEGY_NAME)
+                if resp.get("status") == "success":
+                    status = resp.get("data", {}).get("order_status")
+                    if status in ("rejected", "cancelled"):
+                        log_error(f"Pending entry {self.pending_entry_order_id} ended as {status}; clearing pending entry")
+                        self.entry_pending = False
+                        self.pending_entry_signal = None
+                        self.pending_entry_order_id = None
+                        self.exit_in_progress = False
+            except Exception as e:
+                log(f"[ENTRY RECONCILE ERROR] {e}")
+
+    def reconcile_pending_exit(self):
+        if not self.pending_exit_order_id:
+            return
+        snapshot = self.get_position_snapshot()
+        if snapshot is None:
+            return
+        if snapshot.get("net_qty", 0) == 0:
+            log(f"[EXIT] Confirmed flat after {self.pending_exit_reason or 'pending exit'}")
+            self.position = None
+            self.entry_price = 0.0
+            self.trailing_sl = 0.0
+            self.peak_price = 0.0
+            self._reset_appe()
+            self.exit_in_progress = False
+            self.pending_exit_order_id = None
+            self.pending_exit_reason = None
+            self.save_state()
+            return
+
+        try:
+            resp = self.client.orderstatus(order_id=self.pending_exit_order_id, strategy=STRATEGY_NAME)
+            if resp.get("status") == "success":
+                status = resp.get("data", {}).get("order_status")
+                if status in ("rejected", "cancelled"):
+                    log_error(f"Pending exit {self.pending_exit_order_id} ended as {status}; position still open")
+                    self.pending_exit_order_id = None
+                    self.pending_exit_reason = None
+                    self.exit_in_progress = False
+        except Exception as e:
+            log(f"[EXIT RECONCILE ERROR] {e}")
+
     def place_entry(self, signal):
         if self.daily_pnl <= -MAX_LOSS_PER_DAY:
             log(f"[CIRCUIT BREAKER] Daily loss {self.daily_pnl:.0f} exceeds limit {MAX_LOSS_PER_DAY} — no new trades")
@@ -468,7 +575,12 @@ class EMACrossoverBot:
                     self.save_state()
                     log(f"[ENTRY] Filled @ {price:.2f} | TSL: {self.trailing_sl:.2f} | Trade #{self.trade_count}")
                     return True
-                log("[ENTRY] Could not confirm fill price")
+                log_error(f"ENTRY {signal} placed (order {order_id}) but fill price NOT confirmed — reconciling via positionbook before trading further.")
+                self.entry_pending = True
+                self.pending_entry_signal = signal
+                self.pending_entry_order_id = order_id
+                self.exit_in_progress = True
+                self.reconcile_pending_entry()
             else:
                 log(f"[ENTRY FAILED] {resp}")
         except Exception as e:
@@ -509,15 +621,15 @@ class EMACrossoverBot:
                     sign = "+" if pnl > 0 else ""
                     log(f"[EXIT] Filled @ {exit_price:.2f} | P&L: {sign}{pnl:.0f} | Day total: {self.daily_pnl:.0f}")
                 else:
-                    log("[EXIT] Order placed but could not confirm fill")
+                    log_error(f"EXIT {position} ({reason}) placed (order {order_id}) but fill NOT confirmed — keeping position pending until positionbook confirms flat.")
+                    self.pending_exit_order_id = order_id
+                    self.pending_exit_reason = reason
+                    self.reconcile_pending_exit()
+                    return
 
-                self.position = None
-                self.entry_price = 0.0
-                self.trailing_sl = 0.0
-                self.peak_price = 0.0
-                self._reset_appe()
-                self.exit_in_progress = False
-                self.save_state()
+                self.pending_exit_order_id = order_id
+                self.pending_exit_reason = reason
+                self.reconcile_pending_exit()
             else:
                 log(f"[EXIT FAILED] {resp}")
                 self.exit_in_progress = False
@@ -565,24 +677,35 @@ class EMACrossoverBot:
                     time.sleep(30)
                     continue
                 if now.hour >= 15 and now.minute >= 14:
-                    if self.position:
+                    self.reconcile_pending_entry()
+                    self.reconcile_pending_exit()
+                    if self.position and not self.exit_in_progress:
                         log("[EOD] 15:14 — closing position for end of day")
                         self.place_exit("EOD_SQUAREOFF")
-                    self.clear_state()
-                    if now.minute >= 19:
-                        log(f"[EOD] Post-squareoff — strategy finished for the day.")
+                    if not self.position and not self.exit_in_progress:
+                        self.clear_state()
+                    if now.minute >= 19 and not self.position and not self.exit_in_progress:
+                        log("[EOD] Post-squareoff — strategy finished for the day.")
                         self.running = False
                         self.stop_event.set()
                         return
+                    if now.minute >= 19:
+                        log_error("EOD exit still pending or position still open — keeping strategy alive for retry/manual intervention")
                     time.sleep(60)
                     continue
 
                 if self.daily_pnl <= -MAX_LOSS_PER_DAY:
-                    if self.position:
+                    if self.position and not self.exit_in_progress:
                         self.place_exit("DAILY_LOSS_LIMIT")
                     log(f"[PAUSED] Daily loss limit hit: {self.daily_pnl:.0f}")
                     time.sleep(60)
                     continue
+
+                # Feed-health watchdog (market hours): logs ERROR if ticks have stopped
+                self._check_feed_health()
+
+                self.reconcile_pending_entry()
+                self.reconcile_pending_exit()
 
                 if self.position:
                     self.sync_position()
