@@ -43,6 +43,7 @@ WS_URL = os.getenv("WEBSOCKET_URL") or (
 UNDERLYING = os.getenv("SYMBOL", "BANKNIFTY")
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NFO"))
 QUANTITY = int(os.getenv("QUANTITY", "60"))       # 2 lots x 30 units
+LOT_SIZE = int(os.getenv("LOT_SIZE", "30"))       # BANKNIFTY futures lot size (confirmed 30)
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
 FAST_EMA = int(os.getenv("FAST_EMA", "9"))
@@ -59,7 +60,17 @@ TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5%
 # Trails the *profit curve* (not price): once profit peaks past the arm threshold, exit when it
 # gives back a peak-scaled budget AND the smoothed P&L slope confirms a down-drift (held H sec).
 APPE_ENABLED = os.getenv("APPE_ENABLED", "true").lower() == "true"
-PROFIT_ARM_THRESHOLD = float(os.getenv("PROFIT_ARM_THRESHOLD", "15000"))  # ₹ profit before APPE arms (Gate 1)
+# Gate 1 arm threshold scales with position size so the required points-of-drift to
+# arm stays constant regardless of lots traded. ARM_PER_LOT (₹5,000) per 30-unit lot:
+#   30u -> ₹5,000 | 60u -> ₹10,000 | 90u -> ₹15,000  (all ≈167 BANKNIFTY pts to arm)
+# A fixed ₹15,000 needed ~250 pts on 60u — too rarely hit, so APPE never armed on
+# trades that peaked near it then reversed (e.g. Jun 3/4 round-trips). Set an explicit
+# PROFIT_ARM_THRESHOLD env to override the per-lot formula if ever needed.
+ARM_PER_LOT = float(os.getenv("ARM_PER_LOT", "5000"))        # APPE arm ₹ per lot of LOT_SIZE
+_arm_override = os.getenv("PROFIT_ARM_THRESHOLD")
+PROFIT_ARM_THRESHOLD = (
+    float(_arm_override) if _arm_override else ARM_PER_LOT * (QUANTITY / LOT_SIZE)
+)  # ₹ profit before APPE arms (Gate 1)
 GIVEBACK_K = float(os.getenv("GIVEBACK_K", "30"))             # give-back budget G = k·√P_max (Gate 2)
 TREND_WINDOW_SEC = float(os.getenv("TREND_WINDOW_SEC", "180"))    # slope lookback (Gate 3a)
 TREND_CONFIRM_SEC = float(os.getenv("TREND_CONFIRM_SEC", "30"))   # breach hold / patience (Gate 3b)
@@ -122,7 +133,8 @@ class EMACrossoverBot:
         print(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
         print(f"[INIT] Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
         if APPE_ENABLED:
-            print(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} | G={GIVEBACK_K:g}·√peak | "
+            print(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} "
+                  f"(₹{ARM_PER_LOT:.0f}×{QUANTITY/LOT_SIZE:g} lots) | G={GIVEBACK_K:g}·√peak | "
                   f"trend {TREND_WINDOW_SEC:.0f}s | confirm {TREND_CONFIRM_SEC:.0f}s | hard ×{HARD_MULT:g}")
         else:
             print("[INIT] APPE off — price trailing-SL only")
