@@ -88,6 +88,21 @@ SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "14"))
 # P&L check interval (seconds)
 PNL_CHECK_INTERVAL = int(os.getenv("PNL_CHECK_INTERVAL", "5"))
 
+# Feed-health guard: if option quotes stop succeeding for this long while positioned, PT/SL are
+# evaluating on stale prices (position effectively unprotected) — log ERROR so we can intervene.
+FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
+
+
+def log_error(msg):
+    """Emit a clearly-marked, flushed ERROR line for abnormal conditions (greppable)."""
+    print(f"\n[ERROR] [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def log(msg, end="\n"):
+    """Timestamped, append-mode log — no raw prints outside logging helpers."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts}  {msg}", end=end, flush=True)
+
 STRATEGY_NAME = os.getenv("STRATEGY_NAME", "SHORT_STRADDLE_NIFTY")
 STRATEGY_TAG = STRATEGY_NAME.replace("/", "_").replace(" ", "_")
 
@@ -130,16 +145,16 @@ class ShortStraddleBot:
 
         self.load_state()
 
-        print(f"[INIT] {STRATEGY_NAME}")
+        log(f"[INIT] {STRATEGY_NAME}")
         mode = "Iron Butterfly" if ENABLE_HEDGE else "ATM Straddle"
-        print(f"[INIT] {UNDERLYING} {mode} | {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty")
-        print(f"[INIT] Entry: {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} IST | Exit: {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d} IST")
-        print(f"[INIT] VIX threshold: {'disabled' if SKIP_VIX_CHECK else f'< {VIX_THRESHOLD}'}")
-        print(f"[INIT] Hedge: {'ON — ' + HEDGE_OFFSET + ' wings (iron butterfly)' if ENABLE_HEDGE else 'OFF (naked straddle)'}")
-        print(f"[INIT] Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
-        print(f"[INIT] Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
+        log(f"[INIT] {UNDERLYING} {mode} | {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty")
+        log(f"[INIT] Entry: {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} IST | Exit: {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d} IST")
+        log(f"[INIT] VIX threshold: {'disabled' if SKIP_VIX_CHECK else f'< {VIX_THRESHOLD}'}")
+        log(f"[INIT] Hedge: {'ON — ' + HEDGE_OFFSET + ' wings (iron butterfly)' if ENABLE_HEDGE else 'OFF (naked straddle)'}")
+        log(f"[INIT] Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
+        log(f"[INIT] Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
         if self.is_positioned:
-            print(f"[INIT] Resumed position — CE: {self.ce_symbol} @ {self.ce_entry_price:.2f} | PE: {self.pe_symbol} @ {self.pe_entry_price:.2f}")
+            log(f"[INIT] Resumed position — CE: {self.ce_symbol} @ {self.ce_entry_price:.2f} | PE: {self.pe_symbol} @ {self.pe_entry_price:.2f}")
 
     # -------------------------------------------------------------------------
     # State persistence
@@ -163,9 +178,9 @@ class ShortStraddleBot:
                 "hedge_pe_price": self.hedge_pe_price,
             }
             STATE_FILE.write_text(json.dumps(state))
-            print(f"[STATE] Saved: positioned={self.is_positioned}")
+            log(f"[STATE] Saved: positioned={self.is_positioned}")
         except Exception as e:
-            print(f"[STATE ERROR] Save failed: {e}")
+            log(f"[STATE ERROR] Save failed: {e}")
 
     def load_state(self):
         try:
@@ -173,7 +188,7 @@ class ShortStraddleBot:
                 return
             state = json.loads(STATE_FILE.read_text())
             if state.get("date") != datetime.now().strftime("%Y-%m-%d"):
-                print("[STATE] Stale state from previous day — ignoring")
+                log("[STATE] Stale state from previous day — ignoring")
                 self.clear_state()
                 return
             self.is_positioned = state.get("is_positioned", False)
@@ -196,15 +211,15 @@ class ShortStraddleBot:
             if self.hedge_pe_price > 0:
                 self.hedge_pe_ltp = self.hedge_pe_price
         except Exception as e:
-            print(f"[STATE ERROR] Load failed: {e}")
+            log(f"[STATE ERROR] Load failed: {e}")
 
     def clear_state(self):
         try:
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
-                print("[STATE] Cleared")
+                log("[STATE] Cleared")
         except Exception as e:
-            print(f"[STATE ERROR] Clear failed: {e}")
+            log(f"[STATE ERROR] Clear failed: {e}")
 
     # -------------------------------------------------------------------------
     # Trade history — tracks exit reasons across days
@@ -224,7 +239,7 @@ class ShortStraddleBot:
             history = history[-30:]
             HISTORY_FILE.write_text(json.dumps(history))
         except Exception as e:
-            print(f"[HISTORY ERROR] {e}")
+            log(f"[HISTORY ERROR] {e}")
 
     def check_consecutive_sl(self):
         if CONSECUTIVE_SL_LIMIT <= 0:
@@ -239,11 +254,11 @@ class ShortStraddleBot:
             all_sl = all(t.get("reason") == "STOPLOSS" for t in recent)
             if all_sl:
                 dates = [t.get("date") for t in recent]
-                print(f"[COOLDOWN] Last {CONSECUTIVE_SL_LIMIT} trades were SL hits ({dates}) — skipping today")
+                log(f"[COOLDOWN] Last {CONSECUTIVE_SL_LIMIT} trades were SL hits ({dates}) — skipping today")
                 return True
             return False
         except Exception as e:
-            print(f"[COOLDOWN ERROR] {e}")
+            log(f"[COOLDOWN ERROR] {e}")
             return False
 
     # -------------------------------------------------------------------------
@@ -252,22 +267,22 @@ class ShortStraddleBot:
 
     def check_vix(self):
         if SKIP_VIX_CHECK:
-            print("[VIX] Check disabled — proceeding with entry")
+            log("[VIX] Check disabled — proceeding with entry")
             return True
         try:
             resp = self.client.quotes(symbol="INDIAVIX", exchange="NSE_INDEX")
             if resp.get("status") == "success":
                 vix = float(resp["data"].get("ltp", 0))
-                print(f"[VIX] India VIX: {vix:.2f} | Threshold: {VIX_THRESHOLD}")
+                log(f"[VIX] India VIX: {vix:.2f} | Threshold: {VIX_THRESHOLD}")
                 if vix > VIX_THRESHOLD:
-                    print(f"[VIX] Too high ({vix:.2f} > {VIX_THRESHOLD}) — skipping entry today")
+                    log(f"[VIX] Too high ({vix:.2f} > {VIX_THRESHOLD}) — skipping entry today")
                     return False
                 return True
             else:
-                print(f"[VIX] Could not fetch VIX: {resp} — proceeding with caution")
+                log(f"[VIX] Could not fetch VIX: {resp} — proceeding with caution")
                 return True
         except Exception as e:
-            print(f"[VIX ERROR] {e} — proceeding with caution")
+            log(f"[VIX ERROR] {e} — proceeding with caution")
             return True
 
     # -------------------------------------------------------------------------
@@ -286,12 +301,12 @@ class ShortStraddleBot:
                     expiry_date = datetime.strptime(nearest, "%d-%b-%y").date()
                     today = datetime.now().date()
                     if expiry_date == today:
-                        print(f"[EXPIRY] Today ({today}) is expiry day — skipping straddle (gamma risk)")
+                        log(f"[EXPIRY] Today ({today}) is expiry day — skipping straddle (gamma risk)")
                         return True
-                    print(f"[EXPIRY] Next expiry: {nearest} | Today: {today} — not expiry day")
+                    log(f"[EXPIRY] Next expiry: {nearest} | Today: {today} — not expiry day")
             return False
         except Exception as e:
-            print(f"[EXPIRY CHECK ERROR] {e} — proceeding with caution")
+            log(f"[EXPIRY CHECK ERROR] {e} — proceeding with caution")
             return False
 
     # -------------------------------------------------------------------------
@@ -303,18 +318,18 @@ class ShortStraddleBot:
             return False
         try:
             if not EVENT_CALENDAR_FILE.exists():
-                print(f"[EVENT] Calendar not found: {EVENT_CALENDAR_FILE}")
+                log(f"[EVENT] Calendar not found: {EVENT_CALENDAR_FILE}")
                 return False
             cal = json.loads(EVENT_CALENDAR_FILE.read_text())
             today = datetime.now().strftime("%Y-%m-%d")
             for entry in cal.get("events", []):
                 if entry.get("date") == today:
-                    print(f"[EVENT] Today is a high-volatility event day: {entry.get('event')} — skipping straddle")
+                    log(f"[EVENT] Today is a high-volatility event day: {entry.get('event')} — skipping straddle")
                     return True
-            print(f"[EVENT] No events today ({today}) — proceeding")
+            log(f"[EVENT] No events today ({today}) — proceeding")
             return False
         except Exception as e:
-            print(f"[EVENT CHECK ERROR] {e} — proceeding with caution")
+            log(f"[EVENT CHECK ERROR] {e} — proceeding with caution")
             return False
 
     # -------------------------------------------------------------------------
@@ -327,23 +342,23 @@ class ShortStraddleBot:
         try:
             resp = self.client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
             if resp.get("status") != "success":
-                print(f"[GAP] Could not fetch quote: {resp} — proceeding")
+                log(f"[GAP] Could not fetch quote: {resp} — proceeding")
                 return False
             data = resp.get("data", {})
             ltp = float(data.get("ltp", 0))
             prev_close = float(data.get("close", 0) or data.get("prev_close", 0))
             if prev_close <= 0:
-                print("[GAP] Previous close not available — proceeding")
+                log("[GAP] Previous close not available — proceeding")
                 return False
             gap_pct = abs(ltp - prev_close) / prev_close * 100
             direction = "UP" if ltp > prev_close else "DOWN"
-            print(f"[GAP] {UNDERLYING}: {prev_close:.2f} → {ltp:.2f} ({direction} {gap_pct:.2f}%) | Threshold: {GAP_THRESHOLD_PCT}%")
+            log(f"[GAP] {UNDERLYING}: {prev_close:.2f} → {ltp:.2f} ({direction} {gap_pct:.2f}%) | Threshold: {GAP_THRESHOLD_PCT}%")
             if gap_pct >= GAP_THRESHOLD_PCT:
-                print(f"[GAP] Gap {gap_pct:.2f}% exceeds {GAP_THRESHOLD_PCT}% — skipping straddle")
+                log(f"[GAP] Gap {gap_pct:.2f}% exceeds {GAP_THRESHOLD_PCT}% — skipping straddle")
                 return True
             return False
         except Exception as e:
-            print(f"[GAP CHECK ERROR] {e} — proceeding with caution")
+            log(f"[GAP CHECK ERROR] {e} — proceeding with caution")
             return False
 
     # -------------------------------------------------------------------------
@@ -360,13 +375,13 @@ class ShortStraddleBot:
                 start_date=today, end_date=today,
             )
             if data is None or len(data) < 2:
-                print("[TREND] Not enough intraday data — proceeding")
+                log("[TREND] Not enough intraday data — proceeding")
                 return False
 
             orb_candles = data.head(ORB_MINUTES // 5)
 
             if len(orb_candles) < 1:
-                print("[TREND] No ORB candles found — proceeding")
+                log("[TREND] No ORB candles found — proceeding")
                 return False
 
             orb_high = float(orb_candles["high"].max())
@@ -381,15 +396,15 @@ class ShortStraddleBot:
             breakout_pct = max(breakout_up, breakout_down)
 
             status = "ABOVE" if breakout_up > 0 else "BELOW" if breakout_down > 0 else "INSIDE"
-            print(f"[TREND] ORB({ORB_MINUTES}m): {orb_low:.2f} — {orb_high:.2f} (range {orb_range:.0f}pts)")
-            print(f"[TREND] Price: {current_price:.2f} | {status} range | Breakout: {breakout_pct:.2f}% | Threshold: {ORB_BREAKOUT_PCT}%")
+            log(f"[TREND] ORB({ORB_MINUTES}m): {orb_low:.2f} — {orb_high:.2f} (range {orb_range:.0f}pts)")
+            log(f"[TREND] Price: {current_price:.2f} | {status} range | Breakout: {breakout_pct:.2f}% | Threshold: {ORB_BREAKOUT_PCT}%")
 
             if breakout_pct >= ORB_BREAKOUT_PCT:
-                print(f"[TREND] ORB breakout {breakout_pct:.2f}% — trend day likely, skipping straddle")
+                log(f"[TREND] ORB breakout {breakout_pct:.2f}% — trend day likely, skipping straddle")
                 return True
             return False
         except Exception as e:
-            print(f"[TREND CHECK ERROR] {e} — proceeding with caution")
+            log(f"[TREND CHECK ERROR] {e} — proceeding with caution")
             return False
 
     # -------------------------------------------------------------------------
@@ -405,24 +420,24 @@ class ShortStraddleBot:
                     nearest = expiries[0]
                     # API returns "DD-MMM-YY" but optionsmultiorder expects "DDMMMYY"
                     expiry_formatted = nearest.replace("-", "")
-                    print(f"[EXPIRY] Nearest: {nearest} -> {expiry_formatted}")
+                    log(f"[EXPIRY] Nearest: {nearest} -> {expiry_formatted}")
                     return expiry_formatted
-            print(f"[EXPIRY] Could not fetch: {resp}")
+            log(f"[EXPIRY] Could not fetch: {resp}")
         except Exception as e:
-            print(f"[EXPIRY ERROR] {e}")
+            log(f"[EXPIRY ERROR] {e}")
         return None
 
     def place_straddle(self):
         expiry = self.get_expiry()
         if not expiry:
-            print("[ENTRY] Cannot determine expiry — aborting")
+            log("[ENTRY] Cannot determine expiry — aborting")
             return False
 
         try:
             quote = self.client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
             if quote.get("status") == "success":
                 spot = float(quote["data"].get("ltp", 0))
-                print(f"[ENTRY] {UNDERLYING} spot: {spot:.2f}")
+                log(f"[ENTRY] {UNDERLYING} spot: {spot:.2f}")
             else:
                 print(f"[ENTRY] Could not fetch spot: {quote}")
                 return False
@@ -431,7 +446,7 @@ class ShortStraddleBot:
             return False
 
         mode = "iron butterfly" if ENABLE_HEDGE else "short straddle"
-        print(f"[ENTRY] Placing ATM {mode} — expiry {expiry}, qty {QUANTITY}")
+        log(f"[ENTRY] Placing ATM {mode} — expiry {expiry}, qty {QUANTITY}")
 
         legs = [
             {"offset": "ATM", "option_type": "CE", "action": "SELL",
@@ -456,7 +471,7 @@ class ShortStraddleBot:
                 legs=legs,
             )
 
-            print(f"[ENTRY] Response: {resp}")
+            log(f"[ENTRY] Response: {resp}")
 
             if resp.get("status") != "success":
                 print(f"[ENTRY FAILED] {resp}")
@@ -493,14 +508,14 @@ class ShortStraddleBot:
             ce_result = next((r for r in sell_results if r.get("option_type") == "CE"), sell_results[0])
             pe_result = next((r for r in sell_results if r.get("option_type") == "PE"), sell_results[1])
 
-            print(f"[ENTRY] CE SELL: {self.ce_symbol} | Order: {ce_result.get('orderid')}")
-            print(f"[ENTRY] PE SELL: {self.pe_symbol} | Order: {pe_result.get('orderid')}")
+            log(f"[ENTRY] CE SELL: {self.ce_symbol} | Order: {ce_result.get('orderid')}")
+            log(f"[ENTRY] PE SELL: {self.pe_symbol} | Order: {pe_result.get('orderid')}")
 
             if ENABLE_HEDGE:
                 hedge_ce = next((r for r in buy_results if r.get("option_type") == "CE"), buy_results[0])
                 hedge_pe = next((r for r in buy_results if r.get("option_type") == "PE"), buy_results[1])
-                print(f"[HEDGE] CE BUY:  {self.hedge_ce_symbol} | Order: {hedge_ce.get('orderid')}")
-                print(f"[HEDGE] PE BUY:  {self.hedge_pe_symbol} | Order: {hedge_pe.get('orderid')}")
+                log(f"[HEDGE] CE BUY:  {self.hedge_ce_symbol} | Order: {hedge_ce.get('orderid')}")
+                log(f"[HEDGE] PE BUY:  {self.hedge_pe_symbol} | Order: {hedge_pe.get('orderid')}")
 
             time.sleep(3)
 
@@ -531,20 +546,20 @@ class ShortStraddleBot:
                 self.ce_ltp = ce_price
                 self.pe_ltp = pe_price
 
-                print("=" * 65)
+                log("=" * 65)
                 mode = "IRON BUTTERFLY" if ENABLE_HEDGE else "STRADDLE"
-                print(f"  {mode} POSITIONED")
-                print("=" * 65)
-                print(f"  CE SELL: {self.ce_symbol} @ {ce_price:.2f}")
-                print(f"  PE SELL: {self.pe_symbol} @ {pe_price:.2f}")
+                log(f"  {mode} POSITIONED")
+                log("=" * 65)
+                log(f"  CE SELL: {self.ce_symbol} @ {ce_price:.2f}")
+                log(f"  PE SELL: {self.pe_symbol} @ {pe_price:.2f}")
                 if ENABLE_HEDGE:
-                    print(f"  CE BUY:  {self.hedge_ce_symbol} @ {self.hedge_ce_price:.2f}")
-                    print(f"  PE BUY:  {self.hedge_pe_symbol} @ {self.hedge_pe_price:.2f}")
-                    print(f"  Gross premium: {gross_premium:.0f} | Hedge cost: {hedge_cost:.0f}")
-                print(f"  Net premium collected: {self.total_premium:.0f}")
-                print(f"  Profit target ({PROFIT_TARGET_PCT}%): +{self.total_premium * PROFIT_TARGET_PCT / 100:.0f}")
-                print(f"  Stop-loss ({STOPLOSS_PCT}%): -{self.total_premium * STOPLOSS_PCT / 100:.0f}")
-                print("=" * 65)
+                    log(f"  CE BUY:  {self.hedge_ce_symbol} @ {self.hedge_ce_price:.2f}")
+                    log(f"  PE BUY:  {self.hedge_pe_symbol} @ {self.hedge_pe_price:.2f}")
+                    log(f"  Gross premium: {gross_premium:.0f} | Hedge cost: {hedge_cost:.0f}")
+                log(f"  Net premium collected: {self.total_premium:.0f}")
+                log(f"  Profit target ({PROFIT_TARGET_PCT}%): +{self.total_premium * PROFIT_TARGET_PCT / 100:.0f}")
+                log(f"  Stop-loss ({STOPLOSS_PCT}%): -{self.total_premium * STOPLOSS_PCT / 100:.0f}")
+                log("=" * 65)
                 self.save_state()
                 return True
             else:
@@ -555,7 +570,7 @@ class ShortStraddleBot:
                 return False
 
         except Exception as e:
-            print(f"[ENTRY ERROR] {e}")
+            log(f"[ENTRY ERROR] {e}")
             return False
 
     def _get_fill_price(self, order_id):
@@ -572,10 +587,10 @@ class ShortStraddleBot:
                         if price > 0:
                             return price
                     elif d.get("order_status") in ("rejected", "cancelled"):
-                        print(f"[ORDER] {d.get('order_status')}: {d.get('status_message', '')}")
+                        log(f"[ORDER] {d.get('order_status')}: {d.get('status_message', '')}")
                         return None
             except Exception as e:
-                print(f"[ORDER STATUS ERROR] {e}")
+                log(f"[ORDER STATUS ERROR] {e}")
         return None
 
     def _capture_leg_symbols(self, results):
@@ -616,7 +631,7 @@ class ShortStraddleBot:
                     quantities[symbol] = quantities.get(symbol, 0) + int(p.get("quantity", 0))
             return quantities
         except Exception as e:
-            print(f"[SYNC ERROR] Position snapshot failed: {e}")
+            log(f"[SYNC ERROR] Position snapshot failed: {e}")
             return None
 
     def _tracked_legs_open(self, open_quantities=None):
@@ -649,7 +664,7 @@ class ShortStraddleBot:
 
         qty = None if open_quantities is None else open_quantities.get(symbol, 0)
         if qty == 0:
-            print(f"[EXIT] {label} already flat: {symbol}")
+            log(f"[EXIT] {label} already flat: {symbol}")
             return None
 
         action = fallback_action
@@ -665,7 +680,7 @@ class ShortStraddleBot:
             )
             if resp.get("status") == "success":
                 price = self._get_fill_price(resp.get("orderid"))
-                print(f"[EXIT] {label} closed: {symbol} {action} {quantity} @ {price or 'pending'}")
+                log(f"[EXIT] {label} closed: {symbol} {action} {quantity} @ {price or 'pending'}")
                 return price
             log_error(f"EXIT {label} leg FAILED — {symbol} MAY STILL BE OPEN: {resp}")
         except Exception as e:
@@ -688,21 +703,21 @@ class ShortStraddleBot:
                 near_squareoff = (now.hour > SQUAREOFF_HOUR or
                                   (now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE - 2))
                 reason = "EOD auto square-off" if near_squareoff else "manual exit?"
-                print(f"\n[SYNC] All tracked legs flat ({reason}) — resetting")
+                log(f"\n[SYNC] All tracked legs flat ({reason}) — resetting")
                 self._clear_position_state()
             else:
                 missing = [symbol for symbol in self._tracked_symbols() if open_quantities.get(symbol, 0) == 0]
                 if missing:
-                    print(f"\n[SYNC] Some tracked legs are already flat: {missing}; remaining open: {open_legs}")
+                    log(f"\n[SYNC] Some tracked legs are already flat: {missing}; remaining open: {open_legs}")
         except Exception as e:
-            print(f"[SYNC ERROR] {e}")
+            log(f"[SYNC ERROR] {e}")
 
     # -------------------------------------------------------------------------
     # P&L Monitor
     # -------------------------------------------------------------------------
 
     def monitor_pnl(self):
-        print("[MONITOR] P&L monitoring started")
+        log("[MONITOR] P&L monitoring started")
 
         while not self.stop_event.is_set():
             if not self.is_positioned or self.exit_in_progress:
@@ -719,7 +734,7 @@ class ShortStraddleBot:
             if now.hour > SQUAREOFF_HOUR or (now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE):
                 if self.is_positioned and not self.exit_in_progress:
                     self.exit_in_progress = True
-                    print(f"\n[EOD] {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d} — closing straddle")
+                    log(f"\n[EOD] {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d} — closing straddle")
                     self.close_straddle("EOD_SQUAREOFF")
                 continue
 
@@ -755,7 +770,7 @@ class ShortStraddleBot:
                 if ce_quote_ok and pe_quote_ok and hedge_ce_quote_ok and hedge_pe_quote_ok:
                     self.last_quote_ts = time.monotonic()
                     if self.feed_stale:
-                        print("\n[FEED] Recovered — option quotes resuming")
+                        log("\n[FEED] Recovered — option quotes resuming")
                         self.feed_stale = False
             except Exception as e:
                 print(f"\n[QUOTE ERROR] {e}")
@@ -778,7 +793,7 @@ class ShortStraddleBot:
             pnl_pct = (total_pnl / self.total_premium * 100) if self.total_premium > 0 else 0
             sign = "+" if total_pnl > 0 else ""
 
-            print(
+            log(
                 f"\r[{now.strftime('%H:%M:%S')}] "
                 f"CE: {self.ce_ltp:.2f} | PE: {self.pe_ltp:.2f} | "
                 f"Net P&L: {sign}{total_pnl:.0f} ({sign}{pnl_pct:.1f}%)"
@@ -789,13 +804,13 @@ class ShortStraddleBot:
             # Profit target hit
             if pnl_pct >= PROFIT_TARGET_PCT and not self.exit_in_progress:
                 self.exit_in_progress = True
-                print(f"\n[TARGET] Profit {pnl_pct:.1f}% >= {PROFIT_TARGET_PCT}% — closing straddle")
+                log(f"\n[TARGET] Profit {pnl_pct:.1f}% >= {PROFIT_TARGET_PCT}% — closing straddle")
                 threading.Thread(target=self.close_straddle, args=("PROFIT_TARGET",), daemon=True).start()
 
             # Stop-loss hit (% of premium)
             elif pnl_pct <= -STOPLOSS_PCT and not self.exit_in_progress:
                 self.exit_in_progress = True
-                print(f"\n[STOPLOSS] Loss {pnl_pct:.1f}% exceeds -{STOPLOSS_PCT}% — closing straddle")
+                log(f"\n[STOPLOSS] Loss {pnl_pct:.1f}% exceeds -{STOPLOSS_PCT}% — closing straddle")
                 threading.Thread(target=self.close_straddle, args=("STOPLOSS",), daemon=True).start()
 
 
@@ -811,7 +826,7 @@ class ShortStraddleBot:
             return
 
         mode = "iron butterfly" if ENABLE_HEDGE else "straddle"
-        print(f"\n[EXIT] Closing {mode} — reason: {reason}")
+        log(f"\n[EXIT] Closing {mode} — reason: {reason}")
 
         open_quantities = self.get_open_quantities()
         open_legs = self._tracked_legs_open(open_quantities)
@@ -823,7 +838,7 @@ class ShortStraddleBot:
                 if open_legs:
                     break
         if open_legs == {}:
-            print("[EXIT] Positionbook already confirms all tracked legs are flat")
+            log("[EXIT] Positionbook already confirms all tracked legs are flat")
             self.record_trade(reason, 0.0)
             self._clear_position_state()
             return
@@ -859,17 +874,17 @@ class ShortStraddleBot:
         total_pnl = ce_pnl + pe_pnl + hedge_pnl
         sign = "+" if total_pnl > 0 else ""
 
-        print("=" * 65)
-        print(f"  {mode.upper()} CLOSED")
-        print("=" * 65)
-        print(f"  Reason: {reason}")
-        print(f"  CE: sold @ {self.ce_entry_price:.2f}, bought @ {ce_exit or self.ce_ltp:.2f} -> {'+' if ce_pnl > 0 else ''}{ce_pnl:.0f}")
-        print(f"  PE: sold @ {self.pe_entry_price:.2f}, bought @ {pe_exit or self.pe_ltp:.2f} -> {'+' if pe_pnl > 0 else ''}{pe_pnl:.0f}")
+        log("=" * 65)
+        log(f"  {mode.upper()} CLOSED")
+        log("=" * 65)
+        log(f"  Reason: {reason}")
+        log(f"  CE: sold @ {self.ce_entry_price:.2f}, bought @ {ce_exit or self.ce_ltp:.2f} -> {'+' if ce_pnl > 0 else ''}{ce_pnl:.0f}")
+        log(f"  PE: sold @ {self.pe_entry_price:.2f}, bought @ {pe_exit or self.pe_ltp:.2f} -> {'+' if pe_pnl > 0 else ''}{pe_pnl:.0f}")
         if ENABLE_HEDGE:
-            print(f"  Hedge P&L: {'+' if hedge_pnl > 0 else ''}{hedge_pnl:.0f}")
+            log(f"  Hedge P&L: {'+' if hedge_pnl > 0 else ''}{hedge_pnl:.0f}")
         prem_pct = total_pnl / self.total_premium * 100 if self.total_premium > 0 else 0
-        print(f"  Total P&L: {sign}{total_pnl:.0f} ({sign}{prem_pct:.1f}% of premium)")
-        print("=" * 65)
+        log(f"  Total P&L: {sign}{total_pnl:.0f} ({sign}{prem_pct:.1f}% of premium)")
+        log("=" * 65)
 
         self.record_trade(reason, total_pnl)
         self._clear_position_state()
@@ -879,18 +894,18 @@ class ShortStraddleBot:
     # -------------------------------------------------------------------------
 
     def run(self):
-        print("=" * 65)
+        log("=" * 65)
         mode = "IRON BUTTERFLY" if ENABLE_HEDGE else "SHORT STRADDLE"
-        print(f"  9:20 AM {mode} — {UNDERLYING}")
-        print(f"  {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty | Product: {PRODUCT}")
+        log(f"  9:20 AM {mode} — {UNDERLYING}")
+        log(f"  {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty | Product: {PRODUCT}")
         if ENABLE_HEDGE:
-            print(f"  Hedge: {HEDGE_OFFSET} wings (capped max loss)")
-        print(f"  VIX threshold: {'disabled' if SKIP_VIX_CHECK else f'< {VIX_THRESHOLD}'}")
-        print(f"  Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
-        print(f"  Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
-        print(f"  Entry: {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} | Exit: {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}")
-        print("=" * 65)
-        print("Waiting for entry time...")
+            log(f"  Hedge: {HEDGE_OFFSET} wings (capped max loss)")
+        log(f"  VIX threshold: {'disabled' if SKIP_VIX_CHECK else f'< {VIX_THRESHOLD}'}")
+        log(f"  Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
+        log(f"  Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
+        log(f"  Entry: {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} | Exit: {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}")
+        log("=" * 65)
+        log("Waiting for entry time...")
 
         monitor_t = threading.Thread(target=self.monitor_pnl, daemon=True)
         monitor_t.start()
@@ -908,17 +923,17 @@ class ShortStraddleBot:
                     self.entry_done_today = True
 
                     if self.check_consecutive_sl():
-                        print("[SKIP] Consecutive SL cooldown — no trade today")
+                        log("[SKIP] Consecutive SL cooldown — no trade today")
                     elif self.is_expiry_day():
-                        print("[SKIP] Expiry day — no trade today")
+                        log("[SKIP] Expiry day — no trade today")
                     elif self.is_event_day():
-                        print("[SKIP] Event day — no trade today")
+                        log("[SKIP] Event day — no trade today")
                     elif self.check_gap_open():
-                        print("[SKIP] Gap open too large — no trade today")
+                        log("[SKIP] Gap open too large — no trade today")
                     elif not self.check_vix():
-                        print("[SKIP] VIX too high — no trade today")
+                        log("[SKIP] VIX too high — no trade today")
                     elif self.check_trend():
-                        print("[SKIP] Trend day (ORB breakout) — no trade today")
+                        log("[SKIP] Trend day (ORB breakout) — no trade today")
                     else:
                         self.place_straddle()
 
@@ -928,7 +943,7 @@ class ShortStraddleBot:
                 if (now.hour > SQUAREOFF_HOUR or
                         (now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE + 5)):
                     if not self.is_positioned:
-                        print("\n[EOD] Post-squareoff — strategy finished for the day.")
+                        log("\n[EOD] Post-squareoff — strategy finished for the day.")
                         self.running = False
                         self.stop_event.set()
                         break
@@ -936,13 +951,13 @@ class ShortStraddleBot:
                 time.sleep(1)
 
         except KeyboardInterrupt:
-            print("\n\n[SHUTDOWN] Stopping bot...")
+            log("\n\n[SHUTDOWN] Stopping bot...")
             self.running = False
             self.stop_event.set()
             if self.is_positioned and not self.exit_in_progress:
                 self.close_straddle("SHUTDOWN")
             monitor_t.join(timeout=5)
-            print("[SHUTDOWN] Done.")
+            log("[SHUTDOWN] Done.")
 
 
 if __name__ == "__main__":

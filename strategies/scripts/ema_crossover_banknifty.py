@@ -209,7 +209,7 @@ class EMACrossoverBot:
 
         self.last_tick_ts = time.monotonic()   # feed-health heartbeat
         if self.feed_stale:
-            print("\n[FEED] Recovered — market-data ticks resumed")
+            log("[FEED] Recovered — market-data ticks resumed")
             self.feed_stale = False
 
         self.ltp = float(data["data"]["ltp"])
