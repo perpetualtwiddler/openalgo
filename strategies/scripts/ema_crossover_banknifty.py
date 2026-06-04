@@ -54,6 +54,8 @@ VOLUME_FILTER_MULT = float(os.getenv("VOLUME_FILTER_MULT", "1.5"))
 VOLUME_SMA_PERIOD = int(os.getenv("VOLUME_SMA_PERIOD", "20"))
 
 TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5%
+TIGHT_TSL_THRESHOLD = float(os.getenv("TIGHT_TSL_THRESHOLD", "5000"))  # ₹ unrealized profit at which TSL tightens
+TIGHT_TSL_PCT = float(os.getenv("TIGHT_TSL_PCT", "0.25"))             # tighter trailing % once threshold crossed
 
 # --- Adaptive Profit-Protection Exit (APPE) — see ADAPTIVE_PROFIT_EXIT_DESIGN.md ---
 # Trails the *profit curve* (not price): once profit peaks past the arm threshold, exit when it
@@ -201,18 +203,27 @@ class EMACrossoverBot:
             print(f"\r[{now}] LTP: {self.ltp:.2f} | No position | Day P&L: {self.daily_pnl:.2f}    ", end="")
             return
 
-        # Update trailing stop-loss
+        # Update trailing stop-loss.
+        # Unrealized is computed first so the tightening threshold check can
+        # use it immediately. Once profit crosses TIGHT_TSL_THRESHOLD the TSL
+        # switches to TIGHT_TSL_PCT and never widens back.
         if self.position == "BUY":
+            unrealized = (self.ltp - self.entry_price) * QUANTITY
             if self.ltp > self.peak_price:
                 self.peak_price = self.ltp
-                self.trailing_sl = round(self.peak_price * (1 - TRAILING_SL_PCT / 100), 2)
-            unrealized = (self.ltp - self.entry_price) * QUANTITY
+                tsl_pct = TIGHT_TSL_PCT if unrealized >= TIGHT_TSL_THRESHOLD else TRAILING_SL_PCT
+                new_tsl = round(self.peak_price * (1 - tsl_pct / 100), 2)
+                if new_tsl > self.trailing_sl:  # only tighten, never widen
+                    self.trailing_sl = new_tsl
             hit_sl = self.ltp <= self.trailing_sl
         else:
+            unrealized = (self.entry_price - self.ltp) * QUANTITY
             if self.ltp < self.peak_price:
                 self.peak_price = self.ltp
-                self.trailing_sl = round(self.peak_price * (1 + TRAILING_SL_PCT / 100), 2)
-            unrealized = (self.entry_price - self.ltp) * QUANTITY
+                tsl_pct = TIGHT_TSL_PCT if unrealized >= TIGHT_TSL_THRESHOLD else TRAILING_SL_PCT
+                new_tsl = round(self.peak_price * (1 + tsl_pct / 100), 2)
+                if new_tsl < self.trailing_sl:  # only tighten, never widen
+                    self.trailing_sl = new_tsl
             hit_sl = self.ltp >= self.trailing_sl
 
         sign = "+" if unrealized > 0 else ""
@@ -582,9 +593,25 @@ class EMACrossoverBot:
                     signal = self.check_signal(df)
                     if signal and signal != self.position:
                         self.exit_in_progress = True
-                        self.place_exit("REVERSE_SIGNAL")
-                        time.sleep(1)
-                        self.place_entry(signal)
+                        # If the TSL is already breached at poll time, the
+                        # WebSocket thread lost the race to set exit_in_progress.
+                        # Exit as TRAILING_SL and skip the reverse entry to
+                        # avoid compounding the loss with an immediate re-entry.
+                        tsl_hit = (
+                            self.ltp is not None and self.trailing_sl > 0 and (
+                                (self.position == "BUY" and self.ltp <= self.trailing_sl) or
+                                (self.position == "SELL" and self.ltp >= self.trailing_sl)
+                            )
+                        )
+                        if tsl_hit:
+                            print(f"\n[SIGNAL] Reverse signal but TSL already breached "
+                                  f"(LTP {self.ltp:.2f} vs TSL {self.trailing_sl:.2f}) — "
+                                  f"exiting as TRAILING_SL, skipping reverse entry")
+                            self.place_exit("TRAILING_SL")
+                        else:
+                            self.place_exit("REVERSE_SIGNAL")
+                            time.sleep(1)
+                            self.place_entry(signal)
 
                 time.sleep(SIGNAL_CHECK_INTERVAL)
 
