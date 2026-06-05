@@ -91,6 +91,9 @@ PNL_CHECK_INTERVAL = int(os.getenv("PNL_CHECK_INTERVAL", "5"))
 # Feed-health guard: if option quotes stop succeeding for this long while positioned, PT/SL are
 # evaluating on stale prices (position effectively unprotected) — log ERROR so we can intervene.
 FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
+# Re-emit the STALE ERROR line every N seconds while quotes are still failing, so the warning
+# does not get buried under hours of PNL output in long-running logs.
+FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
 
 
 def log_error(msg):
@@ -123,6 +126,7 @@ class ShortStraddleBot:
         # Feed-health (quote-poll) tracking
         self.last_quote_ts = None   # time.monotonic() of last successful option quote
         self.feed_stale = False
+        self.last_stale_warn_ts = 0.0  # time.monotonic() of last STALE log (rate-limits re-warns)
 
         # Position state
         self.is_positioned = False
@@ -775,18 +779,23 @@ class ShortStraddleBot:
                     if self.feed_stale:
                         log("\n[FEED] Recovered — option quotes resuming")
                         self.feed_stale = False
+                        self.last_stale_warn_ts = 0.0
             except Exception as e:
                 log_error(f"Option quote fetch exception: {e}")
                 time.sleep(PNL_CHECK_INTERVAL)
                 continue
 
-            # Feed-health: PT/SL rely on fresh quotes — if none for FEED_STALE_SEC, position is unprotected
+            # Feed-health: PT/SL rely on fresh quotes — if none for FEED_STALE_SEC, position is unprotected.
+            # Re-warn every FEED_STALE_REWARN_SEC so the issue stays visible in long-running logs.
             age = None if self.last_quote_ts is None else (time.monotonic() - self.last_quote_ts)
-            if age is not None and age > FEED_STALE_SEC and not self.feed_stale:
-                self.feed_stale = True
-                log_error(f"Option-quote feed STALE (no successful quote for {age:.0f}s, >{FEED_STALE_SEC:.0f}s) "
-                          f"— PT/SL evaluating on stale prices; straddle position is effectively UNPROTECTED. "
-                          f"Consider manual square-off.")
+            if age is not None and age > FEED_STALE_SEC:
+                now_mono = time.monotonic()
+                if not self.feed_stale or (now_mono - self.last_stale_warn_ts) >= FEED_STALE_REWARN_SEC:
+                    self.feed_stale = True
+                    self.last_stale_warn_ts = now_mono
+                    log_error(f"Option-quote feed STALE (no successful quote for {age:.0f}s, >{FEED_STALE_SEC:.0f}s) "
+                              f"— PT/SL evaluating on stale prices; straddle position is effectively UNPROTECTED. "
+                              f"Consider manual square-off.")
 
             # Short legs P&L: profit when prices DROP from entry
             ce_pnl = (self.ce_entry_price - self.ce_ltp) * QUANTITY

@@ -82,6 +82,9 @@ HARD_MULT = float(os.getenv("HARD_MULT", "2.0"))             # catastrophic give
 # considered stale — trailing-SL & APPE (both tick-driven) are inactive, so we log ERROR and
 # refuse new entries rather than trade blind (June 3: 0 ticks all day -> unprotected -20,760).
 FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
+# Re-emit the STALE ERROR line every N seconds while ticks are still missing, so the warning
+# does not get buried under hours of [SIGNAL CHECK] noise in long-running logs.
+FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
 
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
@@ -147,6 +150,11 @@ class EMACrossoverBot:
         self.pnl_window = deque()      # (monotonic_ts, unrealized) over TREND_WINDOW_SEC
         self.last_tick_ts = None       # time.monotonic() of last on_ltp_update (feed-health)
         self.feed_stale = False        # True while the WS tick feed is stale
+        self.last_stale_warn_ts = 0.0  # time.monotonic() of last STALE log (rate-limits re-warns)
+        self.ws_alive = False          # set True on FIRST tick received — distinct from SDK's
+                                       # optimistic "[WS] Connected" log which fires on TCP
+                                       # connect, before the WebSocket handshake completes.
+                                       # First-tick is the only proof the pipeline works.
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
 
         self.load_state()
@@ -230,11 +238,17 @@ class EMACrossoverBot:
             return
 
         self.last_tick_ts = time.monotonic()   # feed-health heartbeat
+        self.ltp = float(data["data"]["ltp"])
+        if not self.ws_alive:
+            # First tick ever — definitive end-to-end proof the WS pipeline works.
+            # Anything before this point (including the SDK's optimistic "[WS] Connected"
+            # log) is just TCP/handshake success and tells us nothing about real data flow.
+            self.ws_alive = True
+            log(f"[WS] FIRST TICK RECEIVED for {self.symbol} @ {self.ltp:.2f} — pipeline confirmed live")
         if self.feed_stale:
             log("[FEED] Recovered — market-data ticks resumed")
             self.feed_stale = False
-
-        self.ltp = float(data["data"]["ltp"])
+            self.last_stale_warn_ts = 0.0
 
         if not self.position or self.exit_in_progress:
             log(f"[LTP] {self.ltp:.2f} | No position | Day P&L: {self.daily_pnl:.2f}")
@@ -295,18 +309,26 @@ class EMACrossoverBot:
         return age is not None and age <= FEED_STALE_SEC
 
     def _check_feed_health(self):
-        """During market hours, log ERROR (once per stale episode) if ticks have stopped."""
+        """During market hours, log ERROR periodically while ticks have stopped.
+
+        Re-emits every FEED_STALE_REWARN_SEC so the warning stays visible in long
+        logs (a one-shot log line gets buried under hours of [SIGNAL CHECK] output).
+        """
         if self._feed_ok():
             return
-        if not self.feed_stale:
-            self.feed_stale = True
-            age = self._feed_age()
-            age_str = "no ticks yet" if age is None else f"no ticks for {age:.0f}s"
-            log_error(
-                f"Market-data feed STALE ({age_str}, >{FEED_STALE_SEC:.0f}s) — trailing-SL & "
-                f"APPE are INACTIVE; blocking new entries"
-                + ("; a POSITION IS OPEN AND UNPROTECTED — consider manual square-off." if self.position else ".")
-            )
+        now = time.monotonic()
+        if self.feed_stale and (now - self.last_stale_warn_ts) < FEED_STALE_REWARN_SEC:
+            return  # already stale and re-warn window not yet elapsed
+        self.feed_stale = True
+        self.last_stale_warn_ts = now
+        age = self._feed_age()
+        age_str = "no ticks yet" if age is None else f"no ticks for {age:.0f}s"
+        ws_status = "" if self.ws_alive else " (WS has NEVER delivered a tick this run — likely a misconfigured WEBSOCKET_URL or broken WS proxy)"
+        log_error(
+            f"Market-data feed STALE ({age_str}, >{FEED_STALE_SEC:.0f}s){ws_status} — "
+            f"trailing-SL & APPE are INACTIVE; blocking new entries"
+            + ("; a POSITION IS OPEN AND UNPROTECTED — consider manual square-off." if self.position else ".")
+        )
 
     def _reset_appe(self):
         self.appe_peak = 0.0
@@ -391,7 +413,11 @@ class EMACrossoverBot:
             try:
                 self.client.connect()
                 self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
-                log(f"[WS] Connected — monitoring {self.symbol}")
+                # NOTE: the SDK logs its own "[WS] Connected" line on TCP connect, BEFORE
+                # the WebSocket handshake or any data flow. That line lies when the WS
+                # proxy is unreachable. We do NOT mirror it — the only honest "alive"
+                # signal is FIRST TICK RECEIVED, logged from on_ltp_update().
+                log(f"[WS] Subscribed to {self.symbol} — waiting for first tick (see [WS] FIRST TICK RECEIVED)...")
                 while not self.stop_event.is_set():
                     time.sleep(1)
             except Exception as e:
@@ -425,6 +451,15 @@ class EMACrossoverBot:
         return None
 
     def check_signal(self, df):
+        # Feed-health gate: if the WS tick feed is stale, skip signal evaluation entirely.
+        # This keeps the log visibly broken when the feed is broken — otherwise [SIGNAL CHECK]
+        # lines look identical to healthy operation while trailing-SL/APPE are dead.
+        if not self._feed_ok():
+            age = self._feed_age()
+            age_str = "no ticks yet" if age is None else f"no ticks for {age:.0f}s"
+            log(f"[SIGNAL CHECK SKIPPED] Feed stale ({age_str}) — not evaluating crossover without live ticks")
+            return None
+
         if df is None or len(df) < SLOW_EMA + VOLUME_SMA_PERIOD:
             return None
 
