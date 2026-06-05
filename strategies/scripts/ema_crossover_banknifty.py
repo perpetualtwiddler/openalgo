@@ -251,7 +251,6 @@ class EMACrossoverBot:
             self.last_stale_warn_ts = 0.0
 
         if not self.position or self.exit_in_progress:
-            log(f"[LTP] {self.ltp:.2f} | No position | Day P&L: {self.daily_pnl:.2f}")
             return
 
         # Update trailing stop-loss.
