@@ -440,14 +440,20 @@ class ConnectionPool:
                 result = adapter.initialize(self.broker_name, self.user_id, auth_data)
 
                 # Handle both response formats from adapters:
-                # - {"success": False, "error": "..."} (ConnectionPool format)
-                # - {"status": "error", "code": "...", "message": "..."} (Adapter format)
+                # - {"success": True/False, "error": "..."} (ConnectionPool format)
+                # - {"status": "success"/"error", "code": "...", "message": "..."} (Adapter format)
+                # Only treat as error on EXPLICIT failure markers — missing keys
+                # are not failure (e.g. adapter returning {"status": "success", ...}
+                # has no "success" key and must not be misread as failure).
                 is_error = (
-                    (result and not result.get("success")) or
-                    (result and result.get("status") == "error")
+                    result is None
+                    or result.get("success") is False
+                    or result.get("status") == "error"
                 )
                 if is_error:
-                    error_msg = result.get("message", result.get("error", "Initialization failed"))
+                    error_msg = (result or {}).get(
+                        "message", (result or {}).get("error", "Initialization failed")
+                    )
                     self.logger.error(f"Adapter initialization failed: {error_msg}")
                     return {"success": False, "error": error_msg}
 
@@ -578,14 +584,20 @@ class ConnectionPool:
                 if self.adapters:
                     result = self.adapters[0].connect()
                     # Handle both response formats from adapters:
-                    # - {"success": False, "error": "..."} (ConnectionPool format)
-                    # - {"status": "error", "code": "...", "message": "..."} (Adapter format)
+                    # - {"success": True/False, "error": "..."} (ConnectionPool format)
+                    # - {"status": "success"/"error", "code": "...", "message": "..."} (Adapter format)
+                    # Only treat as error on EXPLICIT failure markers — missing keys
+                    # are not failure (e.g. adapter returning {"status": "success", ...}
+                    # has no "success" key and must not be misread as failure).
                     is_error = (
-                        (result and not result.get("success")) or
-                        (result and result.get("status") == "error")
+                        result is None
+                        or result.get("success") is False
+                        or result.get("status") == "error"
                     )
                     if is_error:
-                        error_msg = result.get("message", result.get("error", "Connection failed"))
+                        error_msg = (result or {}).get(
+                            "message", (result or {}).get("error", "Connection failed")
+                        )
                         # Issue #1419: try recovery once if this looks like a stale
                         # auth token (new trading day, etc.) before surfacing the
                         # error. _attempt_auth_recovery() does not call back into
