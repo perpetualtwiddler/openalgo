@@ -61,12 +61,14 @@ TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5%
 # gives back a peak-scaled budget AND the smoothed P&L slope confirms a down-drift (held H sec).
 APPE_ENABLED = os.getenv("APPE_ENABLED", "true").lower() == "true"
 # Gate 1 arm threshold scales with position size so the required points-of-drift to
-# arm stays constant regardless of lots traded. ARM_PER_LOT (₹5,000) per 30-unit lot:
-#   30u -> ₹5,000 | 60u -> ₹10,000 | 90u -> ₹15,000  (all ≈167 BANKNIFTY pts to arm)
-# A fixed ₹15,000 needed ~250 pts on 60u — too rarely hit, so APPE never armed on
-# trades that peaked near it then reversed (e.g. Jun 3/4 round-trips). Set an explicit
-# PROFIT_ARM_THRESHOLD env to override the per-lot formula if ever needed.
-ARM_PER_LOT = float(os.getenv("ARM_PER_LOT", "5000"))        # APPE arm ₹ per lot of LOT_SIZE
+# arm stays constant regardless of lots traded. ARM_PER_LOT (₹4,000) per 30-unit lot:
+#   30u -> ₹4,000 | 60u -> ₹8,000 | 90u -> ₹12,000  (all ≈133 BANKNIFTY pts to arm)
+# Lowered from ₹5,000 to ₹4,000/lot ("HAVRATPANA CONTROL": cap profit expectations to
+# keep gain/risk balanced and arm APPE sooner). At ₹5,000/lot the ₹10,000 arm on 60u
+# just missed real peaks that then round-tripped to a loss — e.g. Jun 8: a +9,504 peak
+# never armed and exited TSL at -7,188; a replay showed an ₹8,000 arm would have booked
+# ~+5,220. Set an explicit PROFIT_ARM_THRESHOLD env to override the per-lot formula.
+ARM_PER_LOT = float(os.getenv("ARM_PER_LOT", "4000"))        # APPE arm ₹ per lot of LOT_SIZE
 _arm_override = os.getenv("PROFIT_ARM_THRESHOLD")
 PROFIT_ARM_THRESHOLD = (
     float(_arm_override) if _arm_override else ARM_PER_LOT * (QUANTITY / LOT_SIZE)
