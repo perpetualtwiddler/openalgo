@@ -7,18 +7,18 @@ set -euo pipefail
 # Installs the operational systemd timer(s) used to keep paper-trading runs
 # hands-off:
 #
-#   1. openalgo-restart.timer            — daily 08:00 IST restart of openalgo
-#      *** DISABLED (2026-06-05) — see commented-out block below. ***
-#      It was a workaround for APScheduler's ThreadPoolExecutor entering a
-#      "shutdown" state after ~2 days of uptime (scheduled strategies stopped
-#      spawning). That bug is now fixed at the source by switching APScheduler
-#      to DebugExecutor, so the daily restart is no longer needed.
-#      Worse, restarting at 08:00 IST booted the WebSocket proxy *before* the
-#      daily Zerodha re-auth (token expires ~03:00, login ~08:42): the proxy
-#      cold-started with no broker session and never recovered into a
-#      tick-pumping state, so the market-data feed delivered 0 ticks all day
-#      even though the 09:15 subscribe succeeded with no 403. Running openalgo
-#      continuously avoids that window.
+#   1. openalgo-restart.timer            — Mon-Fri 09:05 IST restart of openalgo
+#      Why: the WebSocket proxy/adapter does NOT deliver ticks across the daily
+#      ~03:00 IST Zerodha token expiry + morning re-auth. It happens whether the
+#      proxy cold-starts in the no-session window OR runs continuously through
+#      the expiry: the 09:15 subscribe succeeds (no 403) but 0 ticks flow all
+#      day. The only reliable fix is a fresh restart AFTER the daily login.
+#      So restart at 09:05 IST — after the manual Zerodha auth (~08:42) and 10
+#      minutes before the 09:15 strategy start — so strategies launch onto a
+#      healthy, post-auth feed. Mon-Fri only (no weekend auth/trading).
+#      History: this timer was originally 08:00 (an APScheduler-executor
+#      workaround, since fixed via DebugExecutor); 08:00 was BEFORE auth and
+#      caused the dead feed, so it was moved to 09:05 (post-auth) on 2026-06-08.
 #
 #   2. openalgo-capture-trade-data.timer — Mon-Fri 15:35 IST trade data capture
 #      Why: archive intraday 1m/5m candles for NIFTY, BANKNIFTY, VIX, and
@@ -55,32 +55,31 @@ fi
 
 echo "Installing systemd timers (install dir: $INSTALL_DIR)..."
 
-# --- Timer 1: daily restart (DISABLED 2026-06-05) ---------------------------
-# Intentionally commented out — APScheduler executor shutdown is now fixed via
-# DebugExecutor, and the 08:00 restart booted the WS proxy before the daily
-# Zerodha auth, killing the market-data feed. See header note above.
-# To re-enable, uncomment this block AND the `enable --now` line below.
-#
-# cat > /etc/systemd/system/openalgo-restart.service << EOF
-# [Unit]
-# Description=Daily restart of OpenAlgo (workaround for APScheduler executor shutdown)
-# Wants=network-online.target
-# After=network-online.target
-#
-# [Service]
-# Type=oneshot
-# ExecStart=/usr/bin/systemctl restart openalgo
-# EOF
-#
-# cat > /etc/systemd/system/openalgo-restart.timer << 'EOF'
-# [Unit]
-# Description=Restart OpenAlgo daily at 08:00 IST
-#
-# [Timer]
-# OnCalendar=*-*-* 08:00:00 Asia/Kolkata
-# Persistent=true
-# Unit=openalgo-restart.service
-# EOF
+# --- Timer 1: daily restart (post-auth, pre-strategy) -----------------------
+
+cat > /etc/systemd/system/openalgo-restart.service << EOF
+[Unit]
+Description=Restart OpenAlgo after daily Zerodha auth (WS tick-delivery stall fix)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart openalgo
+EOF
+
+cat > /etc/systemd/system/openalgo-restart.timer << 'EOF'
+[Unit]
+Description=Restart OpenAlgo at 09:05 IST Mon-Fri (post-auth, pre-09:15 strategies)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:05:00 Asia/Kolkata
+Persistent=false
+Unit=openalgo-restart.service
+
+[Install]
+WantedBy=timers.target
+EOF
 
 # --- Timer 2: daily trade data capture --------------------------------------
 
@@ -116,15 +115,16 @@ EOF
 # --- Reload + enable --------------------------------------------------------
 
 systemctl daemon-reload
-# openalgo-restart.timer intentionally NOT enabled — see DISABLED note above.
+systemctl enable --now openalgo-restart.timer
 systemctl enable --now openalgo-capture-trade-data.timer
 
 echo ""
-echo "Timer enabled. Next scheduled run:"
-systemctl list-timers openalgo-capture-trade-data.timer --no-pager
+echo "Both timers enabled. Next scheduled runs:"
+systemctl list-timers openalgo-restart.timer openalgo-capture-trade-data.timer --no-pager
 
 echo ""
 echo "Useful commands:"
 echo "  systemctl list-timers --no-pager"
+echo "  journalctl -u openalgo-restart.service --since today --no-pager"
 echo "  journalctl -u openalgo-capture-trade-data.service --since today --no-pager"
 echo "  systemctl start openalgo-capture-trade-data.service  # manual on-demand capture"
