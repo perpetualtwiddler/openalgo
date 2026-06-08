@@ -467,7 +467,8 @@ daily ≈ 2× per-trade.
     25%-of-premium target into a ratchet, and needs full recalibration: much lower arm threshold,
     give-back as **% of net premium** (not the √-rupee budget), and **less patience** — because for a
     straddle a falling P&L signals a directional bleed, so profit-protect (APPE) and loss-avoid (ALE)
-    converge into the same fast exit.
+    converge into the same fast exit. **→ Full design proposal now drafted in §13 (2026-06-08); still
+    design-only, calibration/implementation pending the loss-side priority + archive data.**
 - [ ] **CUSUM trend gate (v2).** Replace the simple slope gate (3a) with a CUSUM change-point
   detector for earlier, statistically-grounded rollover detection.
 - [ ] **Volatility scaling.** Tie the give-back budget `G` to live VIX / ATR (Chandelier-style) so
@@ -507,3 +508,98 @@ daily ≈ 2× per-trade.
 *Note: the §4 default and §5 worked examples still show A=₹10,000 for illustration/continuity. The
 agreed starting default is **A=₹15,000** per decision #2; examples will be recomputed if/when we
 finalize after the backtest sweep.*
+
+*Update (2026-06-08): EMA arm changed to a per-lot formula — `ARM_PER_LOT=₹4,000` × lots, so a
+60-qty BANKNIFTY position arms at **₹8,000** ("HAVRATPANA CONTROL": cap gain expectations, arm
+sooner). The ₹15,000 in decision #2 predates the proportional-arm + live-tuning approach.*
+
+---
+
+## 13. APPE for the Short Straddle — design proposal
+
+**Status: DESIGN ONLY (2026-06-08). Not implemented.** This elevates the §11 TODO bullet into a
+concrete design to discuss and calibrate later. Read alongside **§11** (why it has been low-priority)
+and **§10/ALE** — for a straddle the profit-protect and loss-avoid exits are tightly coupled (§13.4).
+
+### 13.1 Why the EMA APPE does not port directly
+
+EMA APPE assumes a *directional* trade with a large MFE-then-give-back in **absolute rupees**, and
+uses a √-rupee budget `G = 30·√P_max`. The straddle breaks several of those assumptions:
+
+| Aspect | EMA crossover | Short straddle (iron butterfly) |
+|---|---|---|
+| Direction | directional (BUY/SELL future) | market-neutral (sell ATM CE+PE, OTM8 wings) |
+| Profit source | trend move | theta decay (slow grind) + IV drop |
+| Profit scale | large ₹ swings | small, bounded by net premium; peaks often single-digit ₹thousands (§11: May 29 peaked +₹2,311) |
+| P&L feed | WS ticks (sub-second) | REST quote poll, every `PNL_CHECK_INTERVAL` = 5s |
+| A falling P&L means | giving back a directional gain | usually a **directional bleed = the start of a loss** |
+| Natural scale | rupees / points | **% of net premium collected** (`PROFIT_TARGET_PCT`/`STOPLOSS_PCT` are already %) |
+
+Consequence: the √-rupee budget is wrong here. At P_max = ₹2,311, `30·√2311 ≈ ₹1,442` is a **62%
+give-back budget** — useless. The straddle needs a budget in **% of net premium**, a **low arm**,
+and **less patience**.
+
+### 13.2 Reframing the four gates for the straddle
+
+Let `NP` = net premium collected at entry (the strategy already tracks `total_premium`). Work in
+percentage-of-premium space, where the existing targets live (PT = +25%, SL = −50%):
+```
+u%(t)  = 100 · U(t) / NP            # current P&L as % of premium
+pmax%  = max over t of u%(t)        # peak P&L %
+```
+
+- **Gate 1 — Arm (`STRADDLE_ARM_PCT`, % of NP).** Activate once `pmax% ≥ arm`. Because peaks are
+  small and the +25% PT is rarely reached, the arm must be **low** — proposal **+10–12%** of NP, to
+  be set from the actual `pmax%` distribution in the archive (§13.5 Q1), not guessed.
+- **Gate 2 — Give-back budget (`G_s`, % of NP), a *percentage* ratchet (not √-rupee):**
+  ```
+  giveback% = pmax% − u%(t)
+  exit candidate when  giveback% ≥ G_s(pmax%)
+  ```
+  Two candidate forms (decide on data): **(a) flat fraction** `G_s = f · pmax%` (e.g. f = 0.4 →
+  protect 60% of the best %); **(b) concave-in-%** (mirror the EMA √ idea in %-space so larger %
+  winners are protected proportionally tighter).
+- **Gate 3 — Trend confirm, but FASTER.** Reuse the slope + patience machinery, recalibrated for the
+  5s poll cadence (a 180s window is only ~36 samples; 30s confirm only ~6). Proposal: shorter than
+  EMA — `W ≈ 90–120s`, `H ≈ 10–15s` — because for a straddle a sustained falling P&L *is* the adverse
+  signal, so less patience is warranted.
+- **Gate 4 — Hard override.** Even more important here: a fast V-shaped give-back on a straddle is a
+  directional spike = real short-gamma risk. `giveback% ≥ HARD_MULT · G_s` → exit immediately.
+
+### 13.3 Interaction with existing straddle exits
+
+APPE ratchets **within** the existing band; it changes nothing at the edges:
+
+| Exit | Level | Role once APPE is added |
+|---|---|---|
+| Profit target | +25% of NP | unchanged — the top cap |
+| **APPE ratchet (new)** | trails within `[arm, +25%]` | books a reached-but-sub-PT profit (e.g. hit +16%, rolling over → exit ~+10%) instead of riding back to 0 / into loss |
+| Stop-loss | −50% of NP | unchanged — loss backstop |
+| EOD 15:14 | time | unchanged |
+| Position sync | legs vanish | unchanged |
+
+Today the straddle is **all-or-nothing**: it either tags +25% or rides the open P&L to EOD/SL. APPE
+turns a partial winner that rolls over into a booked partial gain — the EMA lesson, in %-space.
+
+### 13.4 The straddle-specific coupling: APPE ≈ ALE here
+
+For the EMA, APPE (profit side) and ALE (loss side, §10) are distinct mechanisms. For a straddle they
+**converge**: a P&L falling from a profit peak and a P&L deepening into a loss are the *same* event —
+a directional move against short gamma. So the straddle should likely have **one coherent
+"directional-bleed exit"** (a P&L ratchet that simply spans positive→negative), not two independent
+APPE + ALE systems bolted on. **This is the central design decision to settle before building.**
+
+### 13.5 Open questions (resolve before implementing)
+
+1. **Data first.** Extract per-day `pmax%` and the full `u%(t)` curve for the straddle from the
+   archive; set the arm and `G_s` from the real distribution. (Most straddle days never reach +25%.)
+2. **Give-back form** — flat-fraction (a) vs concave-% (b)?
+3. **Arm level** — +10% / +12% of NP? (scale-invariant across premium sizes, unlike a bare ₹ arm).
+4. **Window / patience** for the 5s poll cadence — how much faster than EMA's 180s / 30s?
+5. **Unify with ALE?** Per §13.4, one directional-bleed ratchet spanning profit→loss, vs separate
+   APPE + `MAX_LOSS_PER_TRADE`?
+6. **Hedge effect** — does the iron-butterfly's capped tail change where the ratchet should sit
+   relative to a naked straddle?
+7. **Priority** — §11 still holds that the straddle's **loss side** is what actually hurt it
+   (May 12 −52K, May 29 −2.5K). Sequence this design behind the straddle loss stop unless the
+   archive data shows meaningful sub-PT profit give-back to recover.
