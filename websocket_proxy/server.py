@@ -96,10 +96,27 @@ class WebSocketProxy:
         # ZeroMQ context for subscribing to broker adapters
         self.context = zmq.asyncio.Context()
         self.socket = self.context.socket(zmq.SUB)
-        # Connecting to ZMQ
+        # Connecting to ZMQ.
+        #
+        # Under gunicorn+eventlet the WS proxy runs in a separate subprocess
+        # from the Flask worker, but `SharedZmqPublisher` is a per-process
+        # singleton — so each process gets its own publisher. The Flask worker
+        # binds :5555 first (via database/cache_invalidation.py when auth
+        # tokens are revoked at startup), and the proxy subprocess's market
+        # data publisher then silently falls back to :5556 in
+        # SharedZmqPublisher.bind(). Subscribing only to ZMQ_PORT lands us on
+        # the worker's wire (cache invalidations) and never on the proxy's
+        # wire (ticks), so the strategy sees `Feed STALE` forever.
+        #
+        # Fix: SUB-connect to a small range of candidate publisher ports.
+        # ZMQ `connect()` to a not-yet-bound endpoint is harmless and will
+        # start receiving the moment that publisher binds. Range size is
+        # controllable via ZMQ_SUB_SCAN_RANGE (default 5, covers 5555..5559).
         ZMQ_HOST = os.getenv("ZMQ_HOST", "127.0.0.1")
-        ZMQ_PORT = os.getenv("ZMQ_PORT")
-        self.socket.connect(f"tcp://{ZMQ_HOST}:{ZMQ_PORT}")  # Connect to broker adapter publisher
+        default_port = int(os.getenv("ZMQ_PORT") or "5555")
+        scan_range = int(os.getenv("ZMQ_SUB_SCAN_RANGE", "5"))
+        for port in range(default_port, default_port + scan_range):
+            self.socket.connect(f"tcp://{ZMQ_HOST}:{port}")
 
         # Set up ZeroMQ subscriber to receive all messages
         self.socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all topics
