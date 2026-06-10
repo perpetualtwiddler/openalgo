@@ -805,6 +805,29 @@ class ShortStraddleBot:
         print(f"  Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
         print(f"  Entry: {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} | Exit: {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}")
         print("=" * 65)
+
+        # Startup heads-up: surface the deterministic no-trade reasons NOW (consecutive-SL
+        # cooldown, expiry day, event day are all knowable at init) instead of only at the
+        # entry-time check. Logging only — the authoritative decision still runs in the entry
+        # window below, where the live-data gates (gap / VIX / trend) are also evaluated.
+        try:
+            if self.check_consecutive_sl():
+                _startup_skip = "consecutive-SL cooldown"
+            elif self.is_expiry_day():
+                _startup_skip = "expiry day (gamma risk)"
+            elif self.is_event_day():
+                _startup_skip = "high-volatility event day"
+            else:
+                _startup_skip = None
+            if _startup_skip:
+                print(f"[INIT] *** NO TRADE TODAY — {_startup_skip}. Straddle will skip the "
+                      f"{ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} entry. ***")
+            else:
+                print(f"[INIT] No startup-known blocker — entry still subject to live "
+                      f"gap/VIX/trend checks at {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d}.")
+        except Exception as _e:
+            print(f"[INIT] startup no-trade pre-check skipped (non-fatal): {_e}")
+
         print("Waiting for entry time...")
 
         monitor_t = threading.Thread(target=self.monitor_pnl, daemon=True)
