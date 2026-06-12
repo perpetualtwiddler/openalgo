@@ -74,6 +74,10 @@ PROFIT_ARM_THRESHOLD = (
     float(_arm_override) if _arm_override else ARM_PER_LOT * (QUANTITY / LOT_SIZE)
 )  # ₹ profit before APPE arms (Gate 1)
 GIVEBACK_K = float(os.getenv("GIVEBACK_K", "30"))             # give-back budget G = k·√P_max (Gate 2)
+# Size-aware scaling: G = k·√P_max·√(units/UNITS_REF). Give-back is a points/volatility property,
+# so it grows only √-fast with position size (not linearly). UNITS_REF=2 anchors to the 60-qty
+# calibration → factor 1 at 2 units (no change to current behaviour). See design doc §4/§5.
+GIVEBACK_REF_UNITS = float(os.getenv("GIVEBACK_REF_UNITS", "2"))
 TREND_WINDOW_SEC = float(os.getenv("TREND_WINDOW_SEC", "180"))    # slope lookback (Gate 3a)
 TREND_CONFIRM_SEC = float(os.getenv("TREND_CONFIRM_SEC", "30"))   # breach hold / patience (Gate 3b)
 HARD_MULT = float(os.getenv("HARD_MULT", "2.0"))             # catastrophic give-back multiple (Gate 4)
@@ -153,7 +157,8 @@ class EMACrossoverBot:
         print(f"[INIT] Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
         if APPE_ENABLED:
             print(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} "
-                  f"(₹{ARM_PER_LOT:.0f}×{QUANTITY/LOT_SIZE:g} lots) | G={GIVEBACK_K:g}·√peak | "
+                  f"(₹{ARM_PER_LOT:.0f}×{QUANTITY/LOT_SIZE:g} lots) | "
+                  f"G={GIVEBACK_K:g}·√peak·√({QUANTITY/LOT_SIZE:g}u/{GIVEBACK_REF_UNITS:g}) | "
                   f"trend {TREND_WINDOW_SEC:.0f}s | confirm {TREND_CONFIRM_SEC:.0f}s | hard ×{HARD_MULT:g}")
         else:
             print("[INIT] APPE off — price trailing-SL only")
@@ -352,7 +357,9 @@ class EMACrossoverBot:
             else:
                 return None
 
-        budget = GIVEBACK_K * math.sqrt(max(self.appe_peak, 0.0))
+        # size-aware: √-scale the budget by units so give-back-in-points grows √-fast, not linearly
+        _units_factor = math.sqrt((QUANTITY / LOT_SIZE) / GIVEBACK_REF_UNITS)
+        budget = GIVEBACK_K * math.sqrt(max(self.appe_peak, 0.0)) * _units_factor
         floor = self.appe_peak - budget
         giveback = self.appe_peak - unrealized
 

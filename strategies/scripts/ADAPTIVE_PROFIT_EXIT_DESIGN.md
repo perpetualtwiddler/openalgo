@@ -120,6 +120,24 @@ All three put the May 29 exit in the **₹16.5K–19K** zone — matching Mandar
 17–18K" intuition. **Square-root (b) is the most principled** (smoothly protects a rising fraction,
 no tier discontinuities) and is the recommended default, but it is one config flip to switch.
 
+**Size-aware refinement (units scaling, 2026-06-12).** `G = k·√P_max` is in *rupees* and ignores
+position size, so the give-back room *in points* (`G / QTY`) shrinks as units grow — at a fixed rupee
+peak a 4-unit (120-qty) book would exit on a ~25-pt wiggle vs ~50 pts for 2 units. Give-back is
+fundamentally a *price-volatility (points)* property, so scale it **sub-linearly** with units:
+
+```
+G = k · √P_max · √(units / UNITS_REF)   |   units = QUANTITY / LOT_SIZE,  k = 30,  UNITS_REF = 2
+```
+
+`UNITS_REF = 2` anchors to the current 60-qty calibration (factor = 1 → the §5 table is unchanged).
+This is exactly equivalent to a **points-native** budget `G_pts = k_pts·√(P_max/QTY)` with
+`k_pts = 30/√60 ≈ 3.873` — i.e. the give-back *in points* depends only on **how far price ran, not on
+how many units are held** (size-correct), and the rupee value then scales linearly with QTY. Doubling
+units lifts G by only **×√2** (4 units → ×1.41), never ×2. The arm threshold already scales *linearly*
+with units (₹4,000 × units, §4 Gate 1); the give-back scales by **√units** — the two are deliberately
+different (arm = "earned enough to protect", a rupee bar; give-back = "noise tolerance", a points/vol
+property).
+
 ### Gate 3 — Trend confirmation (is it *genuinely* rolling over, not just one dip?)
 
 This is Mandar's key point: *"when profit is trending down, do NOT exit immediately — confirm it."*
@@ -164,10 +182,12 @@ HARD_MULT default = 2.0
 
 ## 5. Worked examples across scenarios
 
-All examples use the recommended defaults: **square-root budget** `G = k·√P_max` with `k=30`,
-arm threshold `A=10,000`, trend window `W=180s`, patience `H=30s`, hard multiple `2.0`.
+All examples use the recommended defaults: **size-aware square-root budget**
+`G = 30·√P_max·√(units/2)`, arm `A = ₹4,000 × units`, trend window `W=180s`, patience `H=30s`,
+hard multiple `2.0`.
 
-Handy reference — the budget `G` and protective `floor = P_max − G` at various peaks:
+**Reference (a) — at the current 2 units (60 qty)**: factor `√(2/2)=1`, so `G = 30·√P_max` exactly
+(this table is unchanged by the size-aware refinement):
 
 | `P_max` (peak ₹) | `G = 30·√P_max` | `floor` (exit if U drops below, when confirmed) | fraction kept |
 |------------------|------------------|--------------------------------------------------|---------------|
@@ -178,8 +198,35 @@ Handy reference — the budget `G` and protective `floor = P_max − G` at vario
 | 23,568 | 4,606 | 18,962 | 80% |
 | 30,000 | 5,196 | 24,804 | 83% |
 
-Notice the floor protects a **rising fraction** as the peak climbs (70% → 83%) — exactly the
-"10K-peak and 30K-peak should differ" requirement.
+Floor protects a **rising fraction** as the peak climbs (70% → 83%) — the "10K vs 30K peak should
+differ" requirement.
+
+**Reference (b) — units scaling at a fixed P_max = ₹10,000** (G lifts by `√(units/2)`, sub-linear):
+
+| units (qty) | factor `√(units/2)` | `G` (₹) | give-back in **points** (`G/QTY`) |
+|-------------|---------------------|---------|-----------------------------------|
+| 1 (30) | 0.71 | 2,121 | 70.7 |
+| 2 (60) | 1.00 | 3,000 | 50.0 |
+| 4 (120) | 1.41 | 4,243 | 35.4 |
+| 6 (180) | 1.73 | 5,196 | 28.9 |
+
+(Linear scaling would give 4 units G=6,000; √-scaling gives 4,243 — more room than the
+size-blind 3,000, but not double.)
+
+**Reference (c) — points-native (size-independent)**: give-back depends only on the **price
+excursion** `E` (pts), via `G_pts = 3.873·√E`; rupees = `G_pts × QTY`. Same numbers as (a)/(b), just
+expressed in points so the size cancels out:
+
+| peak excursion `E` (pts) | `G_pts = 3.873·√E` | `floor` (pts) | fraction kept |
+|--------------------------|--------------------|---------------|---------------|
+| 100 | 38.7 | 61.3 | 61% |
+| 167 | 50.0 | 117 | 70% |
+| 200 | 54.8 | 145 | 73% |
+| 300 | 67.1 | 233 | 78% |
+| 400 | 77.5 | 322 | 81% |
+
+(`E=167 pts × 60 qty = ₹10,020 ≈` the ₹10,000 row of table (a) — they're the same budget, one in
+rupees, one in points.)
 
 ---
 
