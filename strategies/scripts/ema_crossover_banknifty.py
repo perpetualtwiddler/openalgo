@@ -77,6 +77,10 @@ GIVEBACK_K = float(os.getenv("GIVEBACK_K", "30"))             # give-back budget
 TREND_WINDOW_SEC = float(os.getenv("TREND_WINDOW_SEC", "180"))    # slope lookback (Gate 3a)
 TREND_CONFIRM_SEC = float(os.getenv("TREND_CONFIRM_SEC", "30"))   # breach hold / patience (Gate 3b)
 HARD_MULT = float(os.getenv("HARD_MULT", "2.0"))             # catastrophic give-back multiple (Gate 4)
+# Reverse-signal confirmation SHADOW (design doc §14) — LOG-ONLY, does not change trading.
+# On a reverse-signal exit, records what a "confirm the reverse only on price follow-through"
+# filter WOULD have decided, to gather real-fidelity evidence on this rare event over time.
+REVERSE_CONFIRM_PCT = float(os.getenv("REVERSE_CONFIRM_PCT", "0.0005"))  # 0.05% (~28 BANKNIFTY pts)
 
 # Feed-health guard: if no WS ticks arrive for this long during market hours, the feed is
 # considered stale — trailing-SL & APPE (both tick-driven) are inactive, so we log ERROR and
@@ -138,6 +142,7 @@ class EMACrossoverBot:
         self.pnl_window = deque()      # (monotonic_ts, unrealized) over TREND_WINDOW_SEC
         self.last_tick_ts = None       # time.monotonic() of last on_ltp_update (feed-health)
         self.feed_stale = False        # True while the WS tick feed is stale
+        self.shadow_reverse = None     # §14 reverse-confirm SHADOW (log-only); set on a reverse exit
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
 
         self.load_state()
@@ -227,6 +232,14 @@ class EMACrossoverBot:
 
         self.ltp = float(data["data"]["ltp"])
         now = datetime.now().strftime("%H:%M:%S")
+
+        # §14 reverse-confirm SHADOW — resolve any pending shadow each tick (log-only, no trade change).
+        # Placed before the flat-position return so it keeps tracking after the reverse exit / while paused.
+        if self.shadow_reverse is not None:
+            try:
+                self._resolve_shadow(self.ltp)
+            except Exception:
+                pass
 
         if not self.position or self.exit_in_progress:
             print(f"\r[{now}] LTP: {self.ltp:.2f} | No position | Day P&L: {self.daily_pnl:.2f}    ", end="")
@@ -370,6 +383,39 @@ class EMACrossoverBot:
 
         return None
 
+    # ----- §14 reverse-signal confirmation SHADOW (log-only; never changes trading) -----
+    def _arm_shadow_reverse(self, position, entry_price, trigger_price):
+        """Called when a reverse-signal exit fires. Records the confirm-stop the §14 filter
+        would have used, so the next tick(s) can log whether the reverse followed through."""
+        stop = (trigger_price * (1 - REVERSE_CONFIRM_PCT) if position == "BUY"
+                else trigger_price * (1 + REVERSE_CONFIRM_PCT))
+        self.shadow_reverse = {"dir": position, "entry": entry_price,
+                               "trigger": trigger_price, "stop": round(stop, 2)}
+        print(f"\n[SHADOW] §14 armed — reverse fired @ {trigger_price:.2f}; confirm-stop @ {stop:.2f} "
+              f"(−{REVERSE_CONFIRM_PCT * 100:.2f}% follow-through). Tracking CONFIRM vs NOISE (log-only).")
+
+    def _resolve_shadow(self, price):
+        """Each tick: did price follow through to the confirm-stop (filter would also exit) or not
+        (filter would have HELD)? Resolves on confirm-stop hit or at EOD. Pure logging."""
+        sr = self.shadow_reverse
+        if sr is None:
+            return
+        d, entry, trig, stop = sr["dir"], sr["entry"], sr["trigger"], sr["stop"]
+        rpnl = (trig - entry) * QUANTITY if d == "BUY" else (entry - trig) * QUANTITY
+        confirmed = price <= stop if d == "BUY" else price >= stop
+        if confirmed:
+            spnl = (stop - entry) * QUANTITY if d == "BUY" else (entry - stop) * QUANTITY
+            print(f"\n[SHADOW] §14 CONFIRMED — price hit confirm-stop {stop:.2f}; filter would have exited "
+                  f"~₹{spnl:.0f} (vs actual reverse ~₹{rpnl:.0f}). Filter ≈ no edge this time.")
+            self.shadow_reverse = None
+            return
+        now = datetime.now()
+        if now.hour > 15 or (now.hour == 15 and now.minute >= 14):
+            hpnl = (price - entry) * QUANTITY if d == "BUY" else (entry - price) * QUANTITY
+            print(f"\n[SHADOW] §14 HELD — never reached confirm-stop {stop:.2f}; reverse was noise. "
+                  f"Hold-to-EOD mark ~₹{hpnl:.0f} (vs actual reverse ~₹{rpnl:.0f}). Filter would have AVOIDED the exit.")
+            self.shadow_reverse = None
+
     def start_websocket(self):
         while not self.stop_event.is_set():
             try:
@@ -483,6 +529,12 @@ class EMACrossoverBot:
             return False
 
         if self.position and self.position != signal:
+            # §14 SHADOW (log-only): record what the reverse-confirm filter would have done.
+            # Snapshot entry_price now — place_exit() resets it. Never affects the exit below.
+            try:
+                self._arm_shadow_reverse(self.position, self.entry_price, self.ltp)
+            except Exception:
+                pass
             print(f"[REVERSE] Closing {self.position} before entering {signal}")
             self.place_exit("REVERSE_SIGNAL")
             time.sleep(1)

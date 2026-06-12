@@ -663,3 +663,23 @@ days). Only an archive backtest decides if that's positive.
   reverse)?
 - **Backtest** across the archive — count whipsaw-saved days vs the ₹1,680-per-confirmed-day cost,
   and check it never converts a TSL-day into something worse. (Includes Jun 12 as a known win.)
+
+### 14.5 Backtest verdict + SHADOW logger (2026-06-12)
+
+The offline 5m backtest **cannot reliably evaluate this filter.** Reverses are rare (only **1 of 16**
+archived days had one), and the filter's edge lives in a **~28-pt band** — but the backtest's
+signal-price fidelity is **~30 pts** (5m-candle close vs tick fill, + 1-day EMA warmup vs the live
+multi-day history). On Jun 12 that error flips the verdict: backtest detected the reverse @ 55,875
+(confirm-stop 55,847) and the low 55,845 *just* clips it → "CONFIRMED, filter loses ₹1,676"; live
+fired the reverse @ 55,846 (confirm-stop 55,818), same low 55,845 *misses* it → "HELD, filter saves
+~₹63k." **Opposite conclusions from a 29-pt signal error ≈ the 28-pt threshold.** You can't measure a
+28-pt effect with a 30-pt-error ruler.
+
+So instead of trusting the backtest, a **SHADOW logger is implemented in
+`ema_crossover_banknifty.py`** (commit on mock/strategies): on every *live* reverse-signal exit it
+logs `[SHADOW] §14 armed …` with the confirm-stop, then each tick logs whether price **CONFIRMED**
+(hit the −0.05% follow-through → filter ≈ no edge) or **HELD** (never confirmed by EOD → filter would
+have avoided the exit, with the hold-to-EOD mark). **Log-only — it never changes trading.** Since
+reverses are rare, this accrues perfect-fidelity evidence over the coming weeks at zero risk; revisit
+the implement decision once we have several real `[SHADOW]` data points. `REVERSE_CONFIRM_PCT` env
+tunes the buffer (default 0.05%).
