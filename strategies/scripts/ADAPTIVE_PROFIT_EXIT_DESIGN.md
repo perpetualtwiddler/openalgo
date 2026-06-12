@@ -603,3 +603,63 @@ APPE + ALE systems bolted on. **This is the central design decision to settle be
 7. **Priority** — §11 still holds that the straddle's **loss side** is what actually hurt it
    (May 12 −52K, May 29 −2.5K). Sequence this design behind the straddle loss stop unless the
    archive data shows meaningful sub-PT profit give-back to recover.
+
+---
+
+## 14. Reverse-signal confirmation filter (EMA whipsaw guard)
+
+**Status: DESIGN ONLY (2026-06-12). Not implemented.** Applies to the **EMA crossover** strategy's
+reverse-signal exit. Needs an archive backtest before going live.
+
+### 14.1 The problem — Jun 12, 2026
+
+EMA went BUY @ 56,000 (09:20). At 12:45 a **bearish 9/21 crossover** fired with volume — but the
+cross was **hair-thin**: EMA(9) 55,905.21 vs EMA(21) 55,905.89, a **0.68-point** separation, while
+the position was only **−154 pts (−0.27%)** underwater (still inside the 0.5% trailing-SL). The
+reverse-exit fired anyway → closed @ 55,846.60 = **−₹9,204**, which then tripped the ₹5,000 daily
+circuit breaker and **locked the strategy out for the day**. Price then **recovered to 56,898 by
+EOD** — the long was ultimately right. Held, it would have made **~+₹53,880**. A noise-level cross at
+a local dip cost ~₹63k of swing and the whole afternoon.
+
+### 14.2 The rule
+
+Don't exit on the *crossover itself*. **Book that a reverse fired, then require price follow-through
+to confirm it:**
+
+```
+On a reverse crossover (e.g. EMA9 crosses below EMA21 while long):
+    arm a confirm-stop at  trigger_price − REVERSE_CONFIRM_PTS     (long; mirror for short)
+    REVERSE_CONFIRM_PTS = REVERSE_CONFIRM_PCT × price   (≈ 0.05% ≈ 28 BANKNIFTY pts)
+    if price reaches the confirm-stop:        EXIT (reason = REVERSE_CONFIRMED)
+    if price re-crosses back (gap flips bullish) before the stop:  CANCEL — it was noise
+```
+
+- The **28 pts is BANKNIFTY-future index points** (0.05% of ~56,000), i.e. **₹1,680 at 60 qty** — it
+  is the *price follow-through* buffer, NOT the EMA separation and NOT the rupee loss at exit.
+- The **0.5% trailing-SL stays as the hard backstop** for a fast crash/gap that reaches it before a
+  reverse-cross+confirm can engage.
+
+### 14.3 Worked comparison — all anchored to the real Jun 12 trade (BUY @ 56,000, 60 qty)
+
+`0.5% TSL = 55,720` · reverse cross @ `55,846.60` · confirm-stop @ `55,846.60 − 28 = 55,818.60`
+
+| Case | What price does after the reverse cross | Exit (with rule) | Exit px | P&L |
+|------|------------------------------------------|------------------|---------|-----|
+| **baseline (current rule)** | exits *at* the cross, no confirmation | reverse (immediate) | 55,846.6 | **−9,204** |
+| **A. Noise / whipsaw — JUN 12 REAL** | dips to 55,845 then recovers to 56,898 | none → held to EOD | 56,898 | **+53,880** |
+| **B. Confirmed downtrend** | follows through −28 to 55,818.6 | `REVERSE_CONFIRMED` | 55,818.6 | **−10,884** |
+| **C. Fast crash / gap** | drops to the TSL before a cross+confirm engages | 0.5% TSL backstop | 55,720 | **−16,800** |
+
+Read it as: the filter **saves the whole whipsaw** in case A (−9,204 → +53,880); **costs an extra
+₹1,680** vs the baseline in case B (the confirmation buffer, 28 pts × 60); and is **unchanged** in
+case C (the TSL is the floor either way). Net value = (whipsaw days saved) − (₹1,680 × confirmed
+days). Only an archive backtest decides if that's positive.
+
+### 14.4 Parameters / open questions
+- `REVERSE_CONFIRM_PCT` default ~**0.05%** (≈28 BANKNIFTY pts) — sweep in backtest.
+- Reference for the confirm-stop: the **reverse-trigger price** (armed at the cross, cancelled on a
+  bullish re-cross). Alternative: trail it if a new lower cross prints.
+- Should a **time cap** also disarm it (e.g. if not confirmed within N minutes, drop the pending
+  reverse)?
+- **Backtest** across the archive — count whipsaw-saved days vs the ₹1,680-per-confirmed-day cost,
+  and check it never converts a TSL-day into something worse. (Includes Jun 12 as a known win.)
