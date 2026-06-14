@@ -730,3 +730,67 @@ have avoided the exit, with the hold-to-EOD mark). **Log-only — it never chang
 reverses are rare, this accrues perfect-fidelity evidence over the coming weeks at zero risk; revisit
 the implement decision once we have several real `[SHADOW]` data points. `REVERSE_CONFIRM_PCT` env
 tunes the buffer (default 0.05%).
+
+---
+
+## 15. Daily breaker ↔ per-trade risk coherence (follow-up)
+
+**Status: design / follow-up (2026-06-12). Queued behind §14 — do not change the breaker before §14
+is live.**
+
+**The incoherence (quantified at 60 qty).** The 0.5% trailing-SL's worst-case loss is
+`280 pts × 60 = ₹16,800` — about **3× the ₹5,000 daily breaker**. A losing trade only stays under
+₹5k if it first ran **+197 pts favorable** (so the TSL trails to within 83 pts = ₹5k of entry).
+**Any trade that reverses before going ~+197 pts in profit → its single TSL loss > ₹5k → breaker
+trips → no more EMA trades that day.** So the breaker is effectively "stop after the first real
+losing trade." Per-trade risk ≫ daily cap — the §10.5 gap, now with numbers.
+
+**Why we can't just raise it now.** The breaker interacts with the reverse-signal **flip**. On a
+reverse day a higher breaker lets the *losing middle flip* through before halting:
+
+| Daily limit | June 12 outcome |
+|---|---|
+| ₹5,000 (now) | blocks the flip after trade 1 → **−9,204** |
+| ₹10,000 | allows the losing SELL flip, blocks the recovery → **−14,304** (worse!) |
+| ≥₹15,000 | survives both flips, reaches the recovery BUY → **≈ +43,700** |
+
+So ₹10k is the *worst* spot, and the breaker can't be tuned until the flip behaviour is fixed.
+
+**Sequencing (complementary fixes):**
+1. **§14 reverse-confirm filter** removes the noise-flip cascade.
+2. **Then** raise the breaker. A TSL exit goes *flat* (it does not flip), so the next crossover is a
+   clean fresh entry — giving the "2nd shot after a TSL loss" without the flip gotcha.
+
+**Plan:**
+- Keep **₹5,000** until §14 is validated + live.
+- Then raise the daily breaker to **~₹15,000** (coherent with the ₹16,800 per-trade TSL) so one TSL
+  loss doesn't lock out the day.
+- **Better**: pair with a §10 **ALE per-trade rupee stop** (cap each trade at ~₹X, daily ≈ 2×X) for
+  full coherence — but keep that stop **loose enough not to whipsaw** (June 12 needed ~280 pts of
+  room; a tight ₹6k/100-pt stop would have ejected that winner at −6k), so it needs the backtest.
+- **Ideal**: set the breaker from the *actual* TSL-loss distribution once logs/shadow give real data.
+
+---
+
+## 16. Master TODO / open-items checklist
+
+Single tracker so nothing is lost. (Older brainstorm ideas live in §11; this is the actionable list.)
+Tags: `[live]` deployed · `[shadow]` log-only data-gathering · `[design]` not built · `[blocked]` waiting on another item.
+
+**EMA crossover**
+- [x] `[live]` APPE arm → proportional **₹4,000/lot** (₹8,000 @ 60 qty) — "HAVRATPANA CONTROL"
+- [x] `[live]` APPE give-back **G size-aware** `√(units/2)` (§4/§5) — no-op at 60 qty
+- [ ] `[shadow]` **§14 reverse-confirm filter** — implement once ≥3–5 real `[SHADOW]` events confirm value
+- [ ] `[design][blocked on §14]` **§15 breaker raise** to ~₹15k so one TSL loss doesn't end the day
+- [ ] `[design]` **§10 ALE** per-trade rupee stop (`MAX_LOSS_PER_TRADE`) + coherent daily — keep loose; backtest first
+- [ ] `[design]` Reverse-confirm `REVERSE_CONFIRM_PCT` value — tune from shadow data, not the offline backtest (§14.5)
+
+**Short straddle**
+- [ ] `[live]` startup no-trade banner — done
+- [ ] `[design]` **§13 APPE for straddle** (%-of-premium framing) — revisit after EMA APPE reviewed live
+- [ ] `[design]` **Straddle loss-side stop** — §11 priority; its real pain is directional moves, not give-back
+
+**Validation / infra**
+- [ ] Backtest fidelity — offline 5m can't resolve sub-~30-pt effects (§14.5); use tick replay or live shadow for §14/§15 tuning
+- [ ] Multi-day APPE arm sweep (₹4k vs ₹5k) — optional, once a faithful backtest exists
+- [x] `[live]` 09:05 post-auth restart timer · pre-market apt upgrades · feed-health guard + ERROR logging
