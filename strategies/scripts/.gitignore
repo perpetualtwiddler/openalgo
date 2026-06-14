@@ -9,6 +9,7 @@
 !ema_crossover_banknifty.py
 !capture_trade_data.py
 !backtest_offline.py
+!backtest_ticks.py
 !backtest_straddle_today.py
 !analyze_hedge_cost.py
 !sim_ema_today.py

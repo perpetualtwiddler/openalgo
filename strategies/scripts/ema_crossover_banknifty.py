@@ -40,6 +40,12 @@ WS_URL = os.getenv("WEBSOCKET_URL") or (
     f"ws://{os.getenv('WEBSOCKET_HOST', '127.0.0.1')}:{os.getenv('WEBSOCKET_PORT', '8765')}"
 )
 
+# Feed mode: "quote" subscribes in Quote mode so the WS bus carries traded VOLUME,
+# which websocket_proxy/market_data_recorder.py persists for backtesting. The strategy
+# itself only needs LTP, and quote payloads are a superset that still include ltp, so
+# this is safe to leave on. Set FEED_MODE=ltp to revert to the lighter LTP-only feed.
+FEED_MODE = os.getenv("FEED_MODE", "quote").strip().lower()
+
 UNDERLYING = os.getenv("SYMBOL", "BANKNIFTY")
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NFO"))
 QUANTITY = int(os.getenv("QUANTITY", "60"))       # 2 lots x 30 units
@@ -169,7 +175,7 @@ class EMACrossoverBot:
                   f"trend {TREND_WINDOW_SEC:.0f}s | confirm {TREND_CONFIRM_SEC:.0f}s | hard ×{HARD_MULT:g}")
         else:
             log("[INIT] APPE off — price trailing-SL only")
-        log(f"[INIT] Qty: {QUANTITY} | Product: {PRODUCT} | Direction: {TRADE_DIRECTION}")
+        log(f"[INIT] Qty: {QUANTITY} | Product: {PRODUCT} | Direction: {TRADE_DIRECTION} | Feed: {FEED_MODE}")
         if self.position:
             log(f"[INIT] Resumed {self.position} @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}")
 
@@ -411,19 +417,27 @@ class EMACrossoverBot:
         while not self.stop_event.is_set():
             try:
                 self.client.connect()
-                self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
+                # Quote mode makes the WS bus carry traded volume (recorded for backtesting);
+                # the quote payload is a superset of LTP, so on_ltp_update still reads ltp.
+                if FEED_MODE == "quote":
+                    self.client.subscribe_quote(self.instrument, on_data_received=self.on_ltp_update)
+                else:
+                    self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
                 # NOTE: the SDK logs its own "[WS] Connected" line on TCP connect, BEFORE
                 # the WebSocket handshake or any data flow. That line lies when the WS
                 # proxy is unreachable. We do NOT mirror it — the only honest "alive"
                 # signal is FIRST TICK RECEIVED, logged from on_ltp_update().
-                log(f"[WS] Subscribed to {self.symbol} — waiting for first tick (see [WS] FIRST TICK RECEIVED)...")
+                log(f"[WS] Subscribed to {self.symbol} ({FEED_MODE} mode) — waiting for first tick (see [WS] FIRST TICK RECEIVED)...")
                 while not self.stop_event.is_set():
                     time.sleep(1)
             except Exception as e:
                 log_error(f"WebSocket connection error: {e}")
             finally:
                 try:
-                    self.client.unsubscribe_ltp(self.instrument)
+                    if FEED_MODE == "quote":
+                        self.client.unsubscribe_quote(self.instrument)
+                    else:
+                        self.client.unsubscribe_ltp(self.instrument)
                     self.client.disconnect()
                 except Exception:
                     pass
