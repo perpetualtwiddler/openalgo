@@ -349,6 +349,48 @@ def async_master_contract_download(broker):
     return master_contract_status
 
 
+def _export_capture_token(broker, auth_token):
+    """Best-effort export of the broker's plaintext session token to CAPTURE_TOKEN_FILE.
+
+    Enables a standalone market-data capture daemon to reuse the SAME broker session
+    (a separate login would regenerate/invalidate this token and break trading) by
+    riding a second WebSocket connection on the existing token. No-op unless
+    CAPTURE_TOKEN_FILE is set in .env. Writes atomically with 0600 perms and never
+    raises into the login flow.
+    """
+    path = os.getenv("CAPTURE_TOKEN_FILE", "").strip()
+    if not path:
+        return
+    try:
+        import json
+        import tempfile
+        from utils.config import get_broker_api_key
+
+        ist_now = datetime.now(pytz.timezone("Asia/Kolkata"))
+        payload = {
+            "broker": broker,
+            "api_key": get_broker_api_key(),
+            "access_token": auth_token,
+            "date": ist_now.strftime("%Y-%m-%d"),
+            "ts": ist_now.isoformat(),
+        }
+        target_dir = os.path.dirname(path) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=target_dir, prefix=".captok_", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, path)  # atomic; reader never sees a partial file
+            os.chmod(path, 0o600)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        logger.info(f"[CAPTURE] Exported {broker} session token to {path} (0600)")
+    except Exception as e:
+        logger.warning(f"[CAPTURE] Could not export session token to {path}: {e}")
+
+
 def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, user_id=None):
     """
     Handles common tasks after successful authentication.
@@ -419,6 +461,9 @@ def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, u
     )
     if inserted_id:
         logger.info(f"Database record upserted with ID: {inserted_id}")
+        # Export the session token for an external capture daemon (no-op unless
+        # CAPTURE_TOKEN_FILE is set; best-effort, never blocks login).
+        _export_capture_token(broker, auth_token)
         # Initialize master contract status for this broker
         init_broker_status(broker)
 
