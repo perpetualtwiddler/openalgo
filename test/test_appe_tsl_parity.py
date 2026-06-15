@@ -72,7 +72,8 @@ live.threading = types.SimpleNamespace(Thread=_SyncThread)
 # Constants that must agree for the offline replay to mean anything. (live name, bt name)
 _CONST_PAIRS = [
     ("TRAILING_SL_PCT", "TRAILING_SL_PCT"), ("TIGHT_TSL_THRESHOLD", "TIGHT_TSL_THRESHOLD"),
-    ("TIGHT_TSL_PCT", "TIGHT_TSL_PCT"), ("PROFIT_ARM_THRESHOLD", "PROFIT_ARM_THRESHOLD"),
+    ("TIGHT_TSL_PCT", "TIGHT_TSL_PCT"), ("TIGHT_TSL_ENABLED", "TIGHT_TSL_ENABLED"),
+    ("PROFIT_ARM_THRESHOLD", "PROFIT_ARM_THRESHOLD"),
     ("GIVEBACK_K", "GIVEBACK_K"), ("TREND_WINDOW_SEC", "TREND_WINDOW_SEC"),
     ("TREND_CONFIRM_SEC", "TREND_CONFIRM_SEC"), ("HARD_MULT", "HARD_MULT"),
     ("GIVEBACK_REF_UNITS", "GIVEBACK_REF_UNITS"), ("REVERSE_CONFIRM_PCT", "REVERSE_CONFIRM_PCT"),
@@ -126,8 +127,10 @@ _E = 55000.0
 
 # Crafted scenarios that pin specific exit branches. Each: (label, dir, entry, ticks, expect)
 _CRAFTED = [
+    # APPE never arms (peak unrealized 6000 < 8000); flat 0.5% TSL off peak 55100
+    # = 54824.5, so the pullback must drop below that (TIGHT_TSL is gated OFF now).
     ("tsl_only", "BUY", _E,
-     [(0, 55000), (1, 55050), (2, 55100), (3, 55080), (4, 55020), (5, 54961)],
+     [(0, 55000), (1, 55050), (2, 55100), (3, 55080), (4, 55020), (5, 54800)],
      "TRAILING_SL"),
     # APPE_HARD on a tick where the trailing-SL is ALSO hit — proves APPE wins (live ordering)
     ("appe_hard_coincident_with_tsl", "BUY", _E,

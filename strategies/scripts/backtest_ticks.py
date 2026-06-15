@@ -52,6 +52,7 @@ LOT_SIZE = int(os.getenv("LOT_SIZE", "30"))
 TRAILING_SL_PCT = 0.5
 TIGHT_TSL_THRESHOLD = 5000.0
 TIGHT_TSL_PCT = 0.25
+TIGHT_TSL_ENABLED = False  # mirror live default (gated off): TSL stays flat 0.5%
 APPE_ENABLED = True
 ARM_PER_LOT = 4000.0  # mirror live "HAVRATPANA" tuning (lowered from 5000)
 PROFIT_ARM_THRESHOLD = ARM_PER_LOT * (QTY / LOT_SIZE)  # ₹8,000 at 60 qty
@@ -124,7 +125,7 @@ class Position:
         if self.direction == "BUY":
             if ltp > self.peak_price:
                 self.peak_price = ltp
-                pct = TIGHT_TSL_PCT if u >= TIGHT_TSL_THRESHOLD else TRAILING_SL_PCT
+                pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
                 new = round(self.peak_price * (1 - pct / 100), 2)
                 if new > self.trailing_sl:
                     self.trailing_sl = new
@@ -132,7 +133,7 @@ class Position:
         else:
             if ltp < self.peak_price:
                 self.peak_price = ltp
-                pct = TIGHT_TSL_PCT if u >= TIGHT_TSL_THRESHOLD else TRAILING_SL_PCT
+                pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
                 new = round(self.peak_price * (1 + pct / 100), 2)
                 if new < self.trailing_sl:
                     self.trailing_sl = new
