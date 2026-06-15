@@ -11,8 +11,10 @@ Data layout (one file per session):
     <DATA_DIR>/<YYYY-MM-DD>/normalized_market_data.jsonl
 
 Each line: {"data": {"ltp": <float>, "timestamp": <epoch_ms>, "symbol": ...}}
-Volume handling (two variants run side by side):
-    - PRICE-ONLY : no volume gate (every crossover trades).
+Entry gate mirrors live check_signal: a cross also needs a decisive EMA gap
+(|EMA9-EMA21| >= REVERSE_CONFIRM_PCT x close), price leading (close vs EMA9), and
+EMA9 momentum (slope). Two variants run side by side:
+    - PRICE-ONLY : the structural gate (cross + gap + close + slope) WITHOUT volume.
     - VOL-FILTER : the strategy's volume-confirmation gate. Source is auto-detected
                    PER DAY:
                      * "real vol"        — Quote-mode captures carry cumulative
@@ -51,8 +53,10 @@ TRAILING_SL_PCT = 0.5
 TIGHT_TSL_THRESHOLD = 5000.0
 TIGHT_TSL_PCT = 0.25
 APPE_ENABLED = True
-ARM_PER_LOT = 5000.0
-PROFIT_ARM_THRESHOLD = ARM_PER_LOT * (QTY / LOT_SIZE)  # ₹10,000 at 60 qty
+ARM_PER_LOT = 4000.0  # mirror live "HAVRATPANA" tuning (lowered from 5000)
+PROFIT_ARM_THRESHOLD = ARM_PER_LOT * (QTY / LOT_SIZE)  # ₹8,000 at 60 qty
+GIVEBACK_REF_UNITS = 2.0      # size-aware G anchor: factor 1.0 at 2 lots (60 qty)
+REVERSE_CONFIRM_PCT = 0.0003  # min |EMA9-EMA21| gap at the cross (~0.03%) — entry gate
 GIVEBACK_K = 30.0
 TREND_WINDOW_SEC = 180.0
 TREND_CONFIRM_SEC = 30.0
@@ -171,7 +175,9 @@ class Position:
             else:
                 return None
 
-        budget = GIVEBACK_K * math.sqrt(max(self.appe_peak, 0.0))
+        # size-aware: √-scale the budget by units (mirror live _appe_evaluate)
+        _units_factor = math.sqrt((QTY / LOT_SIZE) / GIVEBACK_REF_UNITS)
+        budget = GIVEBACK_K * math.sqrt(max(self.appe_peak, 0.0)) * _units_factor
         floor = self.appe_peak - budget
         giveback = self.appe_peak - u
 
@@ -291,12 +297,20 @@ def simulate_day(ticks, cfg, use_vol_filter):
             else:
                 vol_ok = False  # not enough history for the baseline yet
 
-        if prev_fast <= prev_slow and ema_fast > ema_slow:
-            if vol_ok:
-                pending_signal = "BUY"
-        elif prev_fast >= prev_slow and ema_fast < ema_slow:
-            if vol_ok:
-                pending_signal = "SELL"
+        # Advanced entry gate (mirror live check_signal §14/§16): a bare cross is not
+        # enough — require a decisive EMA gap, price leading (close vs EMA9), EMA9
+        # momentum, and (when use_vol_filter) volume. PRICE-ONLY keeps the structural
+        # gates and drops only the volume condition, to isolate volume's marginal effect.
+        gap = ema_fast - ema_slow
+        min_gap = REVERSE_CONFIRM_PCT * bar_c
+        slope9 = ema_fast - prev_fast
+        vol_pass = vol_ok if use_vol_filter else True
+        bull_cross = prev_fast <= prev_slow and ema_fast > ema_slow
+        bear_cross = prev_fast >= prev_slow and ema_fast < ema_slow
+        if bull_cross and gap >= min_gap and bar_c > ema_fast and slope9 > 0 and vol_pass:
+            pending_signal = "BUY"
+        elif bear_cross and -gap >= min_gap and bar_c < ema_fast and slope9 < 0 and vol_pass:
+            pending_signal = "SELL"
 
     for t_sec, dt, ltp, cum_vol in ticks:
         # ---- EOD square-off ----

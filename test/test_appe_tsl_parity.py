@@ -75,6 +75,7 @@ _CONST_PAIRS = [
     ("TIGHT_TSL_PCT", "TIGHT_TSL_PCT"), ("PROFIT_ARM_THRESHOLD", "PROFIT_ARM_THRESHOLD"),
     ("GIVEBACK_K", "GIVEBACK_K"), ("TREND_WINDOW_SEC", "TREND_WINDOW_SEC"),
     ("TREND_CONFIRM_SEC", "TREND_CONFIRM_SEC"), ("HARD_MULT", "HARD_MULT"),
+    ("GIVEBACK_REF_UNITS", "GIVEBACK_REF_UNITS"), ("REVERSE_CONFIRM_PCT", "REVERSE_CONFIRM_PCT"),
     ("QUANTITY", "QTY"),
 ]
 
@@ -99,6 +100,7 @@ def _run_live(direction, entry, ticks):
     bot.appe_armed = False
     bot.appe_breach_start = None
     bot.pnl_window = collections.deque()
+    bot.shadow_reverse = None  # §14 shadow attr (log-only); on_ltp_update reads it each tick
     exits = []
     bot.place_exit = lambda reason="Manual": exits.append(reason)
     with contextlib.redirect_stdout(io.StringIO()):
