@@ -228,6 +228,7 @@ def simulate_day(ticks, cfg, use_vol_filter):
     vol_sma_n = cfg["vol_sma"]
     vol_mult = cfg["vol_mult"]
     warmup = cfg["warmup"]
+    rcp = cfg.get("reverse_confirm_pct", REVERSE_CONFIRM_PCT)
 
     # Real traded volume is available only when the capture carries a cumulative
     # "volume" field (Quote mode). LTP-only days fall back to a tick-count proxy.
@@ -302,7 +303,7 @@ def simulate_day(ticks, cfg, use_vol_filter):
         # momentum, and (when use_vol_filter) volume. PRICE-ONLY keeps the structural
         # gates and drops only the volume condition, to isolate volume's marginal effect.
         gap = ema_fast - ema_slow
-        min_gap = REVERSE_CONFIRM_PCT * bar_c
+        min_gap = rcp * bar_c
         slope9 = ema_fast - prev_fast
         vol_pass = vol_ok if use_vol_filter else True
         bull_cross = prev_fast <= prev_slow and ema_fast > ema_slow
@@ -429,6 +430,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=9, help="warmup candles to skip")
     ap.add_argument("--vol-sma", type=int)
     ap.add_argument("--vol-mult", type=float, default=1.5)
+    ap.add_argument("--reverse-confirm-pct", type=float, default=REVERSE_CONFIRM_PCT,
+                    help="min |EMA9-EMA21| gap at the cross as a fraction of price "
+                         "(default mirrors live; lower it for faster timeframes)")
     args = ap.parse_args()
 
     if args.date:
@@ -436,19 +440,24 @@ def main():
     else:
         dates = sorted(p.name for p in DATA_DIR.iterdir() if p.is_dir())
 
+    rcp = args.reverse_confirm_pct
     if args.tf and args.fast and args.slow:
         configs = [{"tf": args.tf, "fast": args.fast, "slow": args.slow,
                     "warmup": args.warmup,
-                    "vol_sma": args.vol_sma or 10, "vol_mult": args.vol_mult}]
+                    "vol_sma": args.vol_sma or 10, "vol_mult": args.vol_mult,
+                    "reverse_confirm_pct": rcp}]
     else:
         configs = [
-            {"tf": 2, "fast": 8, "slow": 17, "warmup": 9, "vol_sma": 10, "vol_mult": 1.5},
-            {"tf": 5, "fast": 9, "slow": 21, "warmup": 9, "vol_sma": 20, "vol_mult": 1.5},
+            {"tf": 2, "fast": 8, "slow": 17, "warmup": 9, "vol_sma": 10, "vol_mult": 1.5,
+             "reverse_confirm_pct": rcp},
+            {"tf": 5, "fast": 9, "slow": 21, "warmup": 9, "vol_sma": 20, "vol_mult": 1.5,
+             "reverse_confirm_pct": rcp},
         ]
 
     print(f"Data dir: {DATA_DIR} | days: {', '.join(dates)}")
     print(f"QTY={QTY} | TSL {TRAILING_SL_PCT}%→{TIGHT_TSL_PCT}%@₹{TIGHT_TSL_THRESHOLD:.0f} | "
-          f"APPE arm ₹{PROFIT_ARM_THRESHOLD:.0f}, G={GIVEBACK_K:g}√peak")
+          f"APPE arm ₹{PROFIT_ARM_THRESHOLD:.0f}, G={GIVEBACK_K:g}√peak | "
+          f"gap gate ≥{rcp*100:.4f}% (~{rcp*57000:.0f} pts @57k)")
     run(dates, configs)
 
 
