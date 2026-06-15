@@ -780,8 +780,8 @@ Tags: `[live]` deployed · `[shadow]` log-only data-gathering · `[design]` not 
 **EMA crossover**
 - [x] `[live]` APPE arm → proportional **₹4,000/lot** (₹8,000 @ 60 qty) — "HAVRATPANA CONTROL"
 - [x] `[live]` APPE give-back **G size-aware** `√(units/2)` (§4/§5) — no-op at 60 qty
-- [ ] `[shadow]` **§14 reverse-confirm filter** — implement once ≥3–5 real `[SHADOW]` events confirm value
-- [ ] `[design]` **Extend §14 min-separation to ENTRY crosses** — require EMA(9)−EMA(21) ≥ ~0.05% (≈28 pts) *at the cross* to enter, not just to reverse; a thin cross + a one-off volume blip fakes out (Jun 15: a **+7.94-pt** cross w/ a volume blip → −₹7k+ trade on a low-volume drift). Shadow-log entry-cross separation first to size the threshold.
+- [x] `[live 2026-06-15]` **Crossover-quality gate (entry & reverse)** — a signal now needs ALL of: EMA cross + **|EMA9−EMA21| ≥ 0.03%** (`REVERSE_CONFIRM_PCT`, ≈17 pts) *at the cross* + **close vs EMA9** (above for long / below for short) + **EMA9 slope** (rising/falling, candle-over-candle) + **volume > 1.5×SMA**. Same gate drives entries AND reverse-exits. This **replaces** the original §14 *post-cross follow-through* idea with an *at-cross* separation + momentum gate. Validated on the archive: rejects the Jun 12 reverse (−0.7) and all Jun 15 noise crosses (2–8 pts); passes decisive crosses (Jun 3 −58/+28). Trade-off: also skips medium 4–15-pt crosses (May 14/29) → fewer, decisive-only trades; net effect TBD on forward data. Tune via `REVERSE_CONFIRM_PCT`.
+- [ ] `[redundant]` §14 shadow-logger (`[SHADOW]` lines) — superseded by the at-cross gate above (reverses now only fire on decisive crosses). Harmless log-only; remove when convenient.
 - [ ] `[design][blocked on §14]` **§15 breaker raise** to ~₹15k so one TSL loss doesn't end the day
 - [ ] `[design]` **§10 ALE** per-trade rupee stop (`MAX_LOSS_PER_TRADE`) + coherent daily — keep loose; backtest first
 - [ ] `[design]` Reverse-confirm `REVERSE_CONFIRM_PCT` value — tune from shadow data, not the offline backtest (§14.5)

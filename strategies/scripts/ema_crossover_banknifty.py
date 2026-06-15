@@ -84,7 +84,7 @@ HARD_MULT = float(os.getenv("HARD_MULT", "2.0"))             # catastrophic give
 # Reverse-signal confirmation SHADOW (design doc §14) — LOG-ONLY, does not change trading.
 # On a reverse-signal exit, records what a "confirm the reverse only on price follow-through"
 # filter WOULD have decided, to gather real-fidelity evidence on this rare event over time.
-REVERSE_CONFIRM_PCT = float(os.getenv("REVERSE_CONFIRM_PCT", "0.0005"))  # 0.05% (~28 BANKNIFTY pts)
+REVERSE_CONFIRM_PCT = float(os.getenv("REVERSE_CONFIRM_PCT", "0.0003"))  # 0.03% (~17 BANKNIFTY pts) — min EMA9-EMA21 gap at the cross
 
 # Feed-health guard: if no WS ticks arrive for this long during market hours, the feed is
 # considered stale — trailing-SL & APPE (both tick-driven) are inactive, so we log ERROR and
@@ -154,6 +154,8 @@ class EMACrossoverBot:
         print(f"[INIT] {STRATEGY_NAME}")
         print(f"[INIT] {self.symbol} on {EXCHANGE} | EMA({FAST_EMA}/{SLOW_EMA}) | {CANDLE_TIMEFRAME}")
         print(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
+        print(f"[INIT] Signal gate (entry & reverse): cross + |EMA9−EMA21|≥{REVERSE_CONFIRM_PCT*100:.2f}% "
+              f"+ close vs EMA9 + EMA9 slope + volume")
         print(f"[INIT] Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
         if APPE_ENABLED:
             print(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} "
@@ -473,30 +475,51 @@ class EMACrossoverBot:
         prev = df.iloc[-3]
         last = df.iloc[-2]   # completed candle (not partial)
 
+        # Crossover-noise gates (design doc §14/§16) — a bare cross isn't enough. A signal needs:
+        #   1. the EMA cross (on the completed candle)
+        #   2. a DECISIVE gap: |EMA9-EMA21| >= REVERSE_CONFIRM_PCT x close (~0.05% = ~28 BANKNIFTY pts)
+        #   3. price leading the move: close > EMA9 (long) / close < EMA9 (short)
+        #   4. EMA9 momentum: EMA9 rising (long) / falling (short), candle-over-candle
+        #   5. volume confirmation: volume > VOLUME_FILTER_MULT x SMA  (existing)
+        # Same gate drives entries AND reverse-exits (a reverse is just an opposite-direction signal).
         vol_ok = last["volume"] > VOLUME_FILTER_MULT * last["vol_sma"] if last["vol_sma"] > 0 else False
+        gap = last["ema_fast"] - last["ema_slow"]                 # >0 bullish, <0 bearish
+        min_gap = REVERSE_CONFIRM_PCT * last["close"]             # ~0.05% of price (~28 pts)
+        slope9 = last["ema_fast"] - prev["ema_fast"]             # EMA9 candle-over-candle slope
 
         print(
-            f"\n[SIGNAL CHECK] EMA({FAST_EMA}): {last['ema_fast']:.2f} | "
-            f"EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
+            f"\n[SIGNAL CHECK] EMA({FAST_EMA}): {last['ema_fast']:.2f} | EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
+            f"gap: {gap:+.1f} (min ±{min_gap:.0f}) | close: {last['close']:.2f} | slope9: {slope9:+.1f} | "
             f"Vol: {last['volume']:.0f} vs {VOLUME_FILTER_MULT}x SMA: {last['vol_sma'] * VOLUME_FILTER_MULT:.0f} | "
             f"Vol OK: {vol_ok}"
         )
 
-        # Bullish crossover
-        if prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]:
-            if vol_ok and TRADE_DIRECTION in ("LONG", "BOTH"):
-                print("[SIGNAL] BUY — EMA fast crossed above slow with volume confirmation")
-                return "BUY"
-            elif not vol_ok:
-                print("[SIGNAL] BUY crossover detected but volume filter not met — skipping")
+        bull_cross = prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]
+        bear_cross = prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"]
 
-        # Bearish crossover
-        if prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"]:
-            if vol_ok and TRADE_DIRECTION in ("SHORT", "BOTH"):
-                print("[SIGNAL] SELL — EMA fast crossed below slow with volume confirmation")
+        # Bullish: cross + decisive gap + close above EMA9 + EMA9 rising + volume
+        if bull_cross and TRADE_DIRECTION in ("LONG", "BOTH"):
+            fails = []
+            if gap < min_gap:                 fails.append(f"thin gap {gap:.1f}<{min_gap:.0f}")
+            if last["close"] <= last["ema_fast"]: fails.append("close≤EMA9")
+            if slope9 <= 0:                   fails.append(f"EMA9 slope {slope9:+.1f}≤0")
+            if not vol_ok:                    fails.append("volume")
+            if not fails:
+                print("[SIGNAL] BUY — cross + gap≥0.05% + close>EMA9 + EMA9 rising + volume")
+                return "BUY"
+            print(f"[SIGNAL] BUY crossover REJECTED — {', '.join(fails)}")
+
+        # Bearish: cross + decisive gap + close below EMA9 + EMA9 falling + volume
+        if bear_cross and TRADE_DIRECTION in ("SHORT", "BOTH"):
+            fails = []
+            if -gap < min_gap:                fails.append(f"thin gap {gap:.1f}, |gap|<{min_gap:.0f}")
+            if last["close"] >= last["ema_fast"]: fails.append("close≥EMA9")
+            if slope9 >= 0:                   fails.append(f"EMA9 slope {slope9:+.1f}≥0")
+            if not vol_ok:                    fails.append("volume")
+            if not fails:
+                print("[SIGNAL] SELL — cross + gap≥0.05% + close<EMA9 + EMA9 falling + volume")
                 return "SELL"
-            elif not vol_ok:
-                print("[SIGNAL] SELL crossover detected but volume filter not met — skipping")
+            print(f"[SIGNAL] SELL crossover REJECTED — {', '.join(fails)}")
 
         return None
 
