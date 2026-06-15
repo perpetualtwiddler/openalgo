@@ -40,6 +40,12 @@ WS_URL = os.getenv("WEBSOCKET_URL") or (
     f"ws://{os.getenv('WEBSOCKET_HOST', '127.0.0.1')}:{os.getenv('WEBSOCKET_PORT', '8765')}"
 )
 
+# Feed mode: "quote" subscribes in Quote mode so the WS bus carries traded VOLUME,
+# which websocket_proxy/market_data_recorder.py persists for backtesting. The strategy
+# itself only needs LTP, and quote payloads are a superset that still include ltp, so
+# this is safe to leave on. Set FEED_MODE=ltp to revert to the lighter LTP-only feed.
+FEED_MODE = os.getenv("FEED_MODE", "quote").strip().lower()
+
 UNDERLYING = os.getenv("SYMBOL", "BANKNIFTY")
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NFO"))
 QUANTITY = int(os.getenv("QUANTITY", "60"))       # 2 lots x 30 units
@@ -55,6 +61,8 @@ VOLUME_FILTER_MULT = float(os.getenv("VOLUME_FILTER_MULT", "1.5"))
 VOLUME_SMA_PERIOD = int(os.getenv("VOLUME_SMA_PERIOD", "20"))
 
 TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5%
+TIGHT_TSL_THRESHOLD = float(os.getenv("TIGHT_TSL_THRESHOLD", "5000"))  # ₹ unrealized profit at which TSL tightens
+TIGHT_TSL_PCT = float(os.getenv("TIGHT_TSL_PCT", "0.25"))             # tighter trailing % once threshold crossed
 
 # --- Adaptive Profit-Protection Exit (APPE) — see ADAPTIVE_PROFIT_EXIT_DESIGN.md ---
 # Trails the *profit curve* (not price): once profit peaks past the arm threshold, exit when it
@@ -90,11 +98,9 @@ REVERSE_CONFIRM_PCT = float(os.getenv("REVERSE_CONFIRM_PCT", "0.0003"))  # 0.03%
 # considered stale — trailing-SL & APPE (both tick-driven) are inactive, so we log ERROR and
 # refuse new entries rather than trade blind (June 3: 0 ticks all day -> unprotected -20,760).
 FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
-
-
-def log_error(msg):
-    """Emit a clearly-marked, flushed ERROR line for abnormal conditions (greppable)."""
-    print(f"\n[ERROR] [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+# Re-emit the STALE ERROR line every N seconds while ticks are still missing, so the warning
+# does not get buried under hours of [SIGNAL CHECK] noise in long-running logs.
+FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
 
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
@@ -107,6 +113,15 @@ STRATEGY_TAG = STRATEGY_NAME.replace("/", "_").replace(" ", "_")
 STATE_DIR = Path(os.getenv("STATE_DIR", "/root/data/openalgo/strategies/state"))
 STATE_FILE = STATE_DIR / f"{STRATEGY_TAG}_state.json"
 
+def log_error(msg):
+    """Emit a clearly-marked, flushed ERROR line for abnormal conditions (greppable)."""
+    print(f"\n[ERROR] [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def log(msg):
+    """Timestamped, append-mode log — no \r, no overwriting, safe outside a TTY."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts}  {msg}", flush=True)
+
 
 def resolve_futures_symbol(client, underlying, exchange):
     """Fetch nearest expiry and build the futures symbol (e.g. BANKNIFTY26MAY26FUT)."""
@@ -116,7 +131,7 @@ def resolve_futures_symbol(client, underlying, exchange):
     nearest = resp["data"][0]
     day, mon, yr = nearest.split("-")
     symbol = f"{underlying}{day}{mon}{yr}FUT"
-    print(f"[SYMBOL] Resolved {underlying} -> {symbol} (expiry {nearest})")
+    log(f"[SYMBOL] Resolved {underlying} -> {symbol} (expiry {nearest})")
     return symbol
 
 
@@ -134,6 +149,11 @@ class EMACrossoverBot:
         self.peak_price = 0.0      # tracks best price for trailing SL
         self.ltp = None
         self.exit_in_progress = False
+        self.entry_pending = False
+        self.pending_entry_signal = None
+        self.pending_entry_order_id = None
+        self.pending_exit_order_id = None
+        self.pending_exit_reason = None
         self.running = True
         self.stop_event = threading.Event()
         self.daily_pnl = 0.0
@@ -147,26 +167,31 @@ class EMACrossoverBot:
         self.last_tick_ts = None       # time.monotonic() of last on_ltp_update (feed-health)
         self.feed_stale = False        # True while the WS tick feed is stale
         self.shadow_reverse = None     # §14 reverse-confirm SHADOW (log-only); set on a reverse exit
+        self.last_stale_warn_ts = 0.0  # time.monotonic() of last STALE log (rate-limits re-warns)
+        self.ws_alive = False          # set True on FIRST tick received — distinct from SDK's
+                                       # optimistic "[WS] Connected" log which fires on TCP
+                                       # connect, before the WebSocket handshake completes.
+                                       # First-tick is the only proof the pipeline works.
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
 
         self.load_state()
 
-        print(f"[INIT] {STRATEGY_NAME}")
-        print(f"[INIT] {self.symbol} on {EXCHANGE} | EMA({FAST_EMA}/{SLOW_EMA}) | {CANDLE_TIMEFRAME}")
-        print(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
-        print(f"[INIT] Signal gate (entry & reverse): cross + |EMA9−EMA21|≥{REVERSE_CONFIRM_PCT*100:.2f}% "
+        log(f"[INIT] {STRATEGY_NAME}")
+        log(f"[INIT] {self.symbol} on {EXCHANGE} | EMA({FAST_EMA}/{SLOW_EMA}) | {CANDLE_TIMEFRAME}")
+        log(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
+        log(f"[INIT] Signal gate (entry & reverse): cross + |EMA9−EMA21|≥{REVERSE_CONFIRM_PCT*100:.2f}% "
               f"+ close vs EMA9 + EMA9 slope + volume")
-        print(f"[INIT] Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
+        log(f"[INIT] Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
         if APPE_ENABLED:
-            print(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} "
+            log(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} "
                   f"(₹{ARM_PER_LOT:.0f}×{QUANTITY/LOT_SIZE:g} lots) | "
                   f"G={GIVEBACK_K:g}·√peak·√({QUANTITY/LOT_SIZE:g}u/{GIVEBACK_REF_UNITS:g}) | "
                   f"trend {TREND_WINDOW_SEC:.0f}s | confirm {TREND_CONFIRM_SEC:.0f}s | hard ×{HARD_MULT:g}")
         else:
-            print("[INIT] APPE off — price trailing-SL only")
-        print(f"[INIT] Qty: {QUANTITY} | Product: {PRODUCT} | Direction: {TRADE_DIRECTION}")
+            log("[INIT] APPE off — price trailing-SL only")
+        log(f"[INIT] Qty: {QUANTITY} | Product: {PRODUCT} | Direction: {TRADE_DIRECTION} | Feed: {FEED_MODE}")
         if self.position:
-            print(f"[INIT] Resumed {self.position} @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}")
+            log(f"[INIT] Resumed {self.position} @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}")
 
     # -------------------------------------------------------------------------
     # State persistence
@@ -188,9 +213,9 @@ class EMACrossoverBot:
                 "appe_armed": self.appe_armed,
             }
             STATE_FILE.write_text(json.dumps(state))
-            print(f"[STATE] Saved: {self.position} @ {self.entry_price:.2f}")
+            log(f"[STATE] Saved: {self.position} @ {self.entry_price:.2f}")
         except Exception as e:
-            print(f"[STATE ERROR] Save failed: {e}")
+            log(f"[STATE ERROR] Save failed: {e}")
 
     def load_state(self):
         try:
@@ -198,11 +223,11 @@ class EMACrossoverBot:
                 return
             state = json.loads(STATE_FILE.read_text())
             if state.get("date") != datetime.now().strftime("%Y-%m-%d"):
-                print("[STATE] Stale state from previous day — ignoring")
+                log("[STATE] Stale state from previous day — ignoring")
                 self.clear_state()
                 return
             if state.get("symbol") != self.symbol:
-                print(f"[STATE] Symbol mismatch ({state.get('symbol')} vs {self.symbol}) — ignoring")
+                log(f"[STATE] Symbol mismatch ({state.get('symbol')} vs {self.symbol}) — ignoring")
                 self.clear_state()
                 return
             self.position = state.get("position")
@@ -214,15 +239,15 @@ class EMACrossoverBot:
             self.appe_peak = state.get("appe_peak", 0.0)
             self.appe_armed = state.get("appe_armed", False)
         except Exception as e:
-            print(f"[STATE ERROR] Load failed: {e}")
+            log(f"[STATE ERROR] Load failed: {e}")
 
     def clear_state(self):
         try:
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
-                print("[STATE] Cleared")
+                log("[STATE] Cleared")
         except Exception as e:
-            print(f"[STATE ERROR] Clear failed: {e}")
+            log(f"[STATE ERROR] Clear failed: {e}")
 
     # -------------------------------------------------------------------------
     # WebSocket — real-time price + trailing stop-loss
@@ -233,12 +258,17 @@ class EMACrossoverBot:
             return
 
         self.last_tick_ts = time.monotonic()   # feed-health heartbeat
-        if self.feed_stale:
-            print(f"\n[FEED] Recovered — market-data ticks resumed")
-            self.feed_stale = False
-
         self.ltp = float(data["data"]["ltp"])
-        now = datetime.now().strftime("%H:%M:%S")
+        if not self.ws_alive:
+            # First tick ever — definitive end-to-end proof the WS pipeline works.
+            # Anything before this point (including the SDK's optimistic "[WS] Connected"
+            # log) is just TCP/handshake success and tells us nothing about real data flow.
+            self.ws_alive = True
+            log(f"[WS] FIRST TICK RECEIVED for {self.symbol} @ {self.ltp:.2f} — pipeline confirmed live")
+        if self.feed_stale:
+            log("[FEED] Recovered — market-data ticks resumed")
+            self.feed_stale = False
+            self.last_stale_warn_ts = 0.0
 
         # §14 reverse-confirm SHADOW — resolve any pending shadow each tick (log-only, no trade change).
         # Placed before the flat-position return so it keeps tracking after the reverse exit / while paused.
@@ -249,28 +279,35 @@ class EMACrossoverBot:
                 pass
 
         if not self.position or self.exit_in_progress:
-            print(f"\r[{now}] LTP: {self.ltp:.2f} | No position | Day P&L: {self.daily_pnl:.2f}    ", end="")
             return
 
-        # Update trailing stop-loss
+        # Update trailing stop-loss.
+        # Unrealized is computed first so the tightening threshold check can
+        # use it immediately. Once profit crosses TIGHT_TSL_THRESHOLD the TSL
+        # switches to TIGHT_TSL_PCT and never widens back.
         if self.position == "BUY":
+            unrealized = (self.ltp - self.entry_price) * QUANTITY
             if self.ltp > self.peak_price:
                 self.peak_price = self.ltp
-                self.trailing_sl = round(self.peak_price * (1 - TRAILING_SL_PCT / 100), 2)
-            unrealized = (self.ltp - self.entry_price) * QUANTITY
+                tsl_pct = TIGHT_TSL_PCT if unrealized >= TIGHT_TSL_THRESHOLD else TRAILING_SL_PCT
+                new_tsl = round(self.peak_price * (1 - tsl_pct / 100), 2)
+                if new_tsl > self.trailing_sl:  # only tighten, never widen
+                    self.trailing_sl = new_tsl
             hit_sl = self.ltp <= self.trailing_sl
         else:
+            unrealized = (self.entry_price - self.ltp) * QUANTITY
             if self.ltp < self.peak_price:
                 self.peak_price = self.ltp
-                self.trailing_sl = round(self.peak_price * (1 + TRAILING_SL_PCT / 100), 2)
-            unrealized = (self.entry_price - self.ltp) * QUANTITY
+                tsl_pct = TIGHT_TSL_PCT if unrealized >= TIGHT_TSL_THRESHOLD else TRAILING_SL_PCT
+                new_tsl = round(self.peak_price * (1 + tsl_pct / 100), 2)
+                if new_tsl < self.trailing_sl:  # only tighten, never widen
+                    self.trailing_sl = new_tsl
             hit_sl = self.ltp >= self.trailing_sl
 
         sign = "+" if unrealized > 0 else ""
-        print(
-            f"\r[{now}] LTP: {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
-            f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}    ",
-            end="",
+        log(
+            f"[LTP] {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
+            f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}"
         )
 
         # APPE — adaptive profit-protection exit. First-to-fire vs the price trail below.
@@ -283,7 +320,7 @@ class EMACrossoverBot:
 
         if hit_sl and not self.exit_in_progress:
             self.exit_in_progress = True
-            print(f"\n[ALERT] Trailing SL hit at {self.ltp:.2f} (SL was {self.trailing_sl:.2f})")
+            log(f"[ALERT] Trailing SL hit at {self.ltp:.2f} (SL was {self.trailing_sl:.2f})")
             threading.Thread(target=self.place_exit, args=("TRAILING_SL",), daemon=True).start()
 
     # -------------------------------------------------------------------------
@@ -299,18 +336,26 @@ class EMACrossoverBot:
         return age is not None and age <= FEED_STALE_SEC
 
     def _check_feed_health(self):
-        """During market hours, log ERROR (once per stale episode) if ticks have stopped."""
+        """During market hours, log ERROR periodically while ticks have stopped.
+
+        Re-emits every FEED_STALE_REWARN_SEC so the warning stays visible in long
+        logs (a one-shot log line gets buried under hours of [SIGNAL CHECK] output).
+        """
         if self._feed_ok():
             return
-        if not self.feed_stale:
-            self.feed_stale = True
-            age = self._feed_age()
-            age_str = "no ticks yet" if age is None else f"no ticks for {age:.0f}s"
-            log_error(
-                f"Market-data feed STALE ({age_str}, >{FEED_STALE_SEC:.0f}s) — trailing-SL & "
-                f"APPE are INACTIVE; blocking new entries"
-                + ("; a POSITION IS OPEN AND UNPROTECTED — consider manual square-off." if self.position else ".")
-            )
+        now = time.monotonic()
+        if self.feed_stale and (now - self.last_stale_warn_ts) < FEED_STALE_REWARN_SEC:
+            return  # already stale and re-warn window not yet elapsed
+        self.feed_stale = True
+        self.last_stale_warn_ts = now
+        age = self._feed_age()
+        age_str = "no ticks yet" if age is None else f"no ticks for {age:.0f}s"
+        ws_status = "" if self.ws_alive else " (WS has NEVER delivered a tick this run — likely a misconfigured WEBSOCKET_URL or broken WS proxy)"
+        log_error(
+            f"Market-data feed STALE ({age_str}, >{FEED_STALE_SEC:.0f}s){ws_status} — "
+            f"trailing-SL & APPE are INACTIVE; blocking new entries"
+            + ("; a POSITION IS OPEN AND UNPROTECTED — consider manual square-off." if self.position else ".")
+        )
 
     def _reset_appe(self):
         self.appe_peak = 0.0
@@ -335,7 +380,7 @@ class EMACrossoverBot:
         den = sum((x - mx) ** 2 for x in xs)
         if den == 0:
             return False
-        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False)) / den
         return slope < 0
 
     def _appe_evaluate(self, unrealized, now):
@@ -355,7 +400,7 @@ class EMACrossoverBot:
         if not self.appe_armed:
             if self.appe_peak >= PROFIT_ARM_THRESHOLD:
                 self.appe_armed = True
-                print(f"\n[APPE] Armed — peak ₹{self.appe_peak:.0f} ≥ arm ₹{PROFIT_ARM_THRESHOLD:.0f}")
+                log(f"[APPE] Armed — peak ₹{self.appe_peak:.0f} ≥ arm ₹{PROFIT_ARM_THRESHOLD:.0f}")
             else:
                 return None
 
@@ -367,7 +412,7 @@ class EMACrossoverBot:
 
         # Gate 4 — catastrophic give-back: exit immediately, skip confirmation
         if giveback >= HARD_MULT * budget:
-            print(f"\n[APPE] HARD exit — give-back ₹{giveback:.0f} ≥ {HARD_MULT:g}×budget ₹{budget:.0f} "
+            log(f"[APPE] HARD exit — give-back ₹{giveback:.0f} ≥ {HARD_MULT:g}×budget ₹{budget:.0f} "
                   f"(peak ₹{self.appe_peak:.0f}, U ₹{unrealized:.0f})")
             return "APPE_HARD"
 
@@ -378,10 +423,10 @@ class EMACrossoverBot:
                 # Gate 3b — confirm-and-hold for TREND_CONFIRM_SEC
                 if self.appe_breach_start is None:
                     self.appe_breach_start = now
-                    print(f"\n[APPE] Breach floor ₹{floor:.0f} (U ₹{unrealized:.0f}, peak ₹{self.appe_peak:.0f}) "
+                    log(f"[APPE] Breach floor ₹{floor:.0f} (U ₹{unrealized:.0f}, peak ₹{self.appe_peak:.0f}) "
                           f"+ trend down — confirming {TREND_CONFIRM_SEC:.0f}s...")
                 elif now - self.appe_breach_start >= TREND_CONFIRM_SEC:
-                    print(f"\n[APPE] Confirmed (held {now - self.appe_breach_start:.0f}s) — exit @ U ₹{unrealized:.0f}")
+                    log(f"[APPE] Confirmed (held {now - self.appe_breach_start:.0f}s) — exit @ U ₹{unrealized:.0f}")
                     return "APPE_RATCHET"
             else:
                 # below floor but trend not down (a dip in an up-leg) — don't arm the timer
@@ -429,20 +474,32 @@ class EMACrossoverBot:
         while not self.stop_event.is_set():
             try:
                 self.client.connect()
-                self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
-                print(f"[WS] Connected — monitoring {self.symbol}")
+                # Quote mode makes the WS bus carry traded volume (recorded for backtesting);
+                # the quote payload is a superset of LTP, so on_ltp_update still reads ltp.
+                if FEED_MODE == "quote":
+                    self.client.subscribe_quote(self.instrument, on_data_received=self.on_ltp_update)
+                else:
+                    self.client.subscribe_ltp(self.instrument, on_data_received=self.on_ltp_update)
+                # NOTE: the SDK logs its own "[WS] Connected" line on TCP connect, BEFORE
+                # the WebSocket handshake or any data flow. That line lies when the WS
+                # proxy is unreachable. We do NOT mirror it — the only honest "alive"
+                # signal is FIRST TICK RECEIVED, logged from on_ltp_update().
+                log(f"[WS] Subscribed to {self.symbol} ({FEED_MODE} mode) — waiting for first tick (see [WS] FIRST TICK RECEIVED)...")
                 while not self.stop_event.is_set():
                     time.sleep(1)
             except Exception as e:
                 log_error(f"WebSocket connection error: {e}")
             finally:
                 try:
-                    self.client.unsubscribe_ltp(self.instrument)
+                    if FEED_MODE == "quote":
+                        self.client.unsubscribe_quote(self.instrument)
+                    else:
+                        self.client.unsubscribe_ltp(self.instrument)
                     self.client.disconnect()
                 except Exception:
                     pass
             if not self.stop_event.is_set():
-                print("[WS] Reconnecting in 5s...")
+                log("[WS] Reconnecting in 5s...")
                 time.sleep(5)
 
     # -------------------------------------------------------------------------
@@ -460,10 +517,19 @@ class EMACrossoverBot:
             if data is not None and len(data) > 0:
                 return data
         except Exception as e:
-            print(f"\n[DATA ERROR] {e}")
+            log(f"[DATA ERROR] {e}")
         return None
 
     def check_signal(self, df):
+        # Feed-health gate: if the WS tick feed is stale, skip signal evaluation entirely.
+        # This keeps the log visibly broken when the feed is broken — otherwise [SIGNAL CHECK]
+        # lines look identical to healthy operation while trailing-SL/APPE are dead.
+        if not self._feed_ok():
+            age = self._feed_age()
+            age_str = "no ticks yet" if age is None else f"no ticks for {age:.0f}s"
+            log(f"[SIGNAL CHECK SKIPPED] Feed stale ({age_str}) — not evaluating crossover without live ticks")
+            return None
+
         if df is None or len(df) < SLOW_EMA + VOLUME_SMA_PERIOD:
             return None
 
@@ -487,8 +553,8 @@ class EMACrossoverBot:
         min_gap = REVERSE_CONFIRM_PCT * last["close"]             # ~0.05% of price (~28 pts)
         slope9 = last["ema_fast"] - prev["ema_fast"]             # EMA9 candle-over-candle slope
 
-        print(
-            f"\n[SIGNAL CHECK] EMA({FAST_EMA}): {last['ema_fast']:.2f} | EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
+        log(
+            f"[SIGNAL CHECK] EMA({FAST_EMA}): {last['ema_fast']:.2f} | EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
             f"gap: {gap:+.1f} (min ±{min_gap:.0f}) | close: {last['close']:.2f} | slope9: {slope9:+.1f} | "
             f"Vol: {last['volume']:.0f} vs {VOLUME_FILTER_MULT}x SMA: {last['vol_sma'] * VOLUME_FILTER_MULT:.0f} | "
             f"Vol OK: {vol_ok}"
@@ -505,9 +571,9 @@ class EMACrossoverBot:
             if slope9 <= 0:                   fails.append(f"EMA9 slope {slope9:+.1f}≤0")
             if not vol_ok:                    fails.append("volume")
             if not fails:
-                print("[SIGNAL] BUY — cross + gap≥0.05% + close>EMA9 + EMA9 rising + volume")
+                log("[SIGNAL] BUY — cross + gap≥0.05% + close>EMA9 + EMA9 rising + volume")
                 return "BUY"
-            print(f"[SIGNAL] BUY crossover REJECTED — {', '.join(fails)}")
+            log(f"[SIGNAL] BUY crossover REJECTED — {', '.join(fails)}")
 
         # Bearish: cross + decisive gap + close below EMA9 + EMA9 falling + volume
         if bear_cross and TRADE_DIRECTION in ("SHORT", "BOTH"):
@@ -517,9 +583,9 @@ class EMACrossoverBot:
             if slope9 >= 0:                   fails.append(f"EMA9 slope {slope9:+.1f}≥0")
             if not vol_ok:                    fails.append("volume")
             if not fails:
-                print("[SIGNAL] SELL — cross + gap≥0.05% + close<EMA9 + EMA9 falling + volume")
+                log("[SIGNAL] SELL — cross + gap≥0.05% + close<EMA9 + EMA9 falling + volume")
                 return "SELL"
-            print(f"[SIGNAL] SELL crossover REJECTED — {', '.join(fails)}")
+            log(f"[SIGNAL] SELL crossover REJECTED — {', '.join(fails)}")
 
         return None
 
@@ -539,15 +605,112 @@ class EMACrossoverBot:
                         if price > 0:
                             return price
                     elif d.get("order_status") in ("rejected", "cancelled"):
-                        print(f"[ORDER] {d.get('order_status')}: {d.get('status_message', '')}")
+                        log(f"[ORDER] {d.get('order_status')}: {d.get('status_message', '')}")
                         return None
             except Exception as e:
-                print(f"[ORDER STATUS ERROR] {e}")
+                log(f"[ORDER STATUS ERROR] {e}")
         return None
+
+    def get_position_snapshot(self):
+        try:
+            resp = self.client.positionbook()
+            if resp.get("status") != "success":
+                return None
+            net_qty = 0
+            avg_price = 0.0
+            for p in resp.get("data", []):
+                if p.get("symbol") == self.symbol and p.get("product") == PRODUCT:
+                    qty = int(p.get("quantity", 0))
+                    net_qty += qty
+                    if qty != 0:
+                        avg_price = float(p.get("average_price", 0) or avg_price)
+            return {"net_qty": net_qty, "average_price": avg_price}
+        except Exception as e:
+            log(f"[SYNC ERROR] Position snapshot failed: {e}")
+            return None
+
+    def initialize_position_from_snapshot(self, signal, snapshot):
+        price = snapshot.get("average_price") or self.ltp
+        if not price:
+            log_error(f"Cannot initialize {signal} state — position exists but no average price/LTP available")
+            return False
+        self.position = signal
+        self.entry_price = float(price)
+        self.peak_price = self.entry_price
+        self._reset_appe()
+        if signal == "BUY":
+            self.trailing_sl = round(self.entry_price * (1 - TRAILING_SL_PCT / 100), 2)
+        else:
+            self.trailing_sl = round(self.entry_price * (1 + TRAILING_SL_PCT / 100), 2)
+        self.entry_pending = False
+        self.pending_entry_signal = None
+        self.pending_entry_order_id = None
+        self.exit_in_progress = False
+        self.trade_count += 1
+        self.save_state()
+        log(f"[ENTRY] Reconciled {signal} position @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f}")
+        return True
+
+    def reconcile_pending_entry(self):
+        if not self.entry_pending or not self.pending_entry_signal:
+            return
+        snapshot = self.get_position_snapshot()
+        if snapshot is None:
+            return
+        net_qty = snapshot.get("net_qty", 0)
+        expected_side = 1 if self.pending_entry_signal == "BUY" else -1
+        if net_qty * expected_side > 0:
+            self.initialize_position_from_snapshot(self.pending_entry_signal, snapshot)
+            return
+
+        if self.pending_entry_order_id:
+            try:
+                resp = self.client.orderstatus(order_id=self.pending_entry_order_id, strategy=STRATEGY_NAME)
+                if resp.get("status") == "success":
+                    status = resp.get("data", {}).get("order_status")
+                    if status in ("rejected", "cancelled"):
+                        log_error(f"Pending entry {self.pending_entry_order_id} ended as {status}; clearing pending entry")
+                        self.entry_pending = False
+                        self.pending_entry_signal = None
+                        self.pending_entry_order_id = None
+                        self.exit_in_progress = False
+            except Exception as e:
+                log(f"[ENTRY RECONCILE ERROR] {e}")
+
+    def reconcile_pending_exit(self):
+        if not self.pending_exit_order_id:
+            return
+        snapshot = self.get_position_snapshot()
+        if snapshot is None:
+            return
+        if snapshot.get("net_qty", 0) == 0:
+            log(f"[EXIT] Confirmed flat after {self.pending_exit_reason or 'pending exit'}")
+            self.position = None
+            self.entry_price = 0.0
+            self.trailing_sl = 0.0
+            self.peak_price = 0.0
+            self._reset_appe()
+            self.exit_in_progress = False
+            self.pending_exit_order_id = None
+            self.pending_exit_reason = None
+            self.save_state()
+            return
+
+        try:
+            resp = self.client.orderstatus(order_id=self.pending_exit_order_id, strategy=STRATEGY_NAME)
+            if resp.get("status") == "success":
+                status = resp.get("data", {}).get("order_status")
+                if status in ("rejected", "cancelled"):
+                    log_error(f"Pending exit {self.pending_exit_order_id} ended as {status}; position still open")
+                    self.pending_exit_order_id = None
+                    self.pending_exit_reason = None
+                    self.exit_in_progress = False
+        except Exception as e:
+            log(f"[EXIT RECONCILE ERROR] {e}")
 
     def place_entry(self, signal):
         if self.daily_pnl <= -MAX_LOSS_PER_DAY:
-            print(f"[CIRCUIT BREAKER] Daily loss {self.daily_pnl:.0f} exceeds limit {MAX_LOSS_PER_DAY} — no new trades")
+            log(f"[CIRCUIT BREAKER] Daily loss {self.daily_pnl:.0f} exceeds limit {MAX_LOSS_PER_DAY} — no new trades")
             return False
 
         # Feed-health guard: never enter without a live tick feed (no trailing-SL/APPE otherwise)
@@ -565,14 +728,14 @@ class EMACrossoverBot:
                 self._arm_shadow_reverse(self.position, self.entry_price, self.ltp)
             except Exception:
                 pass
-            print(f"[REVERSE] Closing {self.position} before entering {signal}")
+            log(f"[REVERSE] Closing {self.position} before entering {signal}")
             self.place_exit("REVERSE_SIGNAL")
             time.sleep(1)
 
         if self.position:
             return False
 
-        print(f"\n[ENTRY] Placing {signal} for {QUANTITY} qty of {self.symbol}")
+        log(f"[ENTRY] Placing {signal} for {QUANTITY} qty of {self.symbol}")
         try:
             resp = self.client.placeorder(
                 strategy=STRATEGY_NAME, symbol=self.symbol, exchange=EXCHANGE,
@@ -580,7 +743,7 @@ class EMACrossoverBot:
             )
             if resp.get("status") == "success":
                 order_id = resp.get("orderid")
-                print(f"[ENTRY] Order placed: {order_id}")
+                log(f"[ENTRY] Order placed: {order_id}")
                 price = self.get_fill_price(order_id)
                 if price:
                     self.position = signal
@@ -594,9 +757,14 @@ class EMACrossoverBot:
                     self.exit_in_progress = False
                     self.trade_count += 1
                     self.save_state()
-                    print(f"[ENTRY] Filled @ {price:.2f} | TSL: {self.trailing_sl:.2f} | Trade #{self.trade_count}")
+                    log(f"[ENTRY] Filled @ {price:.2f} | TSL: {self.trailing_sl:.2f} | Trade #{self.trade_count}")
                     return True
-                log_error(f"ENTRY {signal} placed (order {order_id}) but fill price NOT confirmed — position state uncertain.")
+                log_error(f"ENTRY {signal} placed (order {order_id}) but fill price NOT confirmed — reconciling via positionbook before trading further.")
+                self.entry_pending = True
+                self.pending_entry_signal = signal
+                self.pending_entry_order_id = order_id
+                self.exit_in_progress = True
+                self.reconcile_pending_entry()
             else:
                 log_error(f"ENTRY {signal} order REJECTED/failed: {resp}")
         except Exception as e:
@@ -618,7 +786,7 @@ class EMACrossoverBot:
         entry_price = self.entry_price
 
         exit_action = "SELL" if position == "BUY" else "BUY"
-        print(f"\n[EXIT] Closing {position} — reason: {reason}")
+        log(f"[EXIT] Closing {position} — reason: {reason}")
 
         try:
             resp = self.client.placeorder(
@@ -635,17 +803,17 @@ class EMACrossoverBot:
                         pnl = (entry_price - exit_price) * QUANTITY
                     self.daily_pnl += pnl
                     sign = "+" if pnl > 0 else ""
-                    print(f"[EXIT] Filled @ {exit_price:.2f} | P&L: {sign}{pnl:.0f} | Day total: {self.daily_pnl:.0f}")
+                    log(f"[EXIT] Filled @ {exit_price:.2f} | P&L: {sign}{pnl:.0f} | Day total: {self.daily_pnl:.0f}")
                 else:
-                    log_error(f"EXIT {position} ({reason}) placed (order {order_id}) but fill NOT confirmed — verify square-off manually.")
+                    log_error(f"EXIT {position} ({reason}) placed (order {order_id}) but fill NOT confirmed — keeping position pending until positionbook confirms flat.")
+                    self.pending_exit_order_id = order_id
+                    self.pending_exit_reason = reason
+                    self.reconcile_pending_exit()
+                    return
 
-                self.position = None
-                self.entry_price = 0.0
-                self.trailing_sl = 0.0
-                self.peak_price = 0.0
-                self._reset_appe()
-                self.exit_in_progress = False
-                self.save_state()
+                self.pending_exit_order_id = order_id
+                self.pending_exit_reason = reason
+                self.reconcile_pending_exit()
             else:
                 log_error(f"EXIT {position} ({reason}) order REJECTED/failed — POSITION MAY STILL BE OPEN: {resp}")
                 self.exit_in_progress = False
@@ -668,7 +836,7 @@ class EMACrossoverBot:
                 if p.get("symbol") == self.symbol and p.get("product") == PRODUCT:
                     net_qty += int(p.get("quantity", 0))
             if net_qty == 0 and self.position:
-                print(f"\n[SYNC] Position gone (manual exit?) — resetting from {self.position}")
+                log(f"[SYNC] Position gone (manual exit?) — resetting from {self.position}")
                 self.position = None
                 self.entry_price = 0.0
                 self.trailing_sl = 0.0
@@ -677,14 +845,14 @@ class EMACrossoverBot:
                 self.exit_in_progress = False
                 self.save_state()
         except Exception as e:
-            print(f"[SYNC ERROR] {e}")
+            log(f"[SYNC ERROR] {e}")
 
     # -------------------------------------------------------------------------
     # Strategy Loop
     # -------------------------------------------------------------------------
 
     def strategy_loop(self):
-        print("[STRATEGY] Loop started")
+        log("[STRATEGY] Loop started")
         while not self.stop_event.is_set():
             try:
                 now = datetime.now()
@@ -693,27 +861,35 @@ class EMACrossoverBot:
                     time.sleep(30)
                     continue
                 if now.hour >= 15 and now.minute >= 14:
-                    if self.position:
-                        print("\n[EOD] 15:14 — closing position for end of day")
+                    self.reconcile_pending_entry()
+                    self.reconcile_pending_exit()
+                    if self.position and not self.exit_in_progress:
+                        log("[EOD] 15:14 — closing position for end of day")
                         self.place_exit("EOD_SQUAREOFF")
-                    self.clear_state()
-                    if now.minute >= 19:
-                        print(f"\n[EOD] Post-squareoff — strategy finished for the day.")
+                    if not self.position and not self.exit_in_progress:
+                        self.clear_state()
+                    if now.minute >= 19 and not self.position and not self.exit_in_progress:
+                        log("[EOD] Post-squareoff — strategy finished for the day.")
                         self.running = False
                         self.stop_event.set()
                         return
+                    if now.minute >= 19:
+                        log_error("EOD exit still pending or position still open — keeping strategy alive for retry/manual intervention")
                     time.sleep(60)
                     continue
 
                 if self.daily_pnl <= -MAX_LOSS_PER_DAY:
-                    if self.position:
+                    if self.position and not self.exit_in_progress:
                         self.place_exit("DAILY_LOSS_LIMIT")
-                    print(f"\r[PAUSED] Daily loss limit hit: {self.daily_pnl:.0f}    ", end="")
+                    log(f"[PAUSED] Daily loss limit hit: {self.daily_pnl:.0f}")
                     time.sleep(60)
                     continue
 
                 # Feed-health watchdog (market hours): logs ERROR if ticks have stopped
                 self._check_feed_health()
+
+                self.reconcile_pending_entry()
+                self.reconcile_pending_exit()
 
                 if self.position:
                     self.sync_position()
@@ -728,15 +904,31 @@ class EMACrossoverBot:
                     signal = self.check_signal(df)
                     if signal and signal != self.position:
                         self.exit_in_progress = True
-                        # §14 SHADOW (log-only): the live reverse happens HERE (loop), not in
-                        # place_entry — arm before the exit, snapshotting the pre-exit state.
-                        try:
-                            self._arm_shadow_reverse(self.position, self.entry_price, self.ltp)
-                        except Exception:
-                            pass
-                        self.place_exit("REVERSE_SIGNAL")
-                        time.sleep(1)
-                        self.place_entry(signal)
+                        # If the TSL is already breached at poll time, the
+                        # WebSocket thread lost the race to set exit_in_progress.
+                        # Exit as TRAILING_SL and skip the reverse entry to
+                        # avoid compounding the loss with an immediate re-entry.
+                        tsl_hit = (
+                            self.ltp is not None and self.trailing_sl > 0 and (
+                                (self.position == "BUY" and self.ltp <= self.trailing_sl) or
+                                (self.position == "SELL" and self.ltp >= self.trailing_sl)
+                            )
+                        )
+                        if tsl_hit:
+                            log(f"[SIGNAL] Reverse signal but TSL already breached "
+                                  f"(LTP {self.ltp:.2f} vs TSL {self.trailing_sl:.2f}) — "
+                                  f"exiting as TRAILING_SL, skipping reverse entry")
+                            self.place_exit("TRAILING_SL")
+                        else:
+                            # §14 SHADOW (log-only): the live reverse happens HERE (loop), not in
+                            # place_entry — arm before the exit, snapshotting the pre-exit state.
+                            try:
+                                self._arm_shadow_reverse(self.position, self.entry_price, self.ltp)
+                            except Exception:
+                                pass
+                            self.place_exit("REVERSE_SIGNAL")
+                            time.sleep(1)
+                            self.place_entry(signal)
 
                 time.sleep(SIGNAL_CHECK_INTERVAL)
 
@@ -749,12 +941,12 @@ class EMACrossoverBot:
     # -------------------------------------------------------------------------
 
     def run(self):
-        print("=" * 65)
-        print(f"  EMA({FAST_EMA}/{SLOW_EMA}) CROSSOVER — {self.symbol} {CANDLE_TIMEFRAME}")
-        print(f"  Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
-        print(f"  Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
-        print(f"  Direction: {TRADE_DIRECTION} | Qty: {QUANTITY} | Product: {PRODUCT}")
-        print("=" * 65)
+        log("=" * 65)
+        log(f"  EMA({FAST_EMA}/{SLOW_EMA}) CROSSOVER — {self.symbol} {CANDLE_TIMEFRAME}")
+        log(f"  Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
+        log(f"  Trailing SL: {TRAILING_SL_PCT}% | Max daily loss: {MAX_LOSS_PER_DAY}")
+        log(f"  Direction: {TRADE_DIRECTION} | Qty: {QUANTITY} | Product: {PRODUCT}")
+        log("=" * 65)
 
         ws_t = threading.Thread(target=self.start_websocket, daemon=True)
         ws_t.start()
@@ -767,14 +959,14 @@ class EMACrossoverBot:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("\n\n[SHUTDOWN] Stopping bot...")
+            log("[SHUTDOWN] Stopping bot...")
             self.running = False
             self.stop_event.set()
             if self.position and not self.exit_in_progress:
                 self.place_exit("SHUTDOWN")
             ws_t.join(timeout=5)
             strat_t.join(timeout=5)
-            print(f"[SHUTDOWN] Done. Trades: {self.trade_count} | Day P&L: {self.daily_pnl:.0f}")
+            log(f"[SHUTDOWN] Done. Trades: {self.trade_count} | Day P&L: {self.daily_pnl:.0f}")
 
 
 if __name__ == "__main__":

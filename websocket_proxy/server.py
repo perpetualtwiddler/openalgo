@@ -93,13 +93,29 @@ class WebSocketProxy:
         self._cleanup_interval = 300  # Clean stale entries every 5 minutes
         self._throttle_entry_max_age = 60  # Remove throttle entries older than 60 seconds
 
-        # ZeroMQ context for subscribing to broker adapters
+        # ZeroMQ context for subscribing to broker adapters AND the
+        # cache-invalidation control channel. A single SUB socket can
+        # connect to multiple endpoints; messages from all of them land
+        # in the same recv loop and are routed by topic prefix.
+        #
+        # Topology:
+        #   tcp://ZMQ_HOST:ZMQ_PORT       — market data (proxy subprocess
+        #                                    binds via SharedZmqPublisher)
+        #   tcp://ZMQ_HOST:CACHE_INV_PORT — cache-invalidation control
+        #                                    (Flask worker binds via
+        #                                    database/cache_invalidation.py)
+        #
+        # See database/cache_invalidation.py for the history of why this
+        # is split (#765 → #1374 → #1421 → #1499). Connecting to a
+        # not-yet-bound endpoint is harmless in ZMQ; the SUB starts
+        # receiving the moment the PUB binds.
         self.context = zmq.asyncio.Context()
         self.socket = self.context.socket(zmq.SUB)
-        # Connecting to ZMQ
         ZMQ_HOST = os.getenv("ZMQ_HOST", "127.0.0.1")
-        ZMQ_PORT = os.getenv("ZMQ_PORT")
-        self.socket.connect(f"tcp://{ZMQ_HOST}:{ZMQ_PORT}")  # Connect to broker adapter publisher
+        ZMQ_PORT = int(os.getenv("ZMQ_PORT") or "5555")
+        CACHE_INV_PORT = int(os.getenv("CACHE_INV_PORT", "5557"))
+        self.socket.connect(f"tcp://{ZMQ_HOST}:{ZMQ_PORT}")
+        self.socket.connect(f"tcp://{ZMQ_HOST}:{CACHE_INV_PORT}")
 
         # Set up ZeroMQ subscriber to receive all messages
         self.socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all topics

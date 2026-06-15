@@ -1,25 +1,52 @@
 # database/cache_invalidation.py
 """
-ZeroMQ-based cache invalidation for cross-component delivery.
+ZeroMQ-based cache invalidation for cross-process delivery.
 
-When auth tokens are updated or revoked from a Flask request handler,
-an invalidation message is published on the same ZMQ bus that broker
-adapters use for market data. The websocket proxy's existing SUB
-listener picks it up via the `CACHE_INVALIDATE_*` topic prefix and
-clears its local auth caches.
+The websocket proxy (port 8765) holds local in-memory caches that need
+to be cleared when the Flask worker re-issues auth tokens or revokes a
+session. These caches include `feed_token_cache`, `auth_cache`,
+`verified_api_key_cache`, `invalid_api_key_cache`, and `broker_cache`
+in `websocket_proxy/server.py`. Without invalidation, the proxy keeps
+serving stale tokens after a re-login and clients see HTTP 403 errors
+(GitHub issue #765).
 
-Fix history — issue #1374:
-Earlier this module created its own `zmq.PUB` socket and `connect()`ed
-to the ZMQ port. That collided with `SharedZmqPublisher` (also a PUB,
-but `bind`-ing the same endpoint) — two PUBs on one wire is an invalid
-ZMQ topology and messages were silently dropped. The fix routes
-publishes through the existing `SharedZmqPublisher` singleton, so there
-is exactly one PUB on the wire and the proxy's SUB receives both market
-data and cache invalidations through the same pipe. No new port, no new
-env var.
+Architecture — DEDICATED CONTROL CHANNEL (#1499)
+================================================
+This module owns its own `zmq.PUB` socket bound on `CACHE_INV_PORT`
+(default 5557). The websocket proxy's SUB socket connects to *both*
+`ZMQ_PORT` (market data) and `CACHE_INV_PORT` (control plane) and
+routes the latter by topic prefix `CACHE_INVALIDATE_*` to
+`_handle_cache_invalidation` in server.py.
+
+Fix history
+-----------
+* **issue #765** — proxy held stale caches after re-login. Originally
+  fixed by adding a ZMQ pub/sub control channel here.
+* **issue #1374** — the original control channel was broken: this
+  module created a PUB socket and `connect()`-ed to the same endpoint
+  the market-data PUB `bind()`-s. Two PUBs on one wire is invalid ZMQ
+  topology; messages were silently dropped. The fix at the time
+  delegated publishing through the market-data `SharedZmqPublisher`
+  singleton — i.e. piggy-backed on the market-data bus. That was safe
+  while gunicorn ran proxy + worker in the same process.
+* **issue #1421** — split the WS proxy into its own subprocess. After
+  this, the singleton from #1374 stopped being a singleton across
+  processes: worker and proxy each instantiated their own
+  `SharedZmqPublisher`, the worker won the race to bind :5555, and the
+  proxy fell back to :5556 silently. The proxy's SUB only listened to
+  :5555 → market data was dropped. Strategies saw `Feed STALE` despite
+  a healthy broker feed (2026-06-08 incident).
+* **current (#1499)** — restore the dedicated-control-channel topology
+  the audit at `docs/audit/websocket-broker-priority.md` already
+  recommends: PUB binds its own port here, proxy SUB-connects to it.
+  No singleton race, no overloaded shared bus.
 """
 
+import json
+import os
 import threading
+
+import zmq
 
 from utils.logging import get_logger
 
@@ -37,10 +64,43 @@ _publisher_lock = threading.Lock()
 
 
 class CacheInvalidationPublisher:
-    """Thin wrapper that emits cache-invalidation events through the
-    shared market-data publisher (`SharedZmqPublisher`). Owns no ZMQ
-    socket of its own — that ownership lives in `connection_manager`.
+    """ZMQ PUB owner for cache-invalidation control messages.
+
+    Binds once, lazily, on the first publish call. Bind failures are
+    raised loudly (no port-scanning fallback) — silent fallback was the
+    root cause of the 2026-06-08 stale-feed incident.
     """
+
+    def __init__(self) -> None:
+        self._socket = None
+        self._context = None
+        self._bound_endpoint = None
+        self._lock = threading.Lock()
+
+    def _ensure_bound(self) -> None:
+        if self._socket is not None:
+            return
+        with self._lock:
+            if self._socket is not None:
+                return
+            host = os.getenv("ZMQ_HOST", "127.0.0.1")
+            port = int(os.getenv("CACHE_INV_PORT", "5557"))
+            endpoint = f"tcp://{host}:{port}"
+
+            ctx = zmq.Context.instance()
+            sock = ctx.socket(zmq.PUB)
+            sock.setsockopt(zmq.LINGER, 1000)
+            sock.setsockopt(zmq.SNDHWM, 1000)
+            # Bind explicitly; let zmq.ZMQError propagate if the port is
+            # taken. We do NOT scan forward — silent fallback hid the
+            # #1421 race for weeks. A loud crash at startup is the
+            # correct failure mode here.
+            sock.bind(endpoint)
+
+            self._context = ctx
+            self._socket = sock
+            self._bound_endpoint = endpoint
+            logger.info(f"Cache-invalidation PUB bound to {endpoint}")
 
     def publish_invalidation(self, user_id: str, cache_type: str = ALL_CACHE_TYPE) -> bool:
         """Publish a cache invalidation message for a specific user.
@@ -54,36 +114,33 @@ class CacheInvalidationPublisher:
             return False
 
         try:
-            # Lazy import — avoids a circular dependency between database and
-            # websocket_proxy packages, and keeps cache_invalidation usable
-            # even when the websocket subsystem is disabled.
-            from websocket_proxy.connection_manager import SharedZmqPublisher
-
-            publisher = SharedZmqPublisher()
-            if not publisher._bound:
-                publisher.bind()  # idempotent — only binds first time
-
+            self._ensure_bound()
             topic = f"{CACHE_INVALIDATION_PREFIX}_{cache_type}_{user_id}"
             message = {
                 "action": "invalidate",
                 "user_id": user_id,
                 "cache_type": cache_type,
             }
-            publisher.publish(topic, message)
-
+            self._socket.send_multipart(
+                [topic.encode("utf-8"), json.dumps(message).encode("utf-8")]
+            )
             logger.info(f"Published cache invalidation for user: {user_id}, type: {cache_type}")
             return True
-
         except Exception as e:
             logger.exception(f"Failed to publish cache invalidation for user {user_id}: {e}")
             return False
 
     def close(self) -> None:
-        """No-op kept for backward compatibility — this class no longer
-        owns the ZMQ socket. The shared publisher is cleaned up by
-        `ConnectionPool.disconnect` / `SharedZmqPublisher.cleanup`.
-        """
-        return None
+        """Close the PUB socket. Safe to call multiple times."""
+        with self._lock:
+            if self._socket is not None:
+                try:
+                    self._socket.close(linger=1000)
+                except Exception as e:
+                    logger.warning(f"Error closing cache-invalidation socket: {e}")
+                finally:
+                    self._socket = None
+                    self._bound_endpoint = None
 
 
 def get_cache_invalidation_publisher() -> CacheInvalidationPublisher:

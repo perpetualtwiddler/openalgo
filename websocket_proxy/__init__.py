@@ -21,8 +21,6 @@ from .connection_manager import (
     get_max_symbols_per_websocket,
     get_max_websocket_connections,
 )
-from .server import WebSocketProxy
-from .server import main as websocket_main
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -135,8 +133,6 @@ register_adapter("rmoney", RMoneyWebSocketAdapter)
 
 __all__ = [
     # Core classes
-    "WebSocketProxy",
-    "websocket_main",
     "register_adapter",
     "create_broker_adapter",
     # Base adapter (for cleanup utilities)

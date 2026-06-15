@@ -9,6 +9,8 @@ import zmq
 
 from utils.logging import get_logger
 
+from .market_data_recorder import close_market_data_recorder, record_market_data
+
 # Initialize logger
 logger = get_logger(__name__)
 
@@ -346,6 +348,8 @@ class BaseBrokerWebSocketAdapter(ABC):
 
         except Exception as e:
             self.logger.exception(f"Error cleaning up ZeroMQ resources: {e}")
+        finally:
+            close_market_data_recorder()
 
     def __del__(self):
         """
@@ -416,6 +420,7 @@ class BaseBrokerWebSocketAdapter(ABC):
                 self._shared_publisher.publish(topic, data)
             elif self.socket:
                 # Use own socket
+                record_market_data(topic, data, source="base_adapter")
                 self.socket.send_multipart(
                     [topic.encode("utf-8"), json.dumps(data).encode("utf-8")]
                 )
