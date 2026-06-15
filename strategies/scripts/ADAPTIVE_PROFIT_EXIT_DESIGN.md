@@ -781,6 +781,7 @@ Tags: `[live]` deployed · `[shadow]` log-only data-gathering · `[design]` not 
 - [x] `[live]` APPE arm → proportional **₹4,000/lot** (₹8,000 @ 60 qty) — "HAVRATPANA CONTROL"
 - [x] `[live]` APPE give-back **G size-aware** `√(units/2)` (§4/§5) — no-op at 60 qty
 - [ ] `[shadow]` **§14 reverse-confirm filter** — implement once ≥3–5 real `[SHADOW]` events confirm value
+- [ ] `[design]` **Extend §14 min-separation to ENTRY crosses** — require EMA(9)−EMA(21) ≥ ~0.05% (≈28 pts) *at the cross* to enter, not just to reverse; a thin cross + a one-off volume blip fakes out (Jun 15: a **+7.94-pt** cross w/ a volume blip → −₹7k+ trade on a low-volume drift). Shadow-log entry-cross separation first to size the threshold.
 - [ ] `[design][blocked on §14]` **§15 breaker raise** to ~₹15k so one TSL loss doesn't end the day
 - [ ] `[design]` **§10 ALE** per-trade rupee stop (`MAX_LOSS_PER_TRADE`) + coherent daily — keep loose; backtest first
 - [ ] `[design]` Reverse-confirm `REVERSE_CONFIRM_PCT` value — tune from shadow data, not the offline backtest (§14.5)
