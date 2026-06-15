@@ -63,6 +63,12 @@ VOLUME_SMA_PERIOD = int(os.getenv("VOLUME_SMA_PERIOD", "20"))
 TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5%
 TIGHT_TSL_THRESHOLD = float(os.getenv("TIGHT_TSL_THRESHOLD", "5000"))  # ₹ unrealized profit at which TSL tightens
 TIGHT_TSL_PCT = float(os.getenv("TIGHT_TSL_PCT", "0.25"))             # tighter trailing % once threshold crossed
+# TODO (TIGHT_TSL — disabled for now, 2026-06-16): keep Dinesh's tighten-the-TSL implementation
+# but DO NOT change the trailing % — TSL stays the original 0.5% (TRAILING_SL_PCT) regardless of
+# profit. Whether tightening to TIGHT_TSL_PCT once profit ≥ TIGHT_TSL_THRESHOLD is net-beneficial
+# is unproven and it interacts with the APPE arm (₹8k) — validate on tick-replay / forward data
+# first. Flip TIGHT_TSL_ENABLED=true to activate. See ADAPTIVE_PROFIT_EXIT_DESIGN.md §16.
+TIGHT_TSL_ENABLED = os.getenv("TIGHT_TSL_ENABLED", "false").lower() == "true"
 
 # --- Adaptive Profit-Protection Exit (APPE) — see ADAPTIVE_PROFIT_EXIT_DESIGN.md ---
 # Trails the *profit curve* (not price): once profit peaks past the arm threshold, exit when it
@@ -289,7 +295,7 @@ class EMACrossoverBot:
             unrealized = (self.ltp - self.entry_price) * QUANTITY
             if self.ltp > self.peak_price:
                 self.peak_price = self.ltp
-                tsl_pct = TIGHT_TSL_PCT if unrealized >= TIGHT_TSL_THRESHOLD else TRAILING_SL_PCT
+                tsl_pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and unrealized >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
                 new_tsl = round(self.peak_price * (1 - tsl_pct / 100), 2)
                 if new_tsl > self.trailing_sl:  # only tighten, never widen
                     self.trailing_sl = new_tsl
@@ -298,7 +304,7 @@ class EMACrossoverBot:
             unrealized = (self.entry_price - self.ltp) * QUANTITY
             if self.ltp < self.peak_price:
                 self.peak_price = self.ltp
-                tsl_pct = TIGHT_TSL_PCT if unrealized >= TIGHT_TSL_THRESHOLD else TRAILING_SL_PCT
+                tsl_pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and unrealized >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
                 new_tsl = round(self.peak_price * (1 + tsl_pct / 100), 2)
                 if new_tsl < self.trailing_sl:  # only tighten, never widen
                     self.trailing_sl = new_tsl
