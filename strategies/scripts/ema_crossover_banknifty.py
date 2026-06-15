@@ -705,6 +705,12 @@ class EMACrossoverBot:
                     signal = self.check_signal(df)
                     if signal and signal != self.position:
                         self.exit_in_progress = True
+                        # §14 SHADOW (log-only): the live reverse happens HERE (loop), not in
+                        # place_entry — arm before the exit, snapshotting the pre-exit state.
+                        try:
+                            self._arm_shadow_reverse(self.position, self.entry_price, self.ltp)
+                        except Exception:
+                            pass
                         self.place_exit("REVERSE_SIGNAL")
                         time.sleep(1)
                         self.place_entry(signal)
