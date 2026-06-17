@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 """
-EMA(9/21) Crossover Strategy — BANKNIFTY 5-Minute
-==================================================
+EMA(9/21) Crossover Strategy — BANKNIFTY 3-Minute (Option 1 / ATR-TSL variant)
+==============================================================================
 Buys/sells BANKNIFTY futures on EMA crossover with volume confirmation.
+Distinct 3-min variant of the 5-min strategy (run side-by-side; different name/state).
 
-Entry : EMA(9) crosses EMA(21) on 5-min candles
-Filter: Volume > 1.5x SMA(20) of volume
-Exit  : APPE adaptive profit-protection (trails the P&L curve) OR trailing
-        stop-loss 0.5% OR reverse crossover signal — first to fire wins
+Entry : EMA(9) crosses EMA(21) on 3-min candles
+Gate  : decisive gap ≥0.01% + close vs EMA9 + EMA9(now)>EMA9(3 bars ago) slope + volume
+Filter: Volume > 1.5x SMA(10) of volume (≈30-min)
+Exit  : APPE adaptive profit-protection (arm ₹2,000/lot = ₹4,000) OR dynamic
+        ATR trailing stop (1.5×ATR(14)) OR reverse crossover — first to fire wins
 Product: MIS (intraday, auto square-off by broker at 3:15 PM)
 
 Run standalone:
@@ -54,12 +56,12 @@ PRODUCT = os.getenv("PRODUCT", "MIS")
 
 FAST_EMA = int(os.getenv("FAST_EMA", "9"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "21"))
-SLOPE_BARS = int(os.getenv("SLOPE_BARS", "1"))   # EMA9 slope lookback: 1 = candle-over-candle; e.g. 3 = EMA9(now) vs EMA9(3 bars ago)
-CANDLE_TIMEFRAME = os.getenv("CANDLE_TIMEFRAME", "5m")
+SLOPE_BARS = int(os.getenv("SLOPE_BARS", "3"))   # Opt1: EMA9(now) vs EMA9(3 bars ago)
+CANDLE_TIMEFRAME = os.getenv("CANDLE_TIMEFRAME", "3m")   # Opt1: 3-minute candles
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
 
 VOLUME_FILTER_MULT = float(os.getenv("VOLUME_FILTER_MULT", "1.5"))
-VOLUME_SMA_PERIOD = int(os.getenv("VOLUME_SMA_PERIOD", "20"))
+VOLUME_SMA_PERIOD = int(os.getenv("VOLUME_SMA_PERIOD", "10"))   # Opt1: 10×3m ≈ 30-min volume SMA
 
 TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5%
 TIGHT_TSL_THRESHOLD = float(os.getenv("TIGHT_TSL_THRESHOLD", "5000"))  # ₹ unrealized profit at which TSL tightens
@@ -79,7 +81,7 @@ TIGHT_TSL_ENABLED = os.getenv("TIGHT_TSL_ENABLED", "false").lower() == "true"
 # won't widen an already-tightened stop, but a high ATR at entry sets the wide initial distance.
 # TIGHT_TSL applies to percent mode only. Validate on tick-replay before enabling live.
 # See ADAPTIVE_PROFIT_EXIT_DESIGN.md §17.
-TSL_MODE = os.getenv("TSL_MODE", "percent").strip().lower()   # "percent" | "atr"
+TSL_MODE = os.getenv("TSL_MODE", "atr").strip().lower()   # Opt1: dynamic ATR trailing stop ("percent" | "atr")
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 ATR_MULT = float(os.getenv("ATR_MULT", "1.5"))
 
@@ -95,7 +97,7 @@ APPE_ENABLED = os.getenv("APPE_ENABLED", "true").lower() == "true"
 # just missed real peaks that then round-tripped to a loss — e.g. Jun 8: a +9,504 peak
 # never armed and exited TSL at -7,188; a replay showed an ₹8,000 arm would have booked
 # ~+5,220. Set an explicit PROFIT_ARM_THRESHOLD env to override the per-lot formula.
-ARM_PER_LOT = float(os.getenv("ARM_PER_LOT", "4000"))        # APPE arm ₹ per lot of LOT_SIZE
+ARM_PER_LOT = float(os.getenv("ARM_PER_LOT", "2000"))        # Opt1: APPE arm ₹2,000/lot (₹4,000 @ 60 qty)
 _arm_override = os.getenv("PROFIT_ARM_THRESHOLD")
 PROFIT_ARM_THRESHOLD = (
     float(_arm_override) if _arm_override else ARM_PER_LOT * (QUANTITY / LOT_SIZE)
@@ -111,7 +113,7 @@ HARD_MULT = float(os.getenv("HARD_MULT", "2.0"))             # catastrophic give
 # Reverse-signal confirmation SHADOW (design doc §14) — LOG-ONLY, does not change trading.
 # On a reverse-signal exit, records what a "confirm the reverse only on price follow-through"
 # filter WOULD have decided, to gather real-fidelity evidence on this rare event over time.
-REVERSE_CONFIRM_PCT = float(os.getenv("REVERSE_CONFIRM_PCT", "0.0003"))  # 0.03% (~17 BANKNIFTY pts) — min EMA9-EMA21 gap at the cross
+REVERSE_CONFIRM_PCT = float(os.getenv("REVERSE_CONFIRM_PCT", "0.0001"))  # Opt1: gap gate 0.01% (~5.7 BANKNIFTY pts) at the cross
 
 # Feed-health guard: if no WS ticks arrive for this long during market hours, the feed is
 # considered stale — trailing-SL & APPE (both tick-driven) are inactive, so we log ERROR and
@@ -126,7 +128,7 @@ SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
 
 MAX_LOSS_PER_DAY = float(os.getenv("MAX_LOSS_PER_DAY", "5000"))  # daily circuit breaker
 
-STRATEGY_NAME = os.getenv("STRATEGY_NAME", "EMA_9_21_BANKNIFTY")
+STRATEGY_NAME = os.getenv("STRATEGY_NAME", "EMA_9_21_BANKNIFTY_3M")
 STRATEGY_TAG = STRATEGY_NAME.replace("/", "_").replace(" ", "_")
 
 STATE_DIR = Path(os.getenv("STATE_DIR", "/root/data/openalgo/strategies/state"))

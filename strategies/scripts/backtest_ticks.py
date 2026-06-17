@@ -53,6 +53,12 @@ TRAILING_SL_PCT = 0.5
 TIGHT_TSL_THRESHOLD = 5000.0
 TIGHT_TSL_PCT = 0.25
 TIGHT_TSL_ENABLED = False  # mirror live default (gated off): TSL stays flat 0.5%
+# Dynamic ATR-based trailing stop (mirror live ema_crossover_banknifty.py):
+# TSL_MODE="atr" -> trailing distance = ATR_MULT x ATR(ATR_PERIOD) in POINTS
+# (volatility-proportional, recomputed each completed bar); "percent" -> classic % of price.
+TSL_MODE = os.getenv("TSL_MODE", "percent").strip().lower()   # "percent" | "atr"
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ATR_MULT = float(os.getenv("ATR_MULT", "1.5"))
 APPE_ENABLED = True
 ARM_PER_LOT = 4000.0  # mirror live "HAVRATPANA" tuning (lowered from 5000)
 PROFIT_ARM_THRESHOLD = ARM_PER_LOT * (QTY / LOT_SIZE)  # ₹8,000 at 60 qty
@@ -99,15 +105,16 @@ def load_ticks(date_str):
 # APPE — faithful port of ema_crossover_banknifty.py::_appe_evaluate
 # =============================================================================
 class Position:
-    def __init__(self, direction, entry_price, entry_dt):
+    def __init__(self, direction, entry_price, entry_dt, entry_atr=None):
         self.direction = direction          # "BUY" / "SELL"
         self.entry_price = entry_price
         self.entry_dt = entry_dt
         self.peak_price = entry_price        # for trailing SL
+        self.trail_atr = entry_atr           # latest ATR(points); set per-bar by simulate_day
         if direction == "BUY":
-            self.trailing_sl = round(entry_price * (1 - TRAILING_SL_PCT / 100), 2)
+            self.trailing_sl = round(entry_price - self._dist(0.0), 2)
         else:
-            self.trailing_sl = round(entry_price * (1 + TRAILING_SL_PCT / 100), 2)
+            self.trailing_sl = round(entry_price + self._dist(0.0), 2)
         # APPE state
         self.appe_peak = 0.0
         self.appe_armed = False
@@ -119,24 +126,33 @@ class Position:
             return (ltp - self.entry_price) * QTY
         return (self.entry_price - ltp) * QTY
 
+    def _dist(self, u):
+        """Trailing-stop distance in POINTS from the peak. ATR mode = ATR_MULT x ATR
+        (volatility-proportional); percent mode = peak_price x pct/100 (TIGHT-aware).
+        Falls back to percent if ATR not yet available."""
+        if TSL_MODE == "atr" and self.trail_atr and self.trail_atr > 0:
+            return ATR_MULT * self.trail_atr
+        pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
+        return self.peak_price * pct / 100.0
+
     def update_trailing(self, ltp):
-        """Update TSL with tightening; return True if SL is hit at this tick."""
+        """Update TSL (ratchet only — never loosens); return True if SL hit at this tick.
+        Recomputed every tick so an ATR contraction can tighten the stop even without a
+        new peak; an ATR expansion can't loosen it (max/min guard)."""
         u = self.unrealized(ltp)
         if self.direction == "BUY":
             if ltp > self.peak_price:
                 self.peak_price = ltp
-                pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
-                new = round(self.peak_price * (1 - pct / 100), 2)
-                if new > self.trailing_sl:
-                    self.trailing_sl = new
+            new = round(self.peak_price - self._dist(u), 2)
+            if new > self.trailing_sl:
+                self.trailing_sl = new
             return ltp <= self.trailing_sl
         else:
             if ltp < self.peak_price:
                 self.peak_price = ltp
-                pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
-                new = round(self.peak_price * (1 + pct / 100), 2)
-                if new < self.trailing_sl:
-                    self.trailing_sl = new
+            new = round(self.peak_price + self._dist(u), 2)
+            if new < self.trailing_sl:
+                self.trailing_sl = new
             return ltp >= self.trailing_sl
 
     def _slope_negative(self):
@@ -247,6 +263,10 @@ def simulate_day(ticks, cfg, use_vol_filter):
     bars_done = 0                 # completed bars this day
     ema_fast = ema_slow = None
     prev_fast = prev_slow = None
+    slope_bars = cfg.get("slope_bars", 1)            # EMA9 slope lookback in bars (1 = candle-over-candle)
+    ema_fast_hist = deque(maxlen=slope_bars + 1)     # recent EMA9 values for the slope check
+    atr = None                    # Wilder ATR(ATR_PERIOD) in points (per completed bar)
+    prev_bar_close = None         # previous completed bar's close (for True Range)
     vol_series = deque(maxlen=vol_sma_n)  # per-bar volume (real) or tick-count (proxy)
 
     pending_signal = None         # "BUY"/"SELL" to act on next tick
@@ -267,13 +287,22 @@ def simulate_day(ticks, cfg, use_vol_filter):
     def finalize_bar():
         """Called when a bar completes; updates EMAs + detects crossover."""
         nonlocal ema_fast, ema_slow, prev_fast, prev_slow, bars_done
-        nonlocal pending_signal, prev_bar_cum_vol
+        nonlocal pending_signal, prev_bar_cum_vol, atr, prev_bar_close
         prev_fast, prev_slow = ema_fast, ema_slow
         if ema_fast is None:
             ema_fast, ema_slow = bar_c, bar_c
         else:
             ema_fast = fast_a * bar_c + (1 - fast_a) * ema_fast
             ema_slow = slow_a * bar_c + (1 - slow_a) * ema_slow
+
+        # Wilder ATR (adjust=False ewm, seed = first TR) — matches live's
+        # tr.ewm(alpha=1/period, adjust=False).mean(). TR uses this bar's H/L and
+        # the previous bar's close. Only meaningful past warmup (positions open later).
+        tr = (bar_h - bar_l) if prev_bar_close is None else max(
+            bar_h - bar_l, abs(bar_h - prev_bar_close), abs(bar_l - prev_bar_close))
+        atr = tr if atr is None else atr + (tr - atr) / ATR_PERIOD
+        prev_bar_close = bar_c
+        ema_fast_hist.append(ema_fast)               # for the slope_bars-bar EMA9 slope
 
         # Per-bar volume: diff cumulative quote volume across the bar boundary;
         # fall back to tick-count when no real volume exists.
@@ -305,7 +334,8 @@ def simulate_day(ticks, cfg, use_vol_filter):
         # gates and drops only the volume condition, to isolate volume's marginal effect.
         gap = ema_fast - ema_slow
         min_gap = rcp * bar_c
-        slope9 = ema_fast - prev_fast
+        slope_ref = ema_fast_hist[0] if len(ema_fast_hist) > slope_bars else prev_fast
+        slope9 = ema_fast - slope_ref                # EMA9 now vs slope_bars bars ago
         vol_pass = vol_ok if use_vol_filter else True
         bull_cross = prev_fast <= prev_slow and ema_fast > ema_slow
         bear_cross = prev_fast >= prev_slow and ema_fast < ema_slow
@@ -348,11 +378,12 @@ def simulate_day(ticks, cfg, use_vol_filter):
                 close_trade(pos, ltp, dt, "REVERSE")
                 pos = None
             if pos is None:
-                pos = Position(pending_signal, ltp, dt)
+                pos = Position(pending_signal, ltp, dt, entry_atr=atr)
             pending_signal = None
 
         # ---- per-tick exit evaluation (APPE-first, then trailing-SL — see step()) ----
         if pos is not None:
+            pos.trail_atr = atr   # track latest ATR (updates at each completed bar)
             res = pos.step(ltp, t_sec)
             if res is not None:
                 reason, exit_price = res
