@@ -233,6 +233,18 @@ class Position:
         return None
 
 
+def detect_signal(pf, ps, cf, cs, close, min_gap, slope9, vol_pass):
+    """Entry gate shared by close-confirmed and early modes (mirror live check_signal
+    §14/§16): a cross PLUS a decisive EMA gap, price leading (close vs EMA9=fast), EMA9
+    momentum (slope), and volume. pf/ps = prior EMAs, cf/cs = current EMAs."""
+    gap = cf - cs
+    if pf <= ps and cf > cs and gap >= min_gap and close > cf and slope9 > 0 and vol_pass:
+        return "BUY"
+    if pf >= ps and cf < cs and -gap >= min_gap and close < cf and slope9 < 0 and vol_pass:
+        return "SELL"
+    return None
+
+
 # =============================================================================
 # Single-day simulation
 # =============================================================================
@@ -247,6 +259,8 @@ def simulate_day(ticks, cfg, use_vol_filter):
     vol_mult = cfg["vol_mult"]
     warmup = cfg["warmup"]
     rcp = cfg.get("reverse_confirm_pct", REVERSE_CONFIRM_PCT)
+    early = cfg.get("early", False)             # detect cross intra-bar (no wait for close)
+    gap_pts = cfg.get("gap_gate", -1.0)         # fixed-points gap gate; <0 → rcp*price (live)
 
     # Real traded volume is available only when the capture carries a cumulative
     # "volume" field (Quote mode). LTP-only days fall back to a tick-count proxy.
@@ -288,6 +302,18 @@ def simulate_day(ticks, cfg, use_vol_filter):
             "exit_dt": exit_dt, "exit_price": exit_price, "reason": reason, "pnl": pnl,
         })
 
+    def vol_ok_for(v):
+        """Volume-filter check for a given (per-bar or partial-bar) volume v."""
+        if not use_vol_filter:
+            return True
+        if len(vol_series) < vol_sma_n:
+            return False
+        vsma = sum(vol_series) / len(vol_series)
+        return v > vol_mult * vsma if vsma > 0 else False
+
+    def gate_min(close):
+        return gap_pts if gap_pts >= 0 else rcp * close
+
     def finalize_bar():
         """Called when a bar completes; updates EMAs + detects crossover."""
         nonlocal ema_fast, ema_slow, prev_fast, prev_slow, bars_done
@@ -323,32 +349,23 @@ def simulate_day(ticks, cfg, use_vol_filter):
         if prev_fast is None or bars_done < warmup:
             return
 
-        # Volume filter on the just-closed bar (cur_vol is vol_series[-1])
-        vol_ok = True
-        if use_vol_filter:
-            if len(vol_series) >= vol_sma_n:
-                vsma = sum(vol_series) / len(vol_series)
-                vol_ok = cur_vol > vol_mult * vsma if vsma > 0 else False
-            else:
-                vol_ok = False  # not enough history for the baseline yet
+        # (early mode detects the cross intra-bar in the tick loop below — skip the close gate)
+        if early:
+            return
 
-        # Advanced entry gate (mirror live check_signal §14/§16): a bare cross is not
-        # enough — require a decisive EMA gap, price leading (close vs EMA9), EMA9
-        # momentum, and (when use_vol_filter) volume. PRICE-ONLY keeps the structural
-        # gates and drops only the volume condition, to isolate volume's marginal effect.
+        # Close-confirmed entry gate on the just-closed bar. Combines Dinesh's gate_min
+        # (fixed --gap-gate in points, else rcp*price) + vol_ok_for, with the slope_bars-bar
+        # EMA slope and an optional N-candle confirmation window (cross_confirm_bars). At the
+        # defaults (cross_confirm_bars=0, slope_bars=1) this is identical to detect_signal()
+        # (entry only on the cross candle); detect_signal() still drives the early-entry mode.
         gap = ema_fast - ema_slow
-        min_gap = rcp * bar_c
+        min_gap = gate_min(bar_c)
         slope_ref = ema_fast_hist[0] if len(ema_fast_hist) > slope_bars else prev_fast
         slope9 = ema_fast - slope_ref                # EMA9 now vs slope_bars bars ago
-        vol_pass = vol_ok if use_vol_filter else True
+        vol_pass = vol_ok_for(cur_vol)
         bull_cross = prev_fast <= prev_slow and ema_fast > ema_slow
         bear_cross = prev_fast >= prev_slow and ema_fast < ema_slow
 
-        # Crossover + optional N-candle confirmation window. cross_confirm_bars=0 (default)
-        # reproduces the original "decisive on the cross candle only" behaviour. With N>0, a
-        # cross stays armed for N candles after it; entry fires on the first candle within that
-        # window where the gap turns decisive AND price-lead/slope/volume agree. The cross is
-        # disarmed if the EMAs flip back across, if the window expires, or once it fires.
         if bull_cross:
             cross_dir, cross_age = 1, 0
         elif bear_cross:
@@ -394,6 +411,24 @@ def simulate_day(ticks, cfg, use_vol_filter):
         bar_ticks += 1
         if cum_vol is not None:
             bar_cum_vol = cum_vol
+
+        # ---- early-entry: detect the cross intra-bar, no wait for candle close ----
+        # Uses a "live" EMA = alpha*ltp + (1-alpha)*last-completed-EMA, the forming bar's
+        # partial volume, and the current ltp as the provisional close. Note these all
+        # "repaint" as the bar fills — that is exactly the latency-vs-whipsaw tradeoff
+        # this mode measures. (No intra-bar flip-flop: the prior bar's fast/slow relation
+        # is fixed for the bar, so only one cross direction can fire within it.)
+        if early and ema_fast is not None and bars_done >= warmup:
+            live_fast = fast_a * ltp + (1 - fast_a) * ema_fast
+            live_slow = slow_a * ltp + (1 - slow_a) * ema_slow
+            if volume_source == "real":
+                pv = max(0.0, bar_cum_vol - prev_bar_cum_vol) if bar_cum_vol is not None else 0.0
+            else:
+                pv = float(bar_ticks)
+            sig = detect_signal(ema_fast, ema_slow, live_fast, live_slow, ltp,
+                                gate_min(ltp), live_fast - ema_fast, vol_ok_for(pv))
+            if sig:
+                pending_signal = sig
 
         # ---- act on a pending signal (entry / reverse) at this tick ----
         if pending_signal is not None:
@@ -488,6 +523,10 @@ def main():
     ap.add_argument("--reverse-confirm-pct", type=float, default=REVERSE_CONFIRM_PCT,
                     help="min |EMA9-EMA21| gap at the cross as a fraction of price "
                          "(default mirrors live; lower it for faster timeframes)")
+    ap.add_argument("--gap-gate", type=float, default=-1.0,
+                    help="gap gate in POINTS (e.g. 17, 3, 0); <0 = use --reverse-confirm-pct fraction")
+    ap.add_argument("--early-entry", action="store_true",
+                    help="enter intra-bar the moment the gate passes, instead of waiting for candle close")
     args = ap.parse_args()
 
     if args.date:
@@ -496,23 +535,23 @@ def main():
         dates = sorted(p.name for p in DATA_DIR.iterdir() if p.is_dir())
 
     rcp = args.reverse_confirm_pct
+    common = {"reverse_confirm_pct": rcp, "gap_gate": args.gap_gate, "early": args.early_entry}
     if args.tf and args.fast and args.slow:
         configs = [{"tf": args.tf, "fast": args.fast, "slow": args.slow,
                     "warmup": args.warmup,
-                    "vol_sma": args.vol_sma or 10, "vol_mult": args.vol_mult,
-                    "reverse_confirm_pct": rcp}]
+                    "vol_sma": args.vol_sma or 10, "vol_mult": args.vol_mult, **common}]
     else:
         configs = [
-            {"tf": 2, "fast": 8, "slow": 17, "warmup": 9, "vol_sma": 10, "vol_mult": 1.5,
-             "reverse_confirm_pct": rcp},
-            {"tf": 5, "fast": 9, "slow": 21, "warmup": 9, "vol_sma": 20, "vol_mult": 1.5,
-             "reverse_confirm_pct": rcp},
+            {"tf": 2, "fast": 8, "slow": 17, "warmup": 9, "vol_sma": 10, "vol_mult": 1.5, **common},
+            {"tf": 5, "fast": 9, "slow": 21, "warmup": 9, "vol_sma": 20, "vol_mult": 1.5, **common},
         ]
 
+    gap_desc = (f"{args.gap_gate:g} pts (fixed)" if args.gap_gate >= 0
+                else f"{rcp*100:.4f}% (~{rcp*57000:.0f} pts @57k)")
     print(f"Data dir: {DATA_DIR} | days: {', '.join(dates)}")
     print(f"QTY={QTY} | TSL {TRAILING_SL_PCT}%→{TIGHT_TSL_PCT}%@₹{TIGHT_TSL_THRESHOLD:.0f} | "
           f"APPE arm ₹{PROFIT_ARM_THRESHOLD:.0f}, G={GIVEBACK_K:g}√peak | "
-          f"gap gate ≥{rcp*100:.4f}% (~{rcp*57000:.0f} pts @57k)")
+          f"gap gate {gap_desc} | entry={'EARLY intra-bar' if args.early_entry else 'on-close'}")
     run(dates, configs)
 
 
