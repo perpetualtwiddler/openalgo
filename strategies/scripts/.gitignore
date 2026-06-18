@@ -15,6 +15,7 @@
 !sim_ema_today.py
 !test_straddle_filters.py
 !ema_crossover_banknifty_3m_20260617.py
+!ema_crossover_banknifty_opt4_20260618.py
 !backtest_ema_dev.py
 
 # Keep docs

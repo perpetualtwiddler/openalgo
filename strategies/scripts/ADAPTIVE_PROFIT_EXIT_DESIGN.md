@@ -803,6 +803,17 @@ that backs away from price violates the ratchet and can give back more than budg
 **Config (env).** `TSL_MODE` = `percent` (default, unchanged live behaviour) | `atr`;
 `ATR_PERIOD=14`; `ATR_MULT=1.5`. **Default OFF** — gated like TIGHT_TSL pending validation.
 
+**Floored variant (`ATR_FLOOR_PTS`, added 2026-06-18).** ATR-mode distance becomes
+`max(ATR_MULT×ATR, ATR_FLOOR_PTS)` — a hard floor in points. Motivated by the magnitude table
+below (1.5×ATR is only ~50–80 pt on quiet days, ~3× tighter than the old 0.5%): a floor keeps the
+stop from being whip-tight when volatility collapses, while ATR still widens it on volatile days.
+Default `0` (off). Was trialled on **Option 4** (7/15 3m) with a 100-pt floor, then **removed
+(2026-06-18)**: a floor sweep across the captured chop days (06-16/17/18) found the floor strictly
+worse — wider stop just enlarges each whipsaw loss when there's no trend to ride (3-day P&L by floor:
+0pt=+487, 100pt=−9,876, 150pt=−20,832). Option 4 now uses **pure 1.5×ATR**. The knob is retained but
+unused (default 0). ⚠ The sweep is chop-only; the floor's real job is room on a *trending* day, so
+this isn't a verdict — just a reason not to add a floor on chop evidence. Not on any live strategy.
+
 **Interactions.** TIGHT_TSL is a percent-mode concept and is ignored in ATR mode. APPE is
 independent and still evaluated first (APPE give-back `G` ≠ the TSL distance). The daily
 breaker (§15) and per-trade risk (§10) coherence still apply — note a tight ATR stop
@@ -831,6 +842,34 @@ both directions plausible; needs more data.
 parity confirmed (default run unchanged). **Live default stays `percent`** — do NOT flip
 to `atr` until validated on a trending captured day; deploy only at a pre-market restart,
 never mid-session.
+
+---
+
+## 18. Crossover confirmation window (N-candle re-check)
+
+**Idea.** The §16 crossover-quality gate requires the **decisive gap** (≥`REVERSE_CONFIRM_PCT`)
+*on the cross candle itself*. But two EMAs are ~equal at the moment they cross, so the gap there is
+near zero — if a real move only widens the gap to "decisive" a candle or two **after** the cross,
+the at-cross gate skips it entirely. Live example (2026-06-18, 3m): EMA9 crossed below EMA21 ~14:09–14:12
+with gap ≈ 0 (rejected), and the gap only reached the ~6 pt threshold by ~14:21 — by which point it
+was no longer the cross candle, so no entry ever fired despite close/slope/volume all agreeing.
+
+**Rule.** Keep the cross **armed for N candles** after it occurs. On each candle within the window,
+enter if the gap is now decisive **and** close-leads-EMA + fast-EMA slope + volume all agree on
+*that* candle. Disarm the cross when: it fires, the EMAs flip back across (cross negated), or the
+window expires (`cross_age > N`).
+
+**Config.** `cross_confirm_bars = N` (per-strategy). **Default `0`** = original behaviour (entry only
+on the cross candle) → all existing strategies unchanged. **Option 4 uses `2`** (cross candle + up to
+2 following candles).
+
+**⚠ Trade-off, quantified (2026-06-18, choppy/rangebound day, backtest cold-start).** The window
+**re-admits whipsaw risk** the §16 gate was added to remove. With `cross_confirm_bars=2`, Option 4
+took **2 trades, both TSL whipsaw losers** (SELL 10:42→−3,972; BUY 13:33→−5,580; total **−9,552**),
+while every cross-candle-only variation stayed **flat (0 trades)**. So the window is a **double-edged
+lever**: it generates signals on quiet/choppy days, but those tend to be whipsaws; its *upside*
+(catching a real move whose cross was thin) can only be judged on a **trending captured day**.
+Backtest-only (Option 4); not on any live strategy.
 
 ---
 

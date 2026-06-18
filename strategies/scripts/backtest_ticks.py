@@ -59,6 +59,7 @@ TIGHT_TSL_ENABLED = False  # mirror live default (gated off): TSL stays flat 0.5
 TSL_MODE = os.getenv("TSL_MODE", "percent").strip().lower()   # "percent" | "atr"
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 ATR_MULT = float(os.getenv("ATR_MULT", "1.5"))
+ATR_FLOOR_PTS = float(os.getenv("ATR_FLOOR_PTS", "0"))   # ATR-mode floor: dist = max(ATR_MULT*ATR, this)
 APPE_ENABLED = True
 ARM_PER_LOT = 4000.0  # mirror live "HAVRATPANA" tuning (lowered from 5000)
 PROFIT_ARM_THRESHOLD = ARM_PER_LOT * (QTY / LOT_SIZE)  # ₹8,000 at 60 qty
@@ -131,7 +132,7 @@ class Position:
         (volatility-proportional); percent mode = peak_price x pct/100 (TIGHT-aware).
         Falls back to percent if ATR not yet available."""
         if TSL_MODE == "atr" and self.trail_atr and self.trail_atr > 0:
-            return ATR_MULT * self.trail_atr
+            return max(ATR_MULT * self.trail_atr, ATR_FLOOR_PTS)   # ATR trail with optional pts floor
         pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
         return self.peak_price * pct / 100.0
 
@@ -265,6 +266,9 @@ def simulate_day(ticks, cfg, use_vol_filter):
     prev_fast = prev_slow = None
     slope_bars = cfg.get("slope_bars", 1)            # EMA9 slope lookback in bars (1 = candle-over-candle)
     ema_fast_hist = deque(maxlen=slope_bars + 1)     # recent EMA9 values for the slope check
+    cross_confirm_bars = cfg.get("cross_confirm_bars", 0)  # extra candles after a cross to still allow entry (0 = cross candle only)
+    cross_dir = 0                 # armed cross direction: +1 bull / -1 bear / 0 none
+    cross_age = 0                 # completed bars since the armed cross (0 = the cross candle)
     atr = None                    # Wilder ATR(ATR_PERIOD) in points (per completed bar)
     prev_bar_close = None         # previous completed bar's close (for True Range)
     vol_series = deque(maxlen=vol_sma_n)  # per-bar volume (real) or tick-count (proxy)
@@ -287,7 +291,7 @@ def simulate_day(ticks, cfg, use_vol_filter):
     def finalize_bar():
         """Called when a bar completes; updates EMAs + detects crossover."""
         nonlocal ema_fast, ema_slow, prev_fast, prev_slow, bars_done
-        nonlocal pending_signal, prev_bar_cum_vol, atr, prev_bar_close
+        nonlocal pending_signal, prev_bar_cum_vol, atr, prev_bar_close, cross_dir, cross_age
         prev_fast, prev_slow = ema_fast, ema_slow
         if ema_fast is None:
             ema_fast, ema_slow = bar_c, bar_c
@@ -339,10 +343,29 @@ def simulate_day(ticks, cfg, use_vol_filter):
         vol_pass = vol_ok if use_vol_filter else True
         bull_cross = prev_fast <= prev_slow and ema_fast > ema_slow
         bear_cross = prev_fast >= prev_slow and ema_fast < ema_slow
-        if bull_cross and gap >= min_gap and bar_c > ema_fast and slope9 > 0 and vol_pass:
-            pending_signal = "BUY"
-        elif bear_cross and -gap >= min_gap and bar_c < ema_fast and slope9 < 0 and vol_pass:
-            pending_signal = "SELL"
+
+        # Crossover + optional N-candle confirmation window. cross_confirm_bars=0 (default)
+        # reproduces the original "decisive on the cross candle only" behaviour. With N>0, a
+        # cross stays armed for N candles after it; entry fires on the first candle within that
+        # window where the gap turns decisive AND price-lead/slope/volume agree. The cross is
+        # disarmed if the EMAs flip back across, if the window expires, or once it fires.
+        if bull_cross:
+            cross_dir, cross_age = 1, 0
+        elif bear_cross:
+            cross_dir, cross_age = -1, 0
+        elif cross_dir != 0:
+            cross_age += 1
+        if cross_dir == 1 and ema_fast <= ema_slow:      # bull cross negated (EMAs flipped back)
+            cross_dir = 0
+        elif cross_dir == -1 and ema_fast >= ema_slow:   # bear cross negated
+            cross_dir = 0
+        if cross_dir != 0 and cross_age > cross_confirm_bars:   # window expired
+            cross_dir = 0
+
+        if cross_dir == 1 and gap >= min_gap and bar_c > ema_fast and slope9 > 0 and vol_pass:
+            pending_signal = "BUY"; cross_dir = 0
+        elif cross_dir == -1 and -gap >= min_gap and bar_c < ema_fast and slope9 < 0 and vol_pass:
+            pending_signal = "SELL"; cross_dir = 0
 
     for t_sec, dt, ltp, cum_vol in ticks:
         # ---- EOD square-off ----

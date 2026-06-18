@@ -187,6 +187,14 @@ VARIATIONS = [
      {"tf": 2, "fast": 9, "slow": 21, "warmup": 9, "vol_sma": 15, "vol_mult": 1.5,
       "reverse_confirm_pct": 0.0001, "slope_bars": 3},
      0.25, 1000, "atr"),
+    # Option 4 (EMA 7/15 on 3m): fast pair + 2-candle crossover CONFIRMATION WINDOW
+    # (cross_confirm_bars=2) — a cross stays eligible up to 2 candles after it. TSL = PURE
+    # 1.5xATR(14), NO floor (the 100-pt floor was removed 2026-06-18 — the floor sweep showed
+    # it strictly worse on chop). Slope = EMA7(now) vs EMA7(3 bars ago). Arm 2k/lot (=Rs4,000).
+    ("VAR4 7/15 3m/arm₹2k/pureATR/gap0.01/slope3/confirm2", "single",
+     {"tf": 3, "fast": 7, "slow": 15, "warmup": 9, "vol_sma": 10, "vol_mult": 1.5,
+      "reverse_confirm_pct": 0.0001, "slope_bars": 3, "cross_confirm_bars": 2},
+     0.25, 2000, "atr"),
 ]
 
 
@@ -224,12 +232,14 @@ def main():
         if no_vol:
             cfg = {**cfg, "no_vol": True}
         bt.TSL_MODE = tsl_mode            # per-variation: "atr" (1.5xATR(14)) or "percent"
+        bt.ATR_FLOOR_PTS = cfg.get("atr_floor", 0.0)   # per-variation ATR-trail floor in pts (0 = none)
         set_globals(tsl, arm)
         trades = bt.simulate_day(ticks, cfg, not no_vol)[0] if kind == "single" else simulate_mtf(ticks, cfg)
         total, n, w, l, reasons = summarize(trades)
         rows.append((label, cfg, tsl, arm, total, n, w, l, reasons))
         armv = arm * (bt.QTY / bt.LOT_SIZE)
-        tsl_str = f"ATR×{bt.ATR_MULT}" if tsl_mode == "atr" else f"{tsl}%"
+        floor = cfg.get("atr_floor", 0.0)
+        tsl_str = (f"ATR×{bt.ATR_MULT}" + (f"≥{floor:.0f}pt" if floor else "")) if tsl_mode == "atr" else f"{tsl}%"
         print(f"\n{'='*74}\n  {label} | tf={cfg['tf']}m | APPE arm ₹{armv:.0f} | TSL {tsl_str} | "
               f"volSMA({cfg['vol_sma']}≈{cfg['vol_sma']*cfg['tf']}min) | gap {cfg['reverse_confirm_pct']*100:.3f}% | "
               f"slope {cfg.get('slope_bars',1)}-bar\n{'='*74}")
