@@ -65,8 +65,12 @@ HARD_MULT = 2.0
 EOD_HOUR, EOD_MIN = 15, 14
 
 
-def load_ticks(date_str):
-    """Return [(t_sec_float, ist_dt, ltp)] sorted by time for a session."""
+def load_ticks(date_str, symbol=None):
+    """Return [(t_sec_float, ist_dt, ltp, cum_vol)] sorted by time for a session.
+
+    If symbol is given, only ticks whose data["symbol"] matches are included.
+    Required when the capture file contains multiple instruments (e.g. FNO profile).
+    """
     path = DATA_DIR / date_str / "normalized_market_data.jsonl"
     if not path.exists():
         return None
@@ -76,6 +80,8 @@ def load_ticks(date_str):
             try:
                 o = json.loads(line)
                 d = o["data"]
+                if symbol is not None and d.get("symbol") != symbol:
+                    continue
                 ms = int(d["timestamp"])
                 ltp = float(d["ltp"])
             except (json.JSONDecodeError, KeyError, ValueError):
@@ -99,10 +105,14 @@ def load_ticks(date_str):
 # APPE — faithful port of ema_crossover_banknifty.py::_appe_evaluate
 # =============================================================================
 class Position:
-    def __init__(self, direction, entry_price, entry_dt):
+    def __init__(self, direction, entry_price, entry_dt, tp_amt=None, sl_amt=None):
         self.direction = direction          # "BUY" / "SELL"
         self.entry_price = entry_price
         self.entry_dt = entry_dt
+        # Fixed-bracket exits (total ₹, not per-lot). When set, step() uses ONLY this
+        # bracket (take-profit / stop-loss) and bypasses APPE + trailing-SL entirely.
+        self.tp_amt = tp_amt
+        self.sl_amt = sl_amt
         self.peak_price = entry_price        # for trailing SL
         if direction == "BUY":
             self.trailing_sl = round(entry_price * (1 - TRAILING_SL_PCT / 100), 2)
@@ -207,6 +217,25 @@ class Position:
         that moment); TRAILING_SL exits at the SL level. These are modeling choices —
         live's actual broker fill cannot be reproduced offline.
         """
+        # Tick-by-tick exits on unrealized ₹ (market-order model: exits at the crossing
+        # tick's ltp, so realized can slightly overshoot between ticks).
+        u = self.unrealized(ltp)
+        # Tight hard stop-loss — the "cheap exit" for false starts. Active whenever
+        # sl_amt is set: both in pure-bracket mode (tp_amt also set) and in STOP-ONLY
+        # mode (sl_amt set, tp_amt None) where APPE/trailing still let winners run.
+        # Checked first so a false start is cut at the fixed loss.
+        if self.sl_amt is not None and u <= -self.sl_amt:
+            return "SL", ltp
+        # Pure-bracket take-profit: when tp_amt is set, the bracket fully REPLACES
+        # APPE + trailing-SL (winners capped at tp_amt — no trend run-up).
+        if self.tp_amt is not None:
+            if u >= self.tp_amt:
+                return "TP", ltp
+            return None
+
+        # Default / STOP-ONLY mode: APPE fires first, then the (wide 0.5%) trailing-SL.
+        # These let a winner ride a trend, so a tight stop-only entry still captures the
+        # rare big move that pays for the cheap false starts (approach A).
         hit_sl = self.update_trailing(ltp)
         reason = self.appe_evaluate(ltp, now)
         if reason:
@@ -214,6 +243,17 @@ class Position:
         if hit_sl:
             return "TRAILING_SL", self.trailing_sl
         return None
+
+
+def efficiency_ratio(closes):
+    """Kaufman Efficiency Ratio = |net move| / |total path| over a close series, 0..1.
+    ~1 = clean trend, ~0 = round-trip chop. Used as a trend-regime gate (regime_scan.py
+    showed a ~60-min window @ >=0.65 cleanly separates trend days from chop)."""
+    if len(closes) < 2:
+        return 0.0
+    net = abs(closes[-1] - closes[0])
+    path = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
+    return net / path if path > 0 else 0.0
 
 
 def detect_signal(pf, ps, cf, cs, close, min_gap, slope9, vol_pass):
@@ -244,6 +284,15 @@ def simulate_day(ticks, cfg, use_vol_filter):
     rcp = cfg.get("reverse_confirm_pct", REVERSE_CONFIRM_PCT)
     early = cfg.get("early", False)             # detect cross intra-bar (no wait for close)
     gap_pts = cfg.get("gap_gate", -1.0)         # fixed-points gap gate; <0 → rcp*price (live)
+    # Fixed-bracket exit (per-lot → total ₹). When set, replaces APPE + trailing-SL.
+    _lots = QTY / LOT_SIZE
+    tp_amt = cfg["tp_per_lot"] * _lots if cfg.get("tp_per_lot") else None
+    sl_amt = cfg["sl_per_lot"] * _lots if cfg.get("sl_per_lot") else None
+    # Trend-regime gate: only allow NEW entries when the trailing-window Efficiency
+    # Ratio (on completed-bar closes) >= er_gate. None = no gate (trade every signal).
+    er_gate = cfg.get("er_gate")
+    er_bars = max(2, round(cfg.get("er_window_min", 60) / tf))
+    er_closes = deque(maxlen=er_bars + 1)
 
     # Real traded volume is available only when the capture carries a cumulative
     # "volume" field (Quote mode). LTP-only days fall back to a tick-count proxy.
@@ -310,6 +359,7 @@ def simulate_day(ticks, cfg, use_vol_filter):
         else:
             cur_vol = bar_ticks
         vol_series.append(cur_vol)
+        er_closes.append(bar_c)        # completed-bar closes for the trend-regime ER gate
         bars_done += 1
 
         # Need a prior EMA value and to be past warmup gate
@@ -370,13 +420,28 @@ def simulate_day(ticks, cfg, use_vol_filter):
             if sig:
                 pending_signal = sig
 
+        # ---- regime-TRIGGER entry (ER-gate mode) ----
+        # A crossover fires at a regime transition (ER still low); the trailing ER only
+        # confirms a trend ~window-length later, when no fresh cross exists. So in ER-gate
+        # mode we stop waiting for a cross: once ER >= gate and we're flat, enter in the
+        # CURRENT EMA-alignment direction (the lagged, confirmation-based entry the 45-min
+        # latency buys). Crossover-driven reverses below still close a flipped trend.
+        if (er_gate is not None and pos is None and ema_slow is not None
+                and bars_done >= warmup and len(er_closes) >= er_bars
+                and efficiency_ratio(list(er_closes)) >= er_gate):
+            pending_signal = "BUY" if ema_fast > ema_slow else "SELL"
+
         # ---- act on a pending signal (entry / reverse) at this tick ----
         if pending_signal is not None:
             if pos is not None and pos.direction != pending_signal:
                 close_trade(pos, ltp, dt, "REVERSE")
                 pos = None
-            if pos is None:
-                pos = Position(pending_signal, ltp, dt)
+            # Trend-regime gate: a reverse still CLOSES, but a new position only opens
+            # when the trailing-window ER confirms a trend (needs a full window first).
+            regime_ok = er_gate is None or (
+                len(er_closes) >= er_bars and efficiency_ratio(list(er_closes)) >= er_gate)
+            if pos is None and regime_ok:
+                pos = Position(pending_signal, ltp, dt, tp_amt=tp_amt, sl_amt=sl_amt)
             pending_signal = None
 
         # ---- per-tick exit evaluation (APPE-first, then trailing-SL — see step()) ----
@@ -429,7 +494,7 @@ def run(dates, configs):
             print(f"\n  --- {variant} {hdr} ---")
             agg = 0
             for date_str in dates:
-                ticks = load_ticks(date_str)
+                ticks = load_ticks(date_str, symbol=args.symbol)
                 if not ticks:
                     print(f"    {date_str}: no data")
                     continue
@@ -466,7 +531,26 @@ def main():
                     help="gap gate in POINTS (e.g. 17, 3, 0); <0 = use --reverse-confirm-pct fraction")
     ap.add_argument("--early-entry", action="store_true",
                     help="enter intra-bar the moment the gate passes, instead of waiting for candle close")
+    ap.add_argument("--tp-per-lot", type=float,
+                    help="fixed take-profit in ₹ per lot (total = per-lot × lots). "
+                         "When set, replaces APPE + trailing-SL with a pure TP/SL bracket.")
+    ap.add_argument("--sl-per-lot", type=float,
+                    help="fixed stop-loss in ₹ per lot (total = per-lot × lots). Use with --tp-per-lot.")
+    ap.add_argument("--er-gate", type=float,
+                    help="trend-regime gate: only enter when trailing-window Efficiency "
+                         "Ratio >= this (e.g. 0.65). Omit = no gate.")
+    ap.add_argument("--er-window-min", type=int, default=60,
+                    help="ER gate trailing window in minutes (default 60)")
+    ap.add_argument("--data-dir", default=None,
+                    help="override BACKTEST_DATA_DIR for this run (e.g. path to FNO captures)")
+    ap.add_argument("--symbol", default=None,
+                    help="filter ticks to this symbol name (required for multi-symbol capture "
+                         "files, e.g. --symbol BANKNIFTY from an FNO profile capture)")
     args = ap.parse_args()
+
+    if args.data_dir:
+        global DATA_DIR
+        DATA_DIR = Path(args.data_dir)
 
     if args.date:
         dates = [args.date]
@@ -474,7 +558,9 @@ def main():
         dates = sorted(p.name for p in DATA_DIR.iterdir() if p.is_dir())
 
     rcp = args.reverse_confirm_pct
-    common = {"reverse_confirm_pct": rcp, "gap_gate": args.gap_gate, "early": args.early_entry}
+    common = {"reverse_confirm_pct": rcp, "gap_gate": args.gap_gate, "early": args.early_entry,
+              "tp_per_lot": args.tp_per_lot, "sl_per_lot": args.sl_per_lot,
+              "er_gate": args.er_gate, "er_window_min": args.er_window_min}
     if args.tf and args.fast and args.slow:
         configs = [{"tf": args.tf, "fast": args.fast, "slow": args.slow,
                     "warmup": args.warmup,
@@ -487,10 +573,19 @@ def main():
 
     gap_desc = (f"{args.gap_gate:g} pts (fixed)" if args.gap_gate >= 0
                 else f"{rcp*100:.4f}% (~{rcp*57000:.0f} pts @57k)")
-    print(f"Data dir: {DATA_DIR} | days: {', '.join(dates)}")
-    print(f"QTY={QTY} | TSL {TRAILING_SL_PCT}%→{TIGHT_TSL_PCT}%@₹{TIGHT_TSL_THRESHOLD:.0f} | "
-          f"APPE arm ₹{PROFIT_ARM_THRESHOLD:.0f}, G={GIVEBACK_K:g}√peak | "
-          f"gap gate {gap_desc} | entry={'EARLY intra-bar' if args.early_entry else 'on-close'}")
+    _lots = QTY / LOT_SIZE
+    if args.tp_per_lot:
+        exit_desc = (f"BRACKET TP +₹{args.tp_per_lot:g}/lot (+₹{args.tp_per_lot*_lots:g}) / "
+                     f"SL −₹{args.sl_per_lot:g}/lot (−₹{args.sl_per_lot*_lots:g}) [APPE+TSL off]")
+    else:
+        exit_desc = (f"TSL {TRAILING_SL_PCT}%→{TIGHT_TSL_PCT}%@₹{TIGHT_TSL_THRESHOLD:.0f} | "
+                     f"APPE arm ₹{PROFIT_ARM_THRESHOLD:.0f}, G={GIVEBACK_K:g}√peak")
+    er_desc = (f" | ER-gate ≥{args.er_gate:g} over {args.er_window_min}min"
+               if args.er_gate is not None else "")
+    sym_desc = f" | symbol filter: {args.symbol}" if args.symbol else ""
+    print(f"Data dir: {DATA_DIR}{sym_desc} | days: {', '.join(dates)}")
+    print(f"QTY={QTY} ({_lots:g} lots) | {exit_desc} | "
+          f"gap gate {gap_desc} | entry={'EARLY intra-bar' if args.early_entry else 'on-close'}{er_desc}")
     run(dates, configs)
 
 

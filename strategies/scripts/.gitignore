@@ -7,6 +7,9 @@
 # Keep our strategy and tooling scripts
 !short_straddle_nifty.py
 !ema_crossover_banknifty.py
+!ema_regime_banknifty.py
+!regime_scan.py
+!fast_scan.py
 !capture_trade_data.py
 !backtest_offline.py
 !backtest_ticks.py
