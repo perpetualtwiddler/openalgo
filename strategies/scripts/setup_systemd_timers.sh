@@ -112,15 +112,53 @@ Unit=openalgo-capture-trade-data.service
 WantedBy=timers.target
 EOF
 
+# --- Timer 3: daily EMA-options backtest eval -> options_history.csv ---------
+# Why: after the close, replay the day's captured ticks through all EMA-option
+# variants and append one history row per option to options_history.csv — a
+# hands-off multi-day/regime record. Reads the recorder's
+# market_data_capture/<date>/normalized_market_data.jsonl (complete by ~15:15
+# when the EMA strategy unsubscribes); no broker calls, no API key. Date defaults
+# to today (IST) inside backtest_ema_dev.py; the CSV append is idempotent per date.
+# 15:45 IST = a margin past the 15:35 trade-data capture and the 15:30 close.
+
+cat > /etc/systemd/system/openalgo-backtest-eval.service << EOF
+[Unit]
+Description=Daily EMA-options backtest eval (append per-option results to options_history.csv)
+After=openalgo.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=$INSTALL_DIR/strategies/scripts
+Environment=BACKTEST_DATA_DIR=$INSTALL_DIR/log/market_data_capture
+Environment=TZ=Asia/Kolkata
+ExecStart=$INSTALL_DIR/.venv/bin/python $INSTALL_DIR/strategies/scripts/backtest_ema_dev.py --csv $INSTALL_DIR/strategies/scripts/options_history.csv
+StandardOutput=append:$INSTALL_DIR/log/backtest_eval.log
+StandardError=append:$INSTALL_DIR/log/backtest_eval.log
+EOF
+
+cat > /etc/systemd/system/openalgo-backtest-eval.timer << 'EOF'
+[Unit]
+Description=Run the EMA-options backtest eval at 15:45 IST Mon-Fri (post-close, post-capture)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:45:00 Asia/Kolkata
+Persistent=false
+Unit=openalgo-backtest-eval.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 # --- Reload + enable --------------------------------------------------------
 
 systemctl daemon-reload
 systemctl enable --now openalgo-restart.timer
 systemctl enable --now openalgo-capture-trade-data.timer
+systemctl enable --now openalgo-backtest-eval.timer
 
 echo ""
-echo "Both timers enabled. Next scheduled runs:"
-systemctl list-timers openalgo-restart.timer openalgo-capture-trade-data.timer --no-pager
+echo "Timers enabled. Next scheduled runs:"
+systemctl list-timers openalgo-restart.timer openalgo-capture-trade-data.timer openalgo-backtest-eval.timer --no-pager
 
 echo ""
 echo "Useful commands:"
@@ -128,3 +166,5 @@ echo "  systemctl list-timers --no-pager"
 echo "  journalctl -u openalgo-restart.service --since today --no-pager"
 echo "  journalctl -u openalgo-capture-trade-data.service --since today --no-pager"
 echo "  systemctl start openalgo-capture-trade-data.service  # manual on-demand capture"
+echo "  systemctl start openalgo-backtest-eval.service       # manual on-demand eval"
+echo "  tail -n 40 $INSTALL_DIR/log/backtest_eval.log        # daily eval output"

@@ -25,6 +25,7 @@ import csv
 import os
 import sys
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -209,7 +210,7 @@ def main():
             csv_path = argv[i + 1]; del argv[i:i + 2]
         else:
             csv_path = "options_history.csv"; del argv[i:i + 1]
-    date = next((a for a in argv if not a.startswith("--")), "2026-06-16")
+    date = next((a for a in argv if not a.startswith("--")), datetime.now(bt.IST).strftime("%Y-%m-%d"))
     ticks = bt.load_ticks(date)
     print(f"date={date} | ticks={len(ticks)} | QTY={bt.QTY} | DATA_DIR={bt.DATA_DIR}")
     if not ticks:
