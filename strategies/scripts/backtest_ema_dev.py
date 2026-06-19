@@ -21,6 +21,7 @@ Usage:  BACKTEST_DATA_DIR=/root/data/openalgo/log/market_data_capture \
 NOTE: single-day tick capture means EMAs COLD-START (no prior-day warmup like
 live's LOOKBACK_DAYS=3) — early-day signals are unreliable; treat as directional.
 """
+import csv
 import os
 import sys
 from collections import deque
@@ -199,11 +200,23 @@ VARIATIONS = [
 
 
 def main():
-    date = sys.argv[1] if len(sys.argv) > 1 else "2026-06-16"
+    # args: positional date (default 2026-06-16) + optional "--csv [path]" to append a history row per option
+    argv = sys.argv[1:]
+    csv_path = None
+    if "--csv" in argv:
+        i = argv.index("--csv")
+        if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+            csv_path = argv[i + 1]; del argv[i:i + 2]
+        else:
+            csv_path = "options_history.csv"; del argv[i:i + 1]
+    date = next((a for a in argv if not a.startswith("--")), "2026-06-16")
     ticks = bt.load_ticks(date)
     print(f"date={date} | ticks={len(ticks)} | QTY={bt.QTY} | DATA_DIR={bt.DATA_DIR}")
     if not ticks:
         print("NO DATA"); return
+    ltps = [t[2] for t in ticks]
+    rng_pct = (max(ltps) - min(ltps)) / ltps[0] * 100 if ltps and ltps[0] else 0.0
+    regime = "chop" if rng_pct < 0.8 else ("trend" if rng_pct > 1.5 else "mixed")  # day-range heuristic
     # Optional gap-gate override (all variations). The live default 0.03% is
     # calibrated for 5m; faster timeframes have thinner cross-gaps, so set a
     # lower RCP to exercise/compare them (e.g. RCP=0.00012 ~= 0.012%).
@@ -236,7 +249,7 @@ def main():
         set_globals(tsl, arm)
         trades = bt.simulate_day(ticks, cfg, not no_vol)[0] if kind == "single" else simulate_mtf(ticks, cfg)
         total, n, w, l, reasons = summarize(trades)
-        rows.append((label, cfg, tsl, arm, total, n, w, l, reasons))
+        rows.append((label, cfg, tsl, arm, total, n, w, l, reasons, tsl_mode))
         armv = arm * (bt.QTY / bt.LOT_SIZE)
         floor = cfg.get("atr_floor", 0.0)
         tsl_str = (f"ATR×{bt.ATR_MULT}" + (f"≥{floor:.0f}pt" if floor else "")) if tsl_mode == "atr" else f"{tsl}%"
@@ -247,9 +260,35 @@ def main():
         print(f"      exits: {reasons}")
     print(f"\n{'='*74}\n  COMPARISON — {date} (1 day, cold-start EMAs → DIRECTIONAL only)\n{'='*74}")
     print(f"  {'variation':<26}{'P&L ₹':>11}{'trades':>8}{'W':>4}{'L':>4}  exits")
-    for label, cfg, tsl, arm, total, n, w, l, reasons in rows:
+    for label, cfg, tsl, arm, total, n, w, l, reasons, _tm in rows:
         ex = ",".join(f"{k}:{v}" for k, v in reasons.items())
         print(f"  {label:<26}{total:>+11,.0f}{n:>8}{w:>4}{l:>4}  {ex}")
+
+    # --csv: append one history row per option (idempotent — skips a date already present)
+    if csv_path:
+        cols = ["date", "regime", "option", "tf", "ema", "gap_pct", "slope_bars", "vol_sma",
+                "tsl", "arm", "trades", "W", "L", "pnl", "exits", "notes"]
+        existing = set()
+        if os.path.exists(csv_path):
+            with open(csv_path, newline="") as f:
+                existing = {r.get("date") for r in csv.DictReader(f)}
+        if date in existing:
+            print(f"\n  [CSV] {date} already in {csv_path} — not appending (avoid dups)")
+        else:
+            new_file = not os.path.exists(csv_path)
+            with open(csv_path, "a", newline="") as f:
+                wri = csv.writer(f)
+                if new_file:
+                    wri.writerow(cols)
+                for label, cfg, tsl, arm, total, n, w, l, reasons, tm in rows:
+                    floor = cfg.get("atr_floor", 0.0)
+                    tsl_desc = (f"ATR{bt.ATR_MULT:g}x" + (f">={floor:.0f}pt" if floor else "")) if tm == "atr" else f"{tsl:g}%"
+                    ex = ";".join(f"{k}:{v}" for k, v in reasons.items())
+                    wri.writerow([date, regime, label, f"{cfg['tf']}m", f"{cfg['fast']}/{cfg['slow']}",
+                                  f"{cfg['reverse_confirm_pct']*100:.3f}", cfg.get("slope_bars", 1),
+                                  cfg["vol_sma"], tsl_desc, f"{arm*(bt.QTY/bt.LOT_SIZE):.0f}",
+                                  n, w, l, f"{total:.0f}", ex, ""])
+            print(f"\n  [CSV] appended {len(rows)} rows for {date} (regime={regime}, range {rng_pct:.2f}%) -> {csv_path}")
 
 
 if __name__ == "__main__":

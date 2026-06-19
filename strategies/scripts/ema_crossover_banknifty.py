@@ -121,6 +121,10 @@ FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
 # Re-emit the STALE ERROR line every N seconds while ticks are still missing, so the warning
 # does not get buried under hours of [SIGNAL CHECK] noise in long-running logs.
 FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
+# Feed watchdog: if the WS delivered ticks this run then goes SILENT this long, force a WS
+# reconnect (the silent mid-session stall raises no exception, so the normal reconnect never
+# fires). 0 disables. Should be > FEED_STALE_SEC so the health-guard warns first.
+WS_WATCHDOG_SEC = float(os.getenv("WS_WATCHDOG_SEC", "120"))
 
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
@@ -168,6 +172,9 @@ class EMACrossoverBot:
         self.trailing_sl = 0.0
         self.peak_price = 0.0      # tracks best price for trailing SL
         self.atr = None            # latest ATR(ATR_PERIOD) in points (completed candle); ATR-TSL mode
+        self._last_signal_msg = None  # de-dup [SIGNAL CHECK] log: only emit when content changes
+        self._candle_seq = 0          # per-run candle counter (logged as #N to differentiate candles)
+        self._candle_marker = None    # detects a new completed candle (its EMAs change at close)
         self.ltp = None
         self.exit_in_progress = False
         self.entry_pending = False
@@ -200,8 +207,8 @@ class EMACrossoverBot:
         log(f"[INIT] {STRATEGY_NAME}")
         log(f"[INIT] {self.symbol} on {EXCHANGE} | EMA({FAST_EMA}/{SLOW_EMA}) | {CANDLE_TIMEFRAME}")
         log(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
-        log(f"[INIT] Signal gate (entry & reverse): cross + |EMA9−EMA21|≥{REVERSE_CONFIRM_PCT*100:.2f}% "
-              f"+ close vs EMA9 + EMA9 slope + volume")
+        log(f"[INIT] Signal gate (entry & reverse): cross + |EMA{FAST_EMA}−EMA{SLOW_EMA}|≥{REVERSE_CONFIRM_PCT*100:.2f}% "
+              f"+ close vs EMA{FAST_EMA} + EMA{FAST_EMA} slope({SLOPE_BARS}b) + volume")
         if TSL_MODE == "atr":
             log(f"[INIT] Trailing SL: ATR mode — {ATR_MULT}× ATR({ATR_PERIOD}) on {CANDLE_TIMEFRAME} "
                 f"(dynamic, ratchet-only) | Max daily loss: {MAX_LOSS_PER_DAY}")
@@ -527,6 +534,14 @@ class EMACrossoverBot:
                 log(f"[WS] Subscribed to {self.symbol} ({FEED_MODE} mode) — waiting for first tick (see [WS] FIRST TICK RECEIVED)...")
                 while not self.stop_event.is_set():
                     time.sleep(1)
+                    # Feed watchdog: a live feed that goes silent > WS_WATCHDOG_SEC is the mid-session
+                    # stall (no exception → normal reconnect never fires). Break to force a fresh
+                    # connect+resubscribe via the outer loop, self-healing the stall (preserves position).
+                    age = self._feed_age()
+                    if WS_WATCHDOG_SEC and self.ws_alive and age is not None and age > WS_WATCHDOG_SEC:
+                        log_error(f"[WS WATCHDOG] no ticks for {age:.0f}s (>{WS_WATCHDOG_SEC:.0f}s) after a live feed "
+                                  f"— forcing WS reconnect to self-heal the stall")
+                        break
             except Exception as e:
                 log_error(f"WebSocket connection error: {e}")
             finally:
@@ -593,6 +608,14 @@ class EMACrossoverBot:
         if TSL_MODE == "atr" and "atr" in df.columns:
             self.atr = float(last["atr"])
 
+        # Candle counter: bump when a new completed candle appears (its EMAs/close change at
+        # close — stable within a candle across intraday refetches). Logged as #N so consecutive
+        # candles are easy to tell apart during log analysis.
+        _marker = (last["ema_fast"], last["ema_slow"], last["close"])
+        if _marker != self._candle_marker:
+            self._candle_seq += 1
+            self._candle_marker = _marker
+
         # Crossover-noise gates (design doc §14/§16) — a bare cross isn't enough. A signal needs:
         #   1. the EMA cross (on the completed candle)
         #   2. a DECISIVE gap: |EMA9-EMA21| >= REVERSE_CONFIRM_PCT x close (~0.05% = ~28 BANKNIFTY pts)
@@ -607,12 +630,17 @@ class EMACrossoverBot:
 
         atr_str = (f" | ATR({ATR_PERIOD}): {self.atr:.0f} (TSL {ATR_MULT}×={ATR_MULT*self.atr:.0f}pt)"
                    if (TSL_MODE == "atr" and self.atr) else "")
-        log(
-            f"[SIGNAL CHECK] EMA({FAST_EMA}): {last['ema_fast']:.2f} | EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
-            f"gap: {gap:+.1f} (min ±{min_gap:.0f}) | close: {last['close']:.2f} | slope9: {slope9:+.1f} | "
+        sig_msg = (
+            f"[SIGNAL CHECK] #{self._candle_seq} | EMA({FAST_EMA}): {last['ema_fast']:.2f} | EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
+            f"gap: {gap:+.1f} (min ±{min_gap:.0f}) | close: {last['close']:.2f} | slope({SLOPE_BARS}b): {slope9:+.1f} | "
             f"Vol: {last['volume']:.0f} vs {VOLUME_FILTER_MULT}x SMA: {last['vol_sma'] * VOLUME_FILTER_MULT:.0f} | "
             f"Vol OK: {vol_ok}{atr_str}"
         )
+        # De-dup: only emit when the line content changes (new candle / volume / Vol-OK / ATR).
+        # Avoids dozens of identical lines per candle so a crossover is easy to spot.
+        if sig_msg != self._last_signal_msg:
+            log(sig_msg)
+            self._last_signal_msg = sig_msg
 
         # Crossover detection with optional N-candle confirmation window (CROSS_CONFIRM_BARS).
         # Default 0 = cross must be on the completed candle (original §16 behaviour). With N>0, scan
