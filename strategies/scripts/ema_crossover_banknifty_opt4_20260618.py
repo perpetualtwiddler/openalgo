@@ -122,6 +122,12 @@ FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
 # Re-emit the STALE ERROR line every N seconds while ticks are still missing, so the warning
 # does not get buried under hours of [SIGNAL CHECK] noise in long-running logs.
 FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
+# Startup grace: before the FIRST tick ever, suppress the STALE warning for this long so the
+# normal pre-first-tick window (tick #1 usually lands 1-4s after subscribe) does not trip a
+# spurious "no ticks yet, >Ns" ERROR. Entry-blocking is unaffected (gated on _feed_ok(), which
+# stays strict). A genuinely dead feed still flags once this elapses with ws_alive False;
+# mid-session stalls (ws_alive already True) bypass the grace and warn immediately.
+FEED_STARTUP_GRACE_SEC = float(os.getenv("FEED_STARTUP_GRACE_SEC", "30"))
 # Feed watchdog: if the WS delivered ticks this run then goes SILENT this long, force a WS
 # reconnect (the silent mid-session stall raises no exception, so the normal reconnect never
 # fires). 0 disables. Should be > FEED_STALE_SEC so the health-guard warns first.
@@ -194,6 +200,7 @@ class EMACrossoverBot:
         self.appe_breach_start = None  # time.monotonic() when the floor breach began
         self.pnl_window = deque()      # (monotonic_ts, unrealized) over TREND_WINDOW_SEC
         self.last_tick_ts = None       # time.monotonic() of last on_ltp_update (feed-health)
+        self.start_ts = time.monotonic()  # run start — anchors the feed STALE startup grace
         self.feed_stale = False        # True while the WS tick feed is stale
         self.shadow_reverse = None     # §14 reverse-confirm SHADOW (log-only); set on a reverse exit
         self.last_stale_warn_ts = 0.0  # time.monotonic() of last STALE log (rate-limits re-warns)
@@ -390,6 +397,14 @@ class EMACrossoverBot:
         logs (a one-shot log line gets buried under hours of [SIGNAL CHECK] output).
         """
         if self._feed_ok():
+            return
+        # Startup grace: before the first tick EVER, give the WS pipeline a moment to deliver
+        # tick #1 (normally 1-4s post-subscribe) before crying STALE — otherwise the first
+        # health check fires a spurious "no ticks yet, >Ns" ERROR in the normal pre-first-tick
+        # window (entries are already blocked by _feed_ok(), so this is log-only noise). A truly
+        # dead feed still flags once the grace elapses (ws_alive stays False); a mid-session
+        # stall (ws_alive already True) bypasses the grace and warns immediately.
+        if not self.ws_alive and (time.monotonic() - self.start_ts) < FEED_STARTUP_GRACE_SEC:
             return
         now = time.monotonic()
         if self.feed_stale and (now - self.last_stale_warn_ts) < FEED_STALE_REWARN_SEC:
@@ -657,27 +672,27 @@ class EMACrossoverBot:
             if _p["ema_fast"] >= _p["ema_slow"] and _c["ema_fast"] < _c["ema_slow"]:
                 bear_cross = True; break          # most-recent cross is bearish
 
-        # Bullish: cross + decisive gap + close above EMA9 + EMA9 rising + volume
+        # Bullish: cross + decisive gap + close above fast EMA + fast EMA rising + volume
         if bull_cross and TRADE_DIRECTION in ("LONG", "BOTH"):
             fails = []
             if gap < min_gap:                 fails.append(f"thin gap {gap:.1f}<{min_gap:.0f}")
-            if last["close"] <= last["ema_fast"]: fails.append("close≤EMA9")
-            if slope9 <= 0:                   fails.append(f"EMA9 slope {slope9:+.1f}≤0")
+            if last["close"] <= last["ema_fast"]: fails.append(f"close≤EMA{FAST_EMA}")
+            if slope9 <= 0:                   fails.append(f"EMA{FAST_EMA} slope {slope9:+.1f}≤0")
             if not vol_ok:                    fails.append("volume")
             if not fails:
-                log("[SIGNAL] BUY — cross + gap≥0.05% + close>EMA9 + EMA9 rising + volume")
+                log(f"[SIGNAL] BUY — cross + gap≥{REVERSE_CONFIRM_PCT*100:.2f}% + close>EMA{FAST_EMA} + EMA{FAST_EMA} rising + volume")
                 return "BUY"
             log(f"[SIGNAL] BUY crossover REJECTED — {', '.join(fails)}")
 
-        # Bearish: cross + decisive gap + close below EMA9 + EMA9 falling + volume
+        # Bearish: cross + decisive gap + close below fast EMA + fast EMA falling + volume
         if bear_cross and TRADE_DIRECTION in ("SHORT", "BOTH"):
             fails = []
             if -gap < min_gap:                fails.append(f"thin gap {gap:.1f}, |gap|<{min_gap:.0f}")
-            if last["close"] >= last["ema_fast"]: fails.append("close≥EMA9")
-            if slope9 >= 0:                   fails.append(f"EMA9 slope {slope9:+.1f}≥0")
+            if last["close"] >= last["ema_fast"]: fails.append(f"close≥EMA{FAST_EMA}")
+            if slope9 >= 0:                   fails.append(f"EMA{FAST_EMA} slope {slope9:+.1f}≥0")
             if not vol_ok:                    fails.append("volume")
             if not fails:
-                log("[SIGNAL] SELL — cross + gap≥0.05% + close<EMA9 + EMA9 falling + volume")
+                log(f"[SIGNAL] SELL — cross + gap≥{REVERSE_CONFIRM_PCT*100:.2f}% + close<EMA{FAST_EMA} + EMA{FAST_EMA} falling + volume")
                 return "SELL"
             log(f"[SIGNAL] SELL crossover REJECTED — {', '.join(fails)}")
 
