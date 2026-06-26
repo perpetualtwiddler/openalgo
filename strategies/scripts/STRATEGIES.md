@@ -102,6 +102,42 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 - State: `/root/data/openalgo/strategies/state/EMA_9_21_BANKNIFTY_state.json`
 - Logs: `/root/data/openalgo/log/strategies/ema_crossover_banknifty_*.log`
 
+### EMA Variations Under Comparison (5 options)
+
+Section 2 above describes the **original** 5m strategy. Live-deployment history: original 5m (Opt 5)
+→ **3m Option 1** on 2026-06-17 → **3m Option 4 (CURRENT ACTIVE) on 2026-06-18**
+(`ema_crossover_banknifty_opt4_20260618.py`). Options 1/2/3/5 are descheduled/backtest references
+(kept for rollback); they're compared on captured tick data via `backtest_ema_dev.py`. The table
+lists only the differences — all 5 share the same rule framework below.
+
+**Shared across all 5** (constant): entry = EMA cross + decisive **gap** + **close** on the signal
+side of the fast EMA + **fast-EMA slope** in-direction + **volume > 1.5×SMA**; the same gate drives
+reverse-exits; **APPE** profit-protect with size-aware give-back `G = 30·√peak·√(units/2)`; EOD
+square-off 15:14; **daily breaker ₹5,000**; **QTY 60** (2 lots × 30); `FEED_MODE=quote`.
+
+| # | Status | Entry TF | Trend filter | EMA | Gap gate | EMA-slope check | Volume SMA | Trailing SL | APPE arm |
+|---|--------|----------|--------------|-----|----------|-----------------|------------|-------------|----------|
+| **1** | was live 06-17→06-18, now descheduled | 3m | — | 9/21 | 0.01% (~6pt) | EMA9 now > EMA9 3 bars ago | SMA(10) ≈30min | **1.5×ATR(14)** | ₹4,000 (₹2k/lot) |
+| 2 | backtest candidate | 2m | EMA9>EMA21 on 5m | 9/21 | 0.01% | EMA9 now > EMA9 3 bars ago | SMA(15) ≈30min | 1.5×ATR(14) | ₹4,000 (₹2k/lot) |
+| 3 | backtest candidate | 2m | — | 9/21 | 0.01% | EMA9 now > EMA9 3 bars ago | SMA(15) ≈30min | 1.5×ATR(14) | ₹2,000 (₹1k/lot) |
+| **4** | **🟢 LIVE — CURRENT ACTIVE (2026-06-18)** | 3m | — | **7/15** | 0.01% | EMA7 now > EMA7 3 bars ago | SMA(10) ≈30min | **1.5×ATR(14)** (pure, no floor) | ₹4,000 (₹2k/lot) |
+| 5 | original (descheduled 2026-06-17) | 5m | — | 9/21 | 0.03% (~17pt) | EMA9 now > EMA9 1 bar ago | SMA(20) ≈100min | static 0.5% | ₹8,000 (₹4k/lot) |
+
+- **ATR trailing stop** (Options 1–4) = Wilder ATR(14) on the entry timeframe, distance =
+  `ATR_MULT×ATR` (ratchet-only), **pure (no floor)** for all. A 100-pt floor (`ATR_FLOOR_PTS`) was
+  trialled on Option 4 then **removed (2026-06-18)** — a floor sweep on the captured chop days showed
+  it strictly worse (a wider stop just enlarges whipsaw losses when there's no trend to ride). The
+  `ATR_FLOOR_PTS` knob is retained (default 0/off). See `ADAPTIVE_PROFIT_EXIT_DESIGN.md` §17.
+- **Crossover confirmation window** — Options 1/2/3/5 enter only on the *cross candle* (decisive gap
+  required at the cross). **Option 4** adds a **2-candle window** (`cross_confirm_bars=2`): a cross
+  stays eligible for up to 2 candles after it, so a thin cross that turns decisive a candle or two
+  later still trades — at the cost of re-admitting whipsaw risk (on the choppy 06-18 it took 2 such
+  whipsaw losers while the others stayed flat). See `ADAPTIVE_PROFIT_EXIT_DESIGN.md` §18.
+- **Run the comparison:** `BACKTEST_DATA_DIR=/root/data/openalgo/log/market_data_capture \`
+  `.venv/bin/python strategies/scripts/backtest_ema_dev.py <YYYY-MM-DD>` → one table, all 5 rows
+  (baseline immune to env overrides). ⚠ Single-day, cold-start EMAs → directional only; needs a
+  trending captured day for a real verdict (the quiet 06-16/06-17 days gave ~0 trades for all).
+
 ---
 
 ## Capital Allocation

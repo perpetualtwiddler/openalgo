@@ -53,6 +53,13 @@ TRAILING_SL_PCT = 0.5
 TIGHT_TSL_THRESHOLD = 5000.0
 TIGHT_TSL_PCT = 0.25
 TIGHT_TSL_ENABLED = False  # mirror live default (gated off): TSL stays flat 0.5%
+# Dynamic ATR-based trailing stop (mirror live ema_crossover_banknifty.py):
+# TSL_MODE="atr" -> trailing distance = ATR_MULT x ATR(ATR_PERIOD) in POINTS
+# (volatility-proportional, recomputed each completed bar); "percent" -> classic % of price.
+TSL_MODE = os.getenv("TSL_MODE", "percent").strip().lower()   # "percent" | "atr"
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ATR_MULT = float(os.getenv("ATR_MULT", "1.5"))
+ATR_FLOOR_PTS = float(os.getenv("ATR_FLOOR_PTS", "0"))   # ATR-mode floor: dist = max(ATR_MULT*ATR, this)
 APPE_ENABLED = True
 ARM_PER_LOT = 4000.0  # mirror live "HAVRATPANA" tuning (lowered from 5000)
 PROFIT_ARM_THRESHOLD = ARM_PER_LOT * (QTY / LOT_SIZE)  # ₹8,000 at 60 qty
@@ -105,7 +112,7 @@ def load_ticks(date_str, symbol=None):
 # APPE — faithful port of ema_crossover_banknifty.py::_appe_evaluate
 # =============================================================================
 class Position:
-    def __init__(self, direction, entry_price, entry_dt, tp_amt=None, sl_amt=None):
+    def __init__(self, direction, entry_price, entry_dt, tp_amt=None, sl_amt=None, entry_atr=None):
         self.direction = direction          # "BUY" / "SELL"
         self.entry_price = entry_price
         self.entry_dt = entry_dt
@@ -114,10 +121,11 @@ class Position:
         self.tp_amt = tp_amt
         self.sl_amt = sl_amt
         self.peak_price = entry_price        # for trailing SL
+        self.trail_atr = entry_atr           # latest ATR(points); set per-bar by simulate_day
         if direction == "BUY":
-            self.trailing_sl = round(entry_price * (1 - TRAILING_SL_PCT / 100), 2)
+            self.trailing_sl = round(entry_price - self._dist(0.0), 2)
         else:
-            self.trailing_sl = round(entry_price * (1 + TRAILING_SL_PCT / 100), 2)
+            self.trailing_sl = round(entry_price + self._dist(0.0), 2)
         # MFE tracking (max favorable excursion in points from entry)
         self.mfe_pts = 0.0
         # APPE state
@@ -131,30 +139,37 @@ class Position:
             return (ltp - self.entry_price) * QTY
         return (self.entry_price - ltp) * QTY
 
+    def _dist(self, u):
+        """Trailing-stop distance in POINTS from peak. ATR mode = ATR_MULT × ATR (vol-prop);
+        percent mode = peak_price × pct/100 (TIGHT-aware). Falls back to percent if no ATR yet."""
+        if TSL_MODE == "atr" and self.trail_atr and self.trail_atr > 0:
+            return max(ATR_MULT * self.trail_atr, ATR_FLOOR_PTS)
+        pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
+        return self.peak_price * pct / 100.0
+
     def update_trailing(self, ltp, tsl_pct=None):
-        """Update TSL; tsl_pct overrides TRAILING_SL_PCT when provided (e.g. ER-contingent mode)."""
+        """Update TSL; tsl_pct (ER-contingent mode) overrides _dist() when provided.
+        Ratchet-only — never loosens. Returns True if SL hit at this tick."""
         u = self.unrealized(ltp)
         if self.direction == "BUY":
             if ltp > self.peak_price:
                 self.peak_price = ltp
-                if tsl_pct is not None:
-                    pct = tsl_pct
-                else:
-                    pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
-                new = round(self.peak_price * (1 - pct / 100), 2)
-                if new > self.trailing_sl:
-                    self.trailing_sl = new
+            if tsl_pct is not None:
+                new = round(self.peak_price * (1 - tsl_pct / 100), 2)
+            else:
+                new = round(self.peak_price - self._dist(u), 2)
+            if new > self.trailing_sl:
+                self.trailing_sl = new
             return ltp <= self.trailing_sl
         else:
             if ltp < self.peak_price:
                 self.peak_price = ltp
-                if tsl_pct is not None:
-                    pct = tsl_pct
-                else:
-                    pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
-                new = round(self.peak_price * (1 + pct / 100), 2)
-                if new < self.trailing_sl:
-                    self.trailing_sl = new
+            if tsl_pct is not None:
+                new = round(self.peak_price * (1 + tsl_pct / 100), 2)
+            else:
+                new = round(self.peak_price + self._dist(u), 2)
+            if new < self.trailing_sl:
+                self.trailing_sl = new
             return ltp >= self.trailing_sl
 
     def update_mfe(self, ltp):
@@ -361,6 +376,13 @@ def simulate_day(ticks, cfg, use_vol_filter):
     bars_done = 0                 # completed bars this day
     ema_fast = ema_slow = None
     prev_fast = prev_slow = None
+    slope_bars = cfg.get("slope_bars", 1)            # EMA9 slope lookback in bars (1 = candle-over-candle)
+    ema_fast_hist = deque(maxlen=slope_bars + 1)     # recent EMA9 values for the slope check
+    cross_confirm_bars = cfg.get("cross_confirm_bars", 0)  # extra candles after a cross to still allow entry (0 = cross candle only)
+    cross_dir = 0                 # armed cross direction: +1 bull / -1 bear / 0 none
+    cross_age = 0                 # completed bars since the armed cross (0 = the cross candle)
+    atr = None                    # Wilder ATR(ATR_PERIOD) in points (per completed bar)
+    prev_bar_close = None         # previous completed bar's close (for True Range)
     vol_series = deque(maxlen=vol_sma_n)  # per-bar volume (real) or tick-count (proxy)
 
     pending_signal = None         # "BUY"/"SELL" to act on next tick
@@ -394,13 +416,22 @@ def simulate_day(ticks, cfg, use_vol_filter):
     def finalize_bar():
         """Called when a bar completes; updates EMAs + detects crossover."""
         nonlocal ema_fast, ema_slow, prev_fast, prev_slow, bars_done
-        nonlocal pending_signal, prev_bar_cum_vol
+        nonlocal pending_signal, prev_bar_cum_vol, atr, prev_bar_close, cross_dir, cross_age
         prev_fast, prev_slow = ema_fast, ema_slow
         if ema_fast is None:
             ema_fast, ema_slow = bar_c, bar_c
         else:
             ema_fast = fast_a * bar_c + (1 - fast_a) * ema_fast
             ema_slow = slow_a * bar_c + (1 - slow_a) * ema_slow
+
+        # Wilder ATR (adjust=False ewm, seed = first TR) — matches live's
+        # tr.ewm(alpha=1/period, adjust=False).mean(). TR uses this bar's H/L and
+        # the previous bar's close. Only meaningful past warmup (positions open later).
+        tr = (bar_h - bar_l) if prev_bar_close is None else max(
+            bar_h - bar_l, abs(bar_h - prev_bar_close), abs(bar_l - prev_bar_close))
+        atr = tr if atr is None else atr + (tr - atr) / ATR_PERIOD
+        prev_bar_close = bar_c
+        ema_fast_hist.append(ema_fast)               # for the slope_bars-bar EMA9 slope
 
         # Per-bar volume: diff cumulative quote volume across the bar boundary;
         # fall back to tick-count when no real volume exists.
@@ -418,13 +449,40 @@ def simulate_day(ticks, cfg, use_vol_filter):
         if prev_fast is None or bars_done < warmup:
             return
 
+        # (early mode detects the cross intra-bar in the tick loop below — skip the close gate)
         if early:
-            return  # early mode detects the cross intra-bar (in the tick loop), not on close
-        # Close-confirmed entry gate on the just-closed bar.
-        sig = detect_signal(prev_fast, prev_slow, ema_fast, ema_slow, bar_c,
-                            gate_min(bar_c), ema_fast - prev_fast, vol_ok_for(cur_vol))
-        if sig:
-            pending_signal = sig
+            return
+
+        # Close-confirmed entry gate on the just-closed bar. Combines Dinesh's gate_min
+        # (fixed --gap-gate in points, else rcp*price) + vol_ok_for, with the slope_bars-bar
+        # EMA slope and an optional N-candle confirmation window (cross_confirm_bars). At the
+        # defaults (cross_confirm_bars=0, slope_bars=1) this is identical to detect_signal()
+        # (entry only on the cross candle); detect_signal() still drives the early-entry mode.
+        gap = ema_fast - ema_slow
+        min_gap = gate_min(bar_c)
+        slope_ref = ema_fast_hist[0] if len(ema_fast_hist) > slope_bars else prev_fast
+        slope9 = ema_fast - slope_ref                # EMA9 now vs slope_bars bars ago
+        vol_pass = vol_ok_for(cur_vol)
+        bull_cross = prev_fast <= prev_slow and ema_fast > ema_slow
+        bear_cross = prev_fast >= prev_slow and ema_fast < ema_slow
+
+        if bull_cross:
+            cross_dir, cross_age = 1, 0
+        elif bear_cross:
+            cross_dir, cross_age = -1, 0
+        elif cross_dir != 0:
+            cross_age += 1
+        if cross_dir == 1 and ema_fast <= ema_slow:      # bull cross negated (EMAs flipped back)
+            cross_dir = 0
+        elif cross_dir == -1 and ema_fast >= ema_slow:   # bear cross negated
+            cross_dir = 0
+        if cross_dir != 0 and cross_age > cross_confirm_bars:   # window expired
+            cross_dir = 0
+
+        if cross_dir == 1 and gap >= min_gap and bar_c > ema_fast and slope9 > 0 and vol_pass:
+            pending_signal = "BUY"; cross_dir = 0
+        elif cross_dir == -1 and -gap >= min_gap and bar_c < ema_fast and slope9 < 0 and vol_pass:
+            pending_signal = "SELL"; cross_dir = 0
 
     for t_sec, dt, ltp, cum_vol in ticks:
         # ---- EOD square-off ----
@@ -516,11 +574,12 @@ def simulate_day(ticks, cfg, use_vol_filter):
             regime_ok = er_gate is None or (
                 len(er_closes) >= er_bars and efficiency_ratio(list(er_closes)) >= er_gate)
             if pos is None and regime_ok:
-                pos = Position(pending_signal, ltp, dt, tp_amt=tp_amt, sl_amt=sl_amt)
+                pos = Position(pending_signal, ltp, dt, tp_amt=tp_amt, sl_amt=sl_amt, entry_atr=atr)
             pending_signal = None
 
         # ---- per-tick exit evaluation ----
         if pos is not None:
+            pos.trail_atr = atr  # keep ATR current so _dist() uses the latest value
             if er_dynamic and er_exit is not None:
                 # MFE-dynamic bar-close mode: track peak silently per tick.
                 # The exit itself is bar-close-only (handled above); no intra-bar TSL — avoids

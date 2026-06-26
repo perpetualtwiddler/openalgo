@@ -772,6 +772,107 @@ So ₹10k is the *worst* spot, and the breaker can't be tuned until the flip beh
 
 ---
 
+## 17. Dynamic ATR-based trailing stop (TSL tuning)
+
+**Idea.** Replace the fixed-percent trailing stop with one proportional to recent
+volatility. Instead of "always trail 0.5%", trail a multiple of ATR:
+
+```
+TSL distance (points) = ATR_MULT × ATR(ATR_PERIOD)        # default 1.5 × ATR(14)
+long  stop = max(prev_stop, peak_price  − dist)            # ratchet up only
+short stop = min(prev_stop, trough_price + dist)            # ratchet down only
+```
+
+**ATR** = Wilder's RMA of True Range over `ATR_PERIOD` candles **on the strategy
+timeframe** (so on a 3-min chart, ATR(14) = 42 min of recent range).
+`TR = max(high−low, |high−prev_close|, |low−prev_close|)`. Implemented as
+`tr.ewm(alpha=1/period, adjust=False).mean()` (seed = first TR) live, and the
+equivalent recursive `atr += (tr−atr)/period` in the tick engine — identical series.
+
+**Why.** A fixed % ignores the volatility regime: 0.5% is ~287 pts at 57k whether the
+day is dead-flat or whipsawing. ATR adapts — wide stops on volatile days (don't get
+shaken out of a good trend), tight stops on quiet days (lock profit, don't bleed).
+
+**Ratchet (never loosen).** The stop only moves toward price. An ATR *contraction*
+tightens it (good — locks more as things calm); an ATR *expansion* does **not** loosen
+an already-tightened stop (the `max/min` guard). So the volatility benefit comes from a
+high ATR **at/near entry** setting a wide initial distance — not from re-widening
+mid-trade. (A mid-trade re-widening variant was considered and rejected: a trailing stop
+that backs away from price violates the ratchet and can give back more than budgeted.)
+
+**Config (env).** `TSL_MODE` = `percent` (default, unchanged live behaviour) | `atr`;
+`ATR_PERIOD=14`; `ATR_MULT=1.5`. **Default OFF** — gated like TIGHT_TSL pending validation.
+
+**Floored variant (`ATR_FLOOR_PTS`, added 2026-06-18).** ATR-mode distance becomes
+`max(ATR_MULT×ATR, ATR_FLOOR_PTS)` — a hard floor in points. Motivated by the magnitude table
+below (1.5×ATR is only ~50–80 pt on quiet days, ~3× tighter than the old 0.5%): a floor keeps the
+stop from being whip-tight when volatility collapses, while ATR still widens it on volatile days.
+Default `0` (off). Was trialled on **Option 4** (7/15 3m) with a 100-pt floor, then **removed
+(2026-06-18)**: a floor sweep across the captured chop days (06-16/17/18) found the floor strictly
+worse — wider stop just enlarges each whipsaw loss when there's no trend to ride (3-day P&L by floor:
+0pt=+487, 100pt=−9,876, 150pt=−20,832). Option 4 now uses **pure 1.5×ATR**. The knob is retained but
+unused (default 0). ⚠ The sweep is chop-only; the floor's real job is room on a *trending* day, so
+this isn't a verdict — just a reason not to add a floor on chop evidence. Not on any live strategy.
+
+**Interactions.** TIGHT_TSL is a percent-mode concept and is ignored in ATR mode. APPE is
+independent and still evaluated first (APPE give-back `G` ≠ the TSL distance). The daily
+breaker (§15) and per-trade risk (§10) coherence still apply — note a tight ATR stop
+implies a *smaller* per-trade loss, which interacts with the breaker math.
+
+**⚠ Empirical magnitude check (2026-06-16 captured ticks, BANKNIFTY future — a quiet 0.6%
+day).** 1.5×ATR(14) is **much tighter** than the current static stops in this regime:
+
+| timeframe | ATR(14) (last / median) | **1.5×ATR** (last / median) | static 0.5% | static 0.25% |
+|---|---|---|---|---|
+| 5m | 53 / 64 pt | **79 / 96 pt** | 287 pt | 143 pt |
+| 3m | 38 / 50 pt | **57 / 75 pt** | 287 pt | 143 pt |
+| 2m | 31 / 40 pt | **46 / 60 pt** | 287 pt | 143 pt |
+
+So on a quiet day the ATR stop is ~2.4–3.6× tighter than 0.5% → **more / earlier
+stop-outs**. On a volatile day ATR rises (e.g. ATR 250 → 1.5× = 375 pt), so the stop
+widens as intended. Net P&L effect is therefore regime-dependent and **unproven** — must
+be validated on captured *trending + volatile* days before enabling live. Demonstration on
+the lone 2m trade today (BUY 11:51 @57235.8): ATR mode exited 11:55 @57174.2 = **−3,698**
+vs static-0.25% exiting 12:03 @57092.9 = **−8,573** — the tighter ATR stop cut the loser
+faster here, but a trade that *would have recovered* would whipsaw out instead. One day,
+both directions plausible; needs more data.
+
+**Implementation status (2026-06-17).** Implemented + syntax-validated in both
+`ema_crossover_banknifty.py` (live) and `backtest_ticks.py` (tick engine); percent-mode
+parity confirmed (default run unchanged). **Live default stays `percent`** — do NOT flip
+to `atr` until validated on a trending captured day; deploy only at a pre-market restart,
+never mid-session.
+
+---
+
+## 18. Crossover confirmation window (N-candle re-check)
+
+**Idea.** The §16 crossover-quality gate requires the **decisive gap** (≥`REVERSE_CONFIRM_PCT`)
+*on the cross candle itself*. But two EMAs are ~equal at the moment they cross, so the gap there is
+near zero — if a real move only widens the gap to "decisive" a candle or two **after** the cross,
+the at-cross gate skips it entirely. Live example (2026-06-18, 3m): EMA9 crossed below EMA21 ~14:09–14:12
+with gap ≈ 0 (rejected), and the gap only reached the ~6 pt threshold by ~14:21 — by which point it
+was no longer the cross candle, so no entry ever fired despite close/slope/volume all agreeing.
+
+**Rule.** Keep the cross **armed for N candles** after it occurs. On each candle within the window,
+enter if the gap is now decisive **and** close-leads-EMA + fast-EMA slope + volume all agree on
+*that* candle. Disarm the cross when: it fires, the EMAs flip back across (cross negated), or the
+window expires (`cross_age > N`).
+
+**Config.** `cross_confirm_bars = N` (per-strategy). **Default `0`** = original behaviour (entry only
+on the cross candle) → all existing strategies unchanged. **Option 4 uses `2`** (cross candle + up to
+2 following candles).
+
+**⚠ Trade-off, quantified (2026-06-18, choppy/rangebound day, backtest cold-start).** The window
+**re-admits whipsaw risk** the §16 gate was added to remove. With `cross_confirm_bars=2`, Option 4
+took **2 trades, both TSL whipsaw losers** (SELL 10:42→−3,972; BUY 13:33→−5,580; total **−9,552**),
+while every cross-candle-only variation stayed **flat (0 trades)**. So the window is a **double-edged
+lever**: it generates signals on quiet/choppy days, but those tend to be whipsaws; its *upside*
+(catching a real move whose cross was thin) can only be judged on a **trending captured day**.
+Backtest-only (Option 4); not on any live strategy.
+
+---
+
 ## 16. Master TODO / open-items checklist
 
 Single tracker so nothing is lost. (Older brainstorm ideas live in §11; this is the actionable list.)
@@ -783,6 +884,7 @@ Tags: `[live]` deployed · `[shadow]` log-only data-gathering · `[design]` not 
 - [x] `[live 2026-06-15]` **Crossover-quality gate (entry & reverse)** — a signal now needs ALL of: EMA cross + **|EMA9−EMA21| ≥ 0.03%** (`REVERSE_CONFIRM_PCT`, ≈17 pts) *at the cross* + **close vs EMA9** (above for long / below for short) + **EMA9 slope** (rising/falling, candle-over-candle) + **volume > 1.5×SMA**. Same gate drives entries AND reverse-exits. This **replaces** the original §14 *post-cross follow-through* idea with an *at-cross* separation + momentum gate. Validated on the archive: rejects the Jun 12 reverse (−0.7) and all Jun 15 noise crosses (2–8 pts); passes decisive crosses (Jun 3 −58/+28). Trade-off: also skips medium 4–15-pt crosses (May 14/29) → fewer, decisive-only trades; net effect TBD on forward data. Tune via `REVERSE_CONFIRM_PCT`.
 - [ ] `[redundant]` §14 shadow-logger (`[SHADOW]` lines) — superseded by the at-cross gate above (reverses now only fire on decisive crosses). Harmless log-only; remove when convenient.
 - [ ] `[implemented, OFF]` **TIGHT_TSL** (from Dinesh) — tighten the trailing stop 0.5% → `TIGHT_TSL_PCT` (0.25%) once unrealized profit ≥ `TIGHT_TSL_THRESHOLD` (₹5k), never widening back. **Code kept but disabled** (`TIGHT_TSL_ENABLED=false`) → TSL stays the original 0.5%. Unproven and it interacts with the APPE arm (₹8k profit-protect) and the 0.5% trail; **validate on tick-replay / forward data before enabling** (flip `TIGHT_TSL_ENABLED=true`).
+- [ ] `[implemented, OFF]` **§17 ATR dynamic TSL** — trail `ATR_MULT×ATR(ATR_PERIOD)` points (1.5×ATR(14)) instead of static %. Live + engine done, percent-mode parity holds. **Default `TSL_MODE=percent`**; on quiet days 1.5×ATR is ~2.4–3.6× *tighter* than 0.5% (§17 table) → validate on a trending/volatile captured day before flipping `TSL_MODE=atr`. Deploy only pre-market.
 - [ ] `[design][blocked on §14]` **§15 breaker raise** to ~₹15k so one TSL loss doesn't end the day
 - [ ] `[design]` **§10 ALE** per-trade rupee stop (`MAX_LOSS_PER_TRADE`) + coherent daily — keep loose; backtest first
 - [ ] `[design]` Reverse-confirm `REVERSE_CONFIRM_PCT` value — tune from shadow data, not the offline backtest (§14.5)
