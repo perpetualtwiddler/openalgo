@@ -17,10 +17,12 @@ Entry  : when FLAT and the trailing-ER_WINDOW_MIN Kaufman Efficiency Ratio (ER =
          confirms a trend ~window-length later, when no fresh cross exists. ER is a
          TRIGGER, not a filter. This is a deliberately LAGGING, confirmation-based entry
          (~45 min after a trend starts) — it forgoes the first leg to skip all the chop.
-Exit   : RIDE — let winners run. APPE adaptive profit-protection OR trailing-SL 0.5% OR
-         reverse (EMA alignment flips against the position) OR EOD 15:14 — first to fire.
-         NO tight stop: a tight stop chops you out on normal trend pullbacks (proven worse
-         in backtest); it was only ever a patch for an unfiltered entry.
+Exit   : ER-EXIT (primary) — at each bar-close, if the trailing-window ER drops below
+         ER_EXIT (0.40), momentum has stalled and we close at market. Fires ~45-60 min
+         after entry when the regime weakens. Backstop: trailing-SL 0.5% (tick-driven)
+         OR reverse-signal (EMA alignment flips) OR EOD 15:14 — first to fire.
+         APPE disabled (it churns trends by exiting intra-trend pullbacks; bar-close
+         ER-exit is immune to tick noise — proven +8k better over 15 backtested days).
 Product: MIS (intraday, broker auto square-off ~15:15)
 
 *** FORWARD-TEST IN ANALYZER MODE FIRST ***
@@ -78,12 +80,20 @@ CANDLE_TIMEFRAME = os.getenv("CANDLE_TIMEFRAME", "3m")
 ER_GATE = float(os.getenv("ER_GATE", "0.60"))
 ER_WINDOW_MIN = int(os.getenv("ER_WINDOW_MIN", "60"))  # trailing window for ER, minutes
 
-# --- Exits (RIDE: let winners run; NO tight stop) ---
-TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5% trailing stop
+# --- Exits ---
+TRAILING_SL_PCT = float(os.getenv("TRAILING_SL_PCT", "0.5"))  # 0.5% trailing stop (backstop only)
 
-# Adaptive Profit-Protection Exit (APPE) — trails the P&L curve. Same engine/tuning as the
-# crossover bot. Arm scales with size: ARM_PER_LOT (₹4,000) per 30u lot -> ₹8,000 @ 60u.
-APPE_ENABLED = os.getenv("APPE_ENABLED", "true").lower() == "true"
+# ER-exit: primary momentum-collapse exit. At each bar-close, compute rolling ER over the
+# same ER_WINDOW_MIN window used for entry. If ER < ER_EXIT, the regime has stalled — close.
+# Backtest (15 days, 2026-06-09..06-25, 3m bars): pure ER-exit 0.40 = +37,596 vs
+# RIDE (APPE+TSL) = +29,653. APPE churned the 06-12 trend day (3 trades vs holding to EOD).
+ER_EXIT_ENABLED = os.getenv("ER_EXIT_ENABLED", "true").lower() == "true"
+ER_EXIT = float(os.getenv("ER_EXIT", "0.40"))
+
+# Adaptive Profit-Protection Exit (APPE) — disabled by default: bar-close ER-exit is the
+# primary profit protection. APPE fires tick-by-tick and churns trends on intra-bar pullbacks.
+# Set APPE_ENABLED=true to re-enable (useful if ER_EXIT_ENABLED=false for A/B comparison).
+APPE_ENABLED = os.getenv("APPE_ENABLED", "false").lower() == "true"
 ARM_PER_LOT = float(os.getenv("ARM_PER_LOT", "4000"))
 _arm_override = os.getenv("PROFIT_ARM_THRESHOLD")
 PROFIT_ARM_THRESHOLD = float(_arm_override) if _arm_override else ARM_PER_LOT * (QUANTITY / LOT_SIZE)
@@ -190,6 +200,7 @@ class EMARegimeBot:
         self.ws_alive = False
         self.tf_min = _tf_minutes(CANDLE_TIMEFRAME)
         self.er_bars = max(2, ER_WINDOW_MIN // self.tf_min)  # completed bars in the ER window
+        self.er_exit_last_bar_count = 0  # bar count at last ER-exit check (bar-close semantics)
         # --- candles built locally from the WS quote feed (no history-API dependency) ---
         self.bar_lock = threading.Lock()
         self.session_open_dt = None           # 09:15 anchor for time-bucketing
@@ -207,15 +218,17 @@ class EMARegimeBot:
             f"({self.er_bars} bars) → enter in EMA-alignment direction (no crossover wait)")
         log(f"[INIT] Candles built LOCALLY from the {FEED_MODE} feed — {self.tf_min}m bars; "
             f"~{(max(SLOW_EMA, self.er_bars) + 2) * self.tf_min}min warmup before the first signal")
-        log(f"[INIT] Exit (RIDE): APPE OR trailing-SL {TRAILING_SL_PCT}% OR alignment-flip reverse "
-            f"OR EOD 15:14 — NO tight stop")
+        if ER_EXIT_ENABLED:
+            log(f"[INIT] Exit (primary): ER-exit {ER_EXIT:g} — close if ER({ER_WINDOW_MIN}min) < {ER_EXIT:g} "
+                f"at bar-close ({self.er_bars} bars, same window as entry gate)")
+        log(f"[INIT] Exit (backstop): trailing-SL {TRAILING_SL_PCT}% OR alignment-flip reverse OR EOD 15:14")
         if APPE_ENABLED:
             log(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} "
                 f"(₹{ARM_PER_LOT:.0f}×{QUANTITY/LOT_SIZE:g} lots) | "
                 f"G={GIVEBACK_K:g}·√peak·√({QUANTITY/LOT_SIZE:g}u/{GIVEBACK_REF_UNITS:g}) | "
                 f"trend {TREND_WINDOW_SEC:.0f}s | confirm {TREND_CONFIRM_SEC:.0f}s | hard ×{HARD_MULT:g}")
         else:
-            log("[INIT] APPE off — price trailing-SL only")
+            log("[INIT] APPE off — ER-exit is primary profit protection; TSL is backstop only")
         log(f"[INIT] Qty: {QUANTITY} | Product: {PRODUCT} | Direction: {TRADE_DIRECTION} | "
             f"Feed: {FEED_MODE} | Max daily loss: {MAX_LOSS_PER_DAY}")
         log("[INIT] *** Run in ANALYZER MODE for forward-testing — orders are simulated, not live ***")
@@ -461,6 +474,30 @@ class EMARegimeBot:
             self.appe_breach_start = None
         return None
 
+    # -------------------------------------------------------------------------
+    # ER-exit — bar-close momentum collapse check
+    # -------------------------------------------------------------------------
+
+    def _check_er_exit(self):
+        """Returns True when a new bar has completed AND ER < ER_EXIT (regime stalled).
+        Only fires once per completed bar — tracks bar_count so repeated polls within the
+        same bar are no-ops."""
+        if not ER_EXIT_ENABLED or not self.position:
+            return False
+        with self.bar_lock:
+            closes = list(self.bar_closes)
+        n = len(closes)
+        if n <= self.er_exit_last_bar_count or n < self.er_bars:
+            return False  # same bar as last check, or still warming up
+        self.er_exit_last_bar_count = n
+        er = efficiency_ratio(closes[-(self.er_bars + 1):])
+        if er < ER_EXIT:
+            log(f"[ER_EXIT] ER({ER_WINDOW_MIN}min)={er:.3f} < {ER_EXIT:g} — momentum collapsed; "
+                f"closing {self.position}")
+            return True
+        log(f"[ER_EXIT] ER({ER_WINDOW_MIN}min)={er:.3f} ≥ {ER_EXIT:g} — regime holding; staying in {self.position}")
+        return False
+
     def start_websocket(self):
         while not self.stop_event.is_set():
             try:
@@ -593,6 +630,8 @@ class EMARegimeBot:
         self.pending_entry_order_id = None
         self.exit_in_progress = False
         self.trade_count += 1
+        with self.bar_lock:
+            self.er_exit_last_bar_count = len(self.bar_closes)
         self.save_state()
         log(f"[ENTRY] Reconciled {signal} position @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f}")
         return True
@@ -695,6 +734,8 @@ class EMARegimeBot:
                         self.trailing_sl = round(price * (1 + TRAILING_SL_PCT / 100), 2)
                     self.exit_in_progress = False
                     self.trade_count += 1
+                    with self.bar_lock:
+                        self.er_exit_last_bar_count = len(self.bar_closes)
                     self.save_state()
                     log(f"[ENTRY] Filled @ {price:.2f} | TSL: {self.trailing_sl:.2f} | Trade #{self.trade_count}")
                     return True
@@ -831,6 +872,12 @@ class EMARegimeBot:
                     if signal:
                         self.place_entry(signal)
                 elif self.position and not self.exit_in_progress:
+                    # ER-exit check (bar-close): fires at most once per completed bar.
+                    if self._check_er_exit():
+                        self.exit_in_progress = True
+                        self.place_exit("ER_EXIT")
+                        time.sleep(SIGNAL_CHECK_INTERVAL)
+                        continue
                     signal = self.check_signal()
                     if signal and signal != self.position:
                         # Trend regime confirmed in the OPPOSITE direction (alignment flipped).
@@ -868,7 +915,8 @@ class EMARegimeBot:
         log("=" * 65)
         log(f"  EMA TREND-REGIME FOLLOWER — {self.symbol} {CANDLE_TIMEFRAME}")
         log(f"  Entry: flat + ER≥{ER_GATE:g}/{ER_WINDOW_MIN}min → EMA({FAST_EMA}/{SLOW_EMA}) alignment dir")
-        log(f"  Exit (RIDE): APPE / trailing-SL {TRAILING_SL_PCT}% / alignment-flip / EOD")
+        er_exit_str = f"ER<{ER_EXIT:g} bar-close / " if ER_EXIT_ENABLED else ""
+        log(f"  Exit: {er_exit_str}TSL {TRAILING_SL_PCT}% / alignment-flip / EOD")
         log(f"  Direction: {TRADE_DIRECTION} | Qty: {QUANTITY} | Product: {PRODUCT}")
         log("  *** ANALYZER MODE recommended — forward-test on paper first ***")
         log("=" * 65)

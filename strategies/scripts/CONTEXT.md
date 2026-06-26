@@ -104,13 +104,37 @@ produced the first clean result. Tooling: `regime_scan.py` (Efficiency Ratio ove
   trend days confirm the floor. **CAVEAT: 4 trades / 2 trend days — proof-of-concept, not an edge.**
 - Backtester support: `backtest_ticks.py` flags `--er-gate <thr> --er-window-min <min>` (regime
   trigger), plus `--tp-per-lot/--sl-per-lot` (fixed bracket) and `--sl-per-lot` alone (stop-only).
-- **Deployable script: `ema_regime_banknifty.py`** (NEW) — the regime follower for forward-testing
-  in **Analyzer mode**. Same plumbing as the crossover bot (feed/orders/APPE/state/EOD); entry is
-  the ER trigger. Defaults 5/13 @ 3m, ER≥0.60/60min, RIDE.
+- **Deployable script: `ema_regime_banknifty.py`** — the regime follower for forward-testing
+  in **Analyzer mode**. Same plumbing as the crossover bot (feed/orders/state/EOD); entry is
+  the ER trigger. Defaults 5/13 @ 3m, ER≥0.60/60min. **Exit: ER-exit 0.40 (primary) + TSL 0.5%
+  (backstop). APPE disabled by default** (see ER-exit section below).
+
+## ER-exit findings (2026-06-26, 15 days 06-09..06-25, 3m bars, --tf 3 --fast 5 --slow 13)
+
+Exit-mode comparison. All 5 active trading days (0-trade chop days excluded):
+
+| Mode | 15-day total | vs RIDE | Verdict |
+|------|-------------|---------|---------|
+| RIDE (APPE+TSL, current) | +29,653 | baseline | — |
+| **ER-exit 0.40 only** | **+37,596** | **+7,943** | **deployed** |
+| ER-exit + APPE | +21,516 | −8,137 | don't: APPE churns 06-12 |
+| MFE-dynamic ER | +29,328 | −325 | don't: misfires on 06-23 |
+| ER-exit 0.40 + no re-entry after ER_EXIT | ~+40,524 | +10,871 | overfitting (1 day) |
+
+- **ER-exit (bar-close semantics)**: at each completed bar, compute rolling ER over the 60-min
+  window. If ER < 0.40, close at market. No tick-level APPE — immune to intra-bar pullback noise.
+- **Why APPE hurts here**: APPE fires tick-by-tick; on 06-12 (the +32k trend day) it churned 3
+  trades (+16,464 vs +32,400 holding). ER-exit stays out until momentum genuinely collapses.
+- **06-25 loss (−7,008)**: entry was at intraday top (BUY 58,670, peak 58,675, MFE=5pts). No
+  bar-close exit can fix a near-zero MFE entry — the regime filter just occasionally gets it wrong.
+- **No-re-entry rule**: saves the 2nd 06-25 SELL (−2,928) but is single-day overfitting. Bank Nifty
+  intraday reversals on news are genuine opportunities; ER gate re-filters any re-entry anyway.
+- CLI flags in `backtest_ticks.py`: `--er-exit`, `--er-appe`, `--er-tsl`, `--er-tsl-wide`,
+  `--er-dynamic`, `--mfe-scale`, `--mfe-trail-frac`, `--mfe-trail-min`, `--er-exit-high`.
 
 ## Open items / next steps
 0. **Forward-test `ema_regime_banknifty.py` in Analyzer mode** (paper) for several days, esp. trend
-   days, before considering live. Confirm the ER band holds out-of-sample (current edge = 2 days).
+   days, before considering live. Confirm ER-exit 0.40 holds out-of-sample (current edge = 2 days).
 1. Push `mock/strategies` to `origin` (github perpetualtwiddler/openalgo) — several commits ahead.
 2. Set a remote for `mkdskite.git` and push.
 3. **Accumulate multi-day FNO captures** (`/root/data/mkdskite-fno/data/<date>/`) starting 06-19;

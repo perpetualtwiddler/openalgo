@@ -118,6 +118,8 @@ class Position:
             self.trailing_sl = round(entry_price * (1 - TRAILING_SL_PCT / 100), 2)
         else:
             self.trailing_sl = round(entry_price * (1 + TRAILING_SL_PCT / 100), 2)
+        # MFE tracking (max favorable excursion in points from entry)
+        self.mfe_pts = 0.0
         # APPE state
         self.appe_peak = 0.0
         self.appe_armed = False
@@ -129,13 +131,16 @@ class Position:
             return (ltp - self.entry_price) * QTY
         return (self.entry_price - ltp) * QTY
 
-    def update_trailing(self, ltp):
-        """Update TSL with tightening; return True if SL is hit at this tick."""
+    def update_trailing(self, ltp, tsl_pct=None):
+        """Update TSL; tsl_pct overrides TRAILING_SL_PCT when provided (e.g. ER-contingent mode)."""
         u = self.unrealized(ltp)
         if self.direction == "BUY":
             if ltp > self.peak_price:
                 self.peak_price = ltp
-                pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
+                if tsl_pct is not None:
+                    pct = tsl_pct
+                else:
+                    pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
                 new = round(self.peak_price * (1 - pct / 100), 2)
                 if new > self.trailing_sl:
                     self.trailing_sl = new
@@ -143,10 +148,39 @@ class Position:
         else:
             if ltp < self.peak_price:
                 self.peak_price = ltp
-                pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
+                if tsl_pct is not None:
+                    pct = tsl_pct
+                else:
+                    pct = TIGHT_TSL_PCT if (TIGHT_TSL_ENABLED and u >= TIGHT_TSL_THRESHOLD) else TRAILING_SL_PCT
                 new = round(self.peak_price * (1 + pct / 100), 2)
                 if new < self.trailing_sl:
                     self.trailing_sl = new
+            return ltp >= self.trailing_sl
+
+    def update_mfe(self, ltp):
+        """Update maximum favorable excursion (points) and peak_price. Returns mfe_pts."""
+        if self.direction == "BUY":
+            if ltp > self.peak_price:
+                self.peak_price = ltp
+            self.mfe_pts = max(0.0, self.peak_price - self.entry_price)
+        else:
+            if ltp < self.peak_price:
+                self.peak_price = ltp
+            self.mfe_pts = max(0.0, self.entry_price - self.peak_price)
+        return self.mfe_pts
+
+    def update_trailing_pts(self, ltp, trail_pts):
+        """TSL with an absolute-point trail from peak (MFE-dynamic mode).
+        Call update_mfe() first to keep peak_price current."""
+        if self.direction == "BUY":
+            new_sl = round(self.peak_price - trail_pts, 2)
+            if new_sl > self.trailing_sl:
+                self.trailing_sl = new_sl
+            return ltp <= self.trailing_sl
+        else:
+            new_sl = round(self.peak_price + trail_pts, 2)
+            if new_sl < self.trailing_sl:
+                self.trailing_sl = new_sl
             return ltp >= self.trailing_sl
 
     def _slope_negative(self):
@@ -293,6 +327,23 @@ def simulate_day(ticks, cfg, use_vol_filter):
     er_gate = cfg.get("er_gate")
     er_bars = max(2, round(cfg.get("er_window_min", 60) / tf))
     er_closes = deque(maxlen=er_bars + 1)
+    # ER-based exit: close the position at bar-close when rolling ER drops below threshold.
+    # When set alone, APPE and trailing-SL are disabled — ER momentum collapse is the sole
+    # exit signal (plus EOD and EMA-alignment-flip reverse). None = use APPE + TSL as before.
+    er_exit = cfg.get("er_exit")
+    er_appe = cfg.get("er_appe", False)         # re-enable full APPE+TSL tick exits alongside er_exit bar check
+    er_tsl = cfg.get("er_tsl", False)           # ER-contingent TSL: trail% shrinks as ER weakens toward er_exit
+    er_tsl_wide_er = cfg.get("er_tsl_wide_er", 0.70)  # ER level at which TSL is at full TRAILING_SL_PCT width
+    current_tsl_pct = TRAILING_SL_PCT           # active trail%, updated at bar-close in er_tsl mode
+    # MFE-dynamic mode: TSL trail and ER-exit threshold both scale with max favorable excursion.
+    # Small MFE → tight trail + high ER-exit threshold (= entry gate level).
+    # Large MFE → wide trail + low ER-exit threshold (trade has earned its room).
+    er_dynamic = cfg.get("er_dynamic", False)
+    mfe_trail_frac = cfg.get("mfe_trail_frac", 0.30)    # trail = max(min, mfe_pts × frac)
+    mfe_trail_min = cfg.get("mfe_trail_min", 15.0)      # minimum trail in points (initial hard stop)
+    mfe_scale = cfg.get("mfe_scale", 150.0)             # MFE pts at which ER threshold reaches er_exit (wide)
+    er_exit_high = (cfg.get("er_exit_high") or          # ER threshold at zero MFE (tight = entry gate)
+                    (cfg.get("er_gate") or 0.60) if er_dynamic else er_exit)
 
     # Real traded volume is available only when the capture carries a cumulative
     # "volume" field (Quote mode). LTP-only days fall back to a tick-count proxy.
@@ -315,6 +366,7 @@ def simulate_day(ticks, cfg, use_vol_filter):
     pending_signal = None         # "BUY"/"SELL" to act on next tick
     pos = None
     trades = []
+    no_reentry_before_bar = -1  # after a TSL stop-out, block re-entry until the next bar
 
     def bar_index(dt):
         return int((dt - open_dt).total_seconds() // (tf * 60))
@@ -391,6 +443,28 @@ def simulate_day(ticks, cfg, use_vol_filter):
             bar_cum_vol = cum_vol
         elif idx != cur_bar_idx:
             finalize_bar()                # close the bar we were building
+            # ER-based check AFTER finalize_bar so er_closes includes the new bar.
+            # bar_c is still the just-completed bar's close — used as exit price.
+            if er_exit is not None and len(er_closes) >= er_bars:
+                _er_val = efficiency_ratio(list(er_closes))
+                if er_tsl:
+                    # Update ER-contingent TSL %: interpolate between tight (at er_exit) and wide (at er_tsl_wide_er).
+                    if _er_val >= er_tsl_wide_er:
+                        current_tsl_pct = TRAILING_SL_PCT
+                    elif _er_val <= er_exit:
+                        current_tsl_pct = TIGHT_TSL_PCT
+                    else:
+                        _t = (_er_val - er_exit) / (er_tsl_wide_er - er_exit)
+                        current_tsl_pct = TIGHT_TSL_PCT + _t * (TRAILING_SL_PCT - TIGHT_TSL_PCT)
+                if pos is not None:
+                    if er_dynamic:
+                        _t = min(1.0, pos.mfe_pts / mfe_scale) if mfe_scale > 0 else 1.0
+                        _er_thresh = er_exit_high - (er_exit_high - er_exit) * _t
+                    else:
+                        _er_thresh = er_exit
+                    if _er_val < _er_thresh:
+                        close_trade(pos, bar_c, dt, "ER_EXIT")
+                        pos = None
             cur_bar_idx = idx
             bar_o = bar_h = bar_l = bar_c = ltp
             bar_ticks = 0
@@ -427,7 +501,8 @@ def simulate_day(ticks, cfg, use_vol_filter):
         # CURRENT EMA-alignment direction (the lagged, confirmation-based entry the 45-min
         # latency buys). Crossover-driven reverses below still close a flipped trend.
         if (er_gate is not None and pos is None and ema_slow is not None
-                and bars_done >= warmup and len(er_closes) >= er_bars
+                and bars_done >= warmup and cur_bar_idx >= no_reentry_before_bar
+                and len(er_closes) >= er_bars
                 and efficiency_ratio(list(er_closes)) >= er_gate):
             pending_signal = "BUY" if ema_fast > ema_slow else "SELL"
 
@@ -444,13 +519,26 @@ def simulate_day(ticks, cfg, use_vol_filter):
                 pos = Position(pending_signal, ltp, dt, tp_amt=tp_amt, sl_amt=sl_amt)
             pending_signal = None
 
-        # ---- per-tick exit evaluation (APPE-first, then trailing-SL — see step()) ----
+        # ---- per-tick exit evaluation ----
         if pos is not None:
-            res = pos.step(ltp, t_sec)
-            if res is not None:
-                reason, exit_price = res
-                close_trade(pos, exit_price, dt, reason)
-                pos = None
+            if er_dynamic and er_exit is not None:
+                # MFE-dynamic bar-close mode: track peak silently per tick.
+                # The exit itself is bar-close-only (handled above); no intra-bar TSL — avoids
+                # churning on trending days where the 3m noise range exceeds any tight TSL.
+                pos.update_mfe(ltp)
+            elif er_tsl and er_exit is not None:
+                # ER-contingent TSL: trail% tightens as ER weakens; hard bar-close ER_EXIT handles the floor.
+                if pos.update_trailing(ltp, tsl_pct=current_tsl_pct):
+                    close_trade(pos, pos.trailing_sl, dt, "TRAILING_SL")
+                    pos = None
+            elif er_exit is None or er_appe:
+                # Normal APPE+TSL (no er_exit), or er_appe mode where bar-close ER check is additive.
+                res = pos.step(ltp, t_sec)
+                if res is not None:
+                    reason, exit_price = res
+                    close_trade(pos, exit_price, dt, reason)
+                    pos = None
+            # Pure er_exit mode: no tick-level exits — only the bar-close ER check above fires.
 
     # End of data with open position (shouldn't happen — EOD breaks first)
     if pos is not None:
@@ -481,7 +569,7 @@ def print_trades(trades):
 _SOURCE_TAG = {"real": "real vol", "tickcount": "tick-count proxy"}
 
 
-def run(dates, configs):
+def run(dates, configs, symbol=None):
     grand = {}  # (cfg_label, variant) -> total
     n = len(dates)
     for cfg in configs:
@@ -494,7 +582,7 @@ def run(dates, configs):
             print(f"\n  --- {variant} {hdr} ---")
             agg = 0
             for date_str in dates:
-                ticks = load_ticks(date_str, symbol=args.symbol)
+                ticks = load_ticks(date_str, symbol=symbol)
                 if not ticks:
                     print(f"    {date_str}: no data")
                     continue
@@ -541,6 +629,27 @@ def main():
                          "Ratio >= this (e.g. 0.65). Omit = no gate.")
     ap.add_argument("--er-window-min", type=int, default=60,
                     help="ER gate trailing window in minutes (default 60)")
+    ap.add_argument("--er-exit", type=float, default=None,
+                    help="ER-based exit: close position at bar-close when rolling ER drops "
+                         "below this threshold (e.g. 0.40). Disables APPE and trailing-SL.")
+    ap.add_argument("--er-appe", action="store_true",
+                    help="with --er-exit: re-enable APPE+TSL tick exits (bar-close ER check is additive)")
+    ap.add_argument("--er-tsl", action="store_true",
+                    help="with --er-exit: ER-contingent TSL — trail%% shrinks linearly from "
+                         "TRAILING_SL_PCT at --er-tsl-wide down to TIGHT_TSL_PCT at --er-exit")
+    ap.add_argument("--er-tsl-wide", type=float, default=0.70,
+                    help="ER level at which TSL is at full TRAILING_SL_PCT width (default 0.70)")
+    ap.add_argument("--er-dynamic", action="store_true",
+                    help="MFE-dynamic exits (requires --er-exit): TSL trail scales with MFE in points; "
+                         "ER-exit threshold tightens at small MFE and relaxes as MFE grows")
+    ap.add_argument("--mfe-scale", type=float, default=150.0,
+                    help="MFE in points at which ER threshold reaches --er-exit (wide end, default 150)")
+    ap.add_argument("--mfe-trail-frac", type=float, default=0.30,
+                    help="TSL trail = max(--mfe-trail-min, mfe_pts × frac) (default 0.30)")
+    ap.add_argument("--mfe-trail-min", type=float, default=15.0,
+                    help="minimum TSL trail in points — initial hard stop (default 15)")
+    ap.add_argument("--er-exit-high", type=float, default=None,
+                    help="ER-exit threshold at zero MFE (tight end, default = --er-gate or 0.60)")
     ap.add_argument("--data-dir", default=None,
                     help="override BACKTEST_DATA_DIR for this run (e.g. path to FNO captures)")
     ap.add_argument("--symbol", default=None,
@@ -560,7 +669,13 @@ def main():
     rcp = args.reverse_confirm_pct
     common = {"reverse_confirm_pct": rcp, "gap_gate": args.gap_gate, "early": args.early_entry,
               "tp_per_lot": args.tp_per_lot, "sl_per_lot": args.sl_per_lot,
-              "er_gate": args.er_gate, "er_window_min": args.er_window_min}
+              "er_gate": args.er_gate, "er_window_min": args.er_window_min,
+              "er_exit": args.er_exit, "er_appe": args.er_appe,
+              "er_tsl": args.er_tsl, "er_tsl_wide_er": args.er_tsl_wide,
+              "er_dynamic": args.er_dynamic,
+              "mfe_scale": args.mfe_scale, "mfe_trail_frac": args.mfe_trail_frac,
+              "mfe_trail_min": args.mfe_trail_min,
+              "er_exit_high": args.er_exit_high}
     if args.tf and args.fast and args.slow:
         configs = [{"tf": args.tf, "fast": args.fast, "slow": args.slow,
                     "warmup": args.warmup,
@@ -582,11 +697,23 @@ def main():
                      f"APPE arm ₹{PROFIT_ARM_THRESHOLD:.0f}, G={GIVEBACK_K:g}√peak")
     er_desc = (f" | ER-gate ≥{args.er_gate:g} over {args.er_window_min}min"
                if args.er_gate is not None else "")
+    if args.er_exit is not None:
+        _eh = args.er_exit_high or args.er_gate or 0.60
+        if args.er_dynamic:
+            er_desc += (f" | ER-exit dyn({_eh:.2g}→{args.er_exit:.2g} @ MFE 0→{args.mfe_scale:g}pts)"
+                        f" +TSL({args.mfe_trail_min:g}pts+{args.mfe_trail_frac:g}×MFE)")
+        elif args.er_tsl:
+            er_desc += (f" | ER-exit <{args.er_exit:g} +TSL({TIGHT_TSL_PCT:.2g}%..{TRAILING_SL_PCT:.2g}%"
+                        f" @ ER {args.er_exit:g}..{args.er_tsl_wide:g})")
+        elif args.er_appe:
+            er_desc += f" | ER-exit <{args.er_exit:g} +APPE+TSL"
+        else:
+            er_desc += f" | ER-exit <{args.er_exit:g} [APPE+TSL off]"
     sym_desc = f" | symbol filter: {args.symbol}" if args.symbol else ""
     print(f"Data dir: {DATA_DIR}{sym_desc} | days: {', '.join(dates)}")
     print(f"QTY={QTY} ({_lots:g} lots) | {exit_desc} | "
           f"gap gate {gap_desc} | entry={'EARLY intra-bar' if args.early_entry else 'on-close'}{er_desc}")
-    run(dates, configs)
+    run(dates, configs, symbol=args.symbol)
 
 
 if __name__ == "__main__":
