@@ -709,6 +709,12 @@ def main():
                     help="minimum TSL trail in points — initial hard stop (default 15)")
     ap.add_argument("--er-exit-high", type=float, default=None,
                     help="ER-exit threshold at zero MFE (tight end, default = --er-gate or 0.60)")
+    ap.add_argument("--qty", type=int, default=None,
+                    help="total quantity override (default 60 = 2 lots × 30 for BANKNIFTY); "
+                         "e.g. --qty 130 for NIFTY (2×65), --qty 240 for MIDCPNIFTY (2×120)")
+    ap.add_argument("--lot-size", type=int, default=None,
+                    help="lot size override for APPE arm scaling (default 30); "
+                         "e.g. --lot-size 65 for NIFTY, --lot-size 120 for MIDCPNIFTY")
     ap.add_argument("--data-dir", default=None,
                     help="override BACKTEST_DATA_DIR for this run (e.g. path to FNO captures)")
     ap.add_argument("--symbol", default=None,
@@ -719,6 +725,14 @@ def main():
     if args.data_dir:
         global DATA_DIR
         DATA_DIR = Path(args.data_dir)
+
+    if args.qty is not None or args.lot_size is not None:
+        global QTY, LOT_SIZE, PROFIT_ARM_THRESHOLD
+        if args.qty is not None:
+            QTY = args.qty
+        if args.lot_size is not None:
+            LOT_SIZE = args.lot_size
+        PROFIT_ARM_THRESHOLD = ARM_PER_LOT * (QTY / LOT_SIZE)
 
     if args.date:
         dates = [args.date]
