@@ -122,6 +122,7 @@ square-off 15:14; **daily breaker ₹5,000**; **QTY 60** (2 lots × 30); `FEED_M
 | 3 | backtest candidate | 2m | — | 9/21 | 0.01% | EMA9 now > EMA9 3 bars ago | SMA(15) ≈30min | 1.5×ATR(14) | ₹2,000 (₹1k/lot) |
 | **4** | **🟢 LIVE — CURRENT ACTIVE (2026-06-18)** | 3m | — | **7/15** | 0.01% | EMA7 now > EMA7 3 bars ago | SMA(10) ≈30min | **1.5×ATR(14)** (pure, no floor) | ₹4,000 (₹2k/lot) |
 | 5 | original (descheduled 2026-06-17) | 5m | — | 9/21 | 0.03% (~17pt) | EMA9 now > EMA9 1 bar ago | SMA(20) ≈100min | static 0.5% | ₹8,000 (₹4k/lot) |
+| **R** | committed, **not yet deployed** — see §3 | 3m | **ER≥0.60/60min** *(entry trigger, replaces crossover)* | **5/13** (alignment dir only; no cross wait) | — | — | — | **ER-exit <0.40** (bar-close primary) + 0.5% backstop | **off** |
 
 - **ATR trailing stop** (Options 1–4) = Wilder ATR(14) on the entry timeframe, distance =
   `ATR_MULT×ATR` (ratchet-only), **pure (no floor)** for all. A 100-pt floor (`ATR_FLOOR_PTS`) was
@@ -137,6 +138,72 @@ square-off 15:14; **daily breaker ₹5,000**; **QTY 60** (2 lots × 30); `FEED_M
   `.venv/bin/python strategies/scripts/backtest_ema_dev.py <YYYY-MM-DD>` → one table, all 5 rows
   (baseline immune to env overrides). ⚠ Single-day, cold-start EMAs → directional only; needs a
   trending captured day for a real verdict (the quiet 06-16/06-17 days gave ~0 trades for all).
+
+---
+
+## 3. BANKNIFTY EMA Trend-Regime Follower
+
+**File:** `ema_regime_banknifty.py` (committed to `mock/strategies`; **not yet deployed to server**)
+**Status:** Forward-test in Analyzer mode before live.
+
+### Why a different approach
+The EMA crossover strategy enters on the *moment* of a cross — which fires at a regime *transition* when
+momentum is weakest. The regime follower waits for the regime to *confirm* itself (~45–60 min) and only
+then enters in the direction the EMAs already point. This forgoes the first leg but avoids chop entirely:
+no entry gate can save a bad entry — if the regime isn't established, the position will churn regardless
+of the exit rule.
+
+### Position Sizing
+Identical to the EMA crossover variants.
+| Parameter | Value |
+|-----------|-------|
+| Lot size | 30 |
+| Quantity | 60 (2 lots) |
+| Product | MIS (intraday) |
+| Feed mode | quote (for volume capture) |
+
+### Entry Logic
+- Wait until **flat** and the trailing 60-min Efficiency Ratio (ER = \|net move\| / \|total path\| over completed 3m bars) reaches **ER ≥ 0.60**.
+- On trigger: enter in the **current EMA(5/13) alignment direction** — BUY if EMA5 > EMA13, SELL otherwise. No crossover required; a cross fires before ER confirms and would give zero trades.
+- Entry is deliberately lagged (~45 min after a trend starts). The regime filter skips all chop days (ER stays below gate); on trend days the position rides the bulk of the move.
+
+| Parameter | Value | Config env var |
+|-----------|-------|----------------|
+| Entry timeframe | 3m candles (built from WS feed) | `CANDLE_TIMEFRAME=3m` |
+| Fast EMA | 5 | `FAST_EMA=5` |
+| Slow EMA | 13 | `SLOW_EMA=13` |
+| ER gate | 0.60 | `ER_GATE=0.60` |
+| ER window | 60 min (20 bars @ 3m) | `ER_WINDOW_MIN=60` |
+| Trade direction | both | `TRADE_DIRECTION=BOTH` |
+
+### Exit Logic
+| Priority | Trigger | Default | Config env var |
+|----------|---------|---------|----------------|
+| 1 (primary) | **ER-exit** — at each bar-close, if rolling ER < 0.40, momentum collapsed → close at market | 0.40 | `ER_EXIT=0.40` |
+| 2 (backstop) | Trailing SL 0.5% from peak (tick-driven) | 0.5% | `TRAILING_SL_PCT=0.5` |
+| 3 | EMA alignment flip (reverse signal confirmed by ER gate) | — | — |
+| 4 | EOD square-off | 15:14 IST | hardcoded |
+
+APPE is **off** by default — it exits tick-by-tick on intra-trend P&L pullbacks, churning trend days.
+
+### Backtest Results (15 days, 2026-06-09..06-25, 3m bars, 5/13 EMA, ER gate 0.60)
+
+5 active trading days; 10 zero-trade chop days (regime gate correctly kept out).
+
+| Exit mode | 15-day P&L | vs RIDE | Notes |
+|-----------|-----------|---------|-------|
+| RIDE: APPE+TSL (current crossover default) | +29,653 | baseline | APPE churns 06-12 trend |
+| **ER-exit 0.40 only** | **+37,596** | **+7,943** | deployed config |
+| ER-exit + APPE | +21,516 | −8,137 | APPE hurts on trend days |
+| MFE-dynamic ER | +29,328 | −325 | misfires on brief adverse moves |
+
+Worst single day: 2026-06-25 (−7,008): entry at intraday top (BUY 58,670, MFE only +5 pts). No exit rule fixes a near-zero MFE entry — the regime filter occasionally misfires.
+
+### Key Files
+- Strategy: `strategies/scripts/ema_regime_banknifty.py`
+- Backtest flags: `--er-gate 0.60 --er-window-min 60 --er-exit 0.40 --tf 3 --fast 5 --slow 13`
+- Context: `strategies/scripts/CONTEXT.md` (ER-exit section)
+- State (when deployed): `/root/data/openalgo/strategies/state/EMA_REGIME_BANKNIFTY_state.json`
 
 ---
 
