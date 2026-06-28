@@ -123,7 +123,7 @@ EOF
 
 cat > /etc/systemd/system/openalgo-backtest-eval.service << EOF
 [Unit]
-Description=Daily EMA-options backtest eval (append per-option results to options_history.csv)
+Description=Daily EMA-options eval (append to options_history.csv) + refresh cross-strategy comparison CSV
 After=openalgo.service
 
 [Service]
@@ -131,7 +131,11 @@ Type=oneshot
 WorkingDirectory=$INSTALL_DIR/strategies/scripts
 Environment=BACKTEST_DATA_DIR=$INSTALL_DIR/log/market_data_capture
 Environment=TZ=Asia/Kolkata
-ExecStart=$INSTALL_DIR/.venv/bin/python $INSTALL_DIR/strategies/scripts/backtest_ema_dev.py --csv $INSTALL_DIR/strategies/scripts/options_history.csv
+# 1) append today's 5 EMA-option rows to the EMA-specific CSV (CSV#1).
+#    '-' prefix => a no-data day / hiccup here still lets CSV#2 refresh (error still logged).
+ExecStart=-$INSTALL_DIR/.venv/bin/python $INSTALL_DIR/strategies/scripts/backtest_ema_dev.py --csv $INSTALL_DIR/strategies/scripts/options_history.csv
+# 2) rebuild the generic cross-strategy comparison CSV (CSV#2): EMA (from CSV#1) + regime + straddle.
+ExecStart=$INSTALL_DIR/.venv/bin/python $INSTALL_DIR/strategies/scripts/build_generic_csv.py --out $INSTALL_DIR/strategies/scripts/strategies_comparison.csv
 StandardOutput=append:$INSTALL_DIR/log/backtest_eval.log
 StandardError=append:$INSTALL_DIR/log/backtest_eval.log
 EOF

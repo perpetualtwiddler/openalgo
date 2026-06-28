@@ -212,7 +212,7 @@ def main():
             csv_path = "options_history.csv"; del argv[i:i + 1]
     date = next((a for a in argv if not a.startswith("--")), datetime.now(bt.IST).strftime("%Y-%m-%d"))
     ticks = bt.load_ticks(date)
-    print(f"date={date} | ticks={len(ticks)} | QTY={bt.QTY} | DATA_DIR={bt.DATA_DIR}")
+    print(f"date={date} | ticks={len(ticks) if ticks else 0} | QTY={bt.QTY} | DATA_DIR={bt.DATA_DIR}")
     if not ticks:
         print("NO DATA"); return
     ltps = [t[2] for t in ticks]
