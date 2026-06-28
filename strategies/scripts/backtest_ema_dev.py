@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest_ticks as bt  # the live-faithful engine
+import charges as chg        # Zerodha transaction-cost model (gross -> net)
 
 bt.DATA_DIR = Path(os.getenv("BACKTEST_DATA_DIR", "/root/data/openalgo/log/market_data_capture"))
 
@@ -268,7 +269,9 @@ def main():
     # --csv: append one history row per option (idempotent — skips a date already present)
     if csv_path:
         cols = ["date", "regime", "option", "tf", "ema", "gap_pct", "slope_bars", "vol_sma",
-                "tsl", "arm", "trades", "W", "L", "pnl", "exits", "notes"]
+                "tsl", "arm", "trades", "W", "L", "pnl", "charges", "net_pnl", "exits", "notes"]
+        # EMA variants trade BANKNIFTY futures (QTY=60); charge per round-trip ~Rs2,009 (STT-dominated).
+        fut_rt = chg.futures_roundtrip(57800.0, bt.QTY)
         existing = set()
         if os.path.exists(csv_path):
             with open(csv_path, newline="") as f:
@@ -285,10 +288,11 @@ def main():
                     floor = cfg.get("atr_floor", 0.0)
                     tsl_desc = (f"ATR{bt.ATR_MULT:g}x" + (f">={floor:.0f}pt" if floor else "")) if tm == "atr" else f"{tsl:g}%"
                     ex = ";".join(f"{k}:{v}" for k, v in reasons.items())
+                    chgv = round(n * fut_rt)
                     wri.writerow([date, regime, label, f"{cfg['tf']}m", f"{cfg['fast']}/{cfg['slow']}",
                                   f"{cfg['reverse_confirm_pct']*100:.3f}", cfg.get("slope_bars", 1),
                                   cfg["vol_sma"], tsl_desc, f"{arm*(bt.QTY/bt.LOT_SIZE):.0f}",
-                                  n, w, l, f"{total:.0f}", ex, ""])
+                                  n, w, l, f"{total:.0f}", chgv, round(total - chgv), ex, ""])
             print(f"\n  [CSV] appended {len(rows)} rows for {date} (regime={regime}, range {rng_pct:.2f}%) -> {csv_path}")
 
 
