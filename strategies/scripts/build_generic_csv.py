@@ -22,9 +22,15 @@ from pathlib import Path
 
 import backtest_ticks as bt
 import backtest_straddle_history as bs
+import charges as chg
 
 COLS = ["date", "regime_label", "strategy", "variant", "timeframe", "params",
-        "trades", "wins", "losses", "pnl", "exit_breakdown", "notes"]
+        "trades", "wins", "losses", "gross_pnl", "charges", "net_pnl", "exit_breakdown", "notes"]
+
+# EMA crossover + regime trade BANKNIFTY futures. Notional is ~constant over the window, so a
+# representative price gives accurate per-trade charges (STT 0.05% sell-side dominates).
+REP_FUT_PRICE, FUT_QTY = 57800.0, 60
+FUT_RT_CHARGE = chg.futures_roundtrip(REP_FUT_PRICE, FUT_QTY)  # ~Rs2,008 per futures round-trip
 
 # Regime config = the validated CLI run: --tf 3 --fast 5 --slow 13 --er-gate 0.60
 # --er-window-min 60 --er-exit 0.40 (all other er/mfe flags at their CLI defaults).
@@ -60,6 +66,9 @@ def ema_rows(hist_csv):
         return []
     out = []
     for r in csv.DictReader(open(p)):
+        t = int(r.get("trades", "0") or 0)
+        gross = float(r.get("pnl", "0") or 0)
+        ch = round(t * FUT_RT_CHARGE)
         out.append({
             "date": r["date"], "regime_label": r.get("regime", ""),
             "strategy": "EMA_CROSSOVER", "variant": _opt_label(r.get("option", "")),
@@ -67,8 +76,8 @@ def ema_rows(hist_csv):
             "params": f"ema{r.get('ema','')};gap{r.get('gap_pct','')}%;"
                       f"slope{r.get('slope_bars','')};volSMA{r.get('vol_sma','')};"
                       f"tsl{r.get('tsl','')};arm{r.get('arm','')}",
-            "trades": r.get("trades", "0"), "wins": r.get("W", "0"),
-            "losses": r.get("L", "0"), "pnl": r.get("pnl", "0"),
+            "trades": t, "wins": r.get("W", "0"), "losses": r.get("L", "0"),
+            "gross_pnl": round(gross), "charges": ch, "net_pnl": round(gross - ch),
             "exit_breakdown": r.get("exits", ""), "notes": r.get("notes", ""),
         })
     return out
@@ -84,12 +93,14 @@ def regime_rows():
         trades, _ = bt.simulate_day(ticks, REGIME_CFG, False)
         total = sum(t["pnl"] for t in trades)
         w = sum(1 for t in trades if t["pnl"] > 0)
+        ch = round(len(trades) * FUT_RT_CHARGE)
         out.append({
             "date": day, "regime_label": "", "strategy": "EMA_REGIME",
             "variant": "5/13 ER0.60/0.40", "timeframe": "3m",
             "params": "er_gate0.60;er_window60min;er_exit0.40;5/13EMA",
             "trades": len(trades), "wins": w, "losses": len(trades) - w,
-            "pnl": round(total), "exit_breakdown": _exits(trades),
+            "gross_pnl": round(total), "charges": ch, "net_pnl": round(total - ch),
+            "exit_breakdown": _exits(trades),
             "notes": "" if trades else "no-trade (ER gate kept out)",
         })
     return out
@@ -108,12 +119,14 @@ def straddle_rows():
         date = json.load(open(d / "metadata.json"))["date"]
         r = bs.simulate_day(d, prev_close.get(date))
         if r["traded"]:
+            net = r["net_pnl"]
             out.append({
                 "date": r["date"], "regime_label": "", "strategy": "STRADDLE",
                 "variant": "iron_butterfly", "timeframe": "-",
                 "params": "ATM;OTM8;PT25%;SL50%;entry0935",
-                "trades": 1, "wins": 1 if r["pnl"] > 0 else 0,
-                "losses": 0 if r["pnl"] > 0 else 1, "pnl": r["pnl"],
+                "trades": 1, "wins": 1 if net > 0 else 0,
+                "losses": 0 if net > 0 else 1,
+                "gross_pnl": r["pnl"], "charges": r["charges"], "net_pnl": net,
                 "exit_breakdown": f"{r['exit_reason']}:1",
                 "notes": f"premium {r['net_premium']}; {r['pnl_pct']}%",
             })
@@ -122,7 +135,8 @@ def straddle_rows():
                 "date": r["date"], "regime_label": "", "strategy": "STRADDLE",
                 "variant": "iron_butterfly", "timeframe": "-",
                 "params": "ATM;OTM8;PT25%;SL50%;entry0935",
-                "trades": 0, "wins": 0, "losses": 0, "pnl": 0,
+                "trades": 0, "wins": 0, "losses": 0,
+                "gross_pnl": 0, "charges": 0, "net_pnl": 0,
                 "exit_breakdown": "", "notes": f"skip:{r['reason']}",
             })
     return out
@@ -148,19 +162,20 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    agg = defaultdict(lambda: [0.0, 0, 0])  # pnl, trades, rows
+    agg = defaultdict(lambda: [0.0, 0.0, 0.0, 0])  # gross, charges, net, trades
     for r in rows:
         try:
-            agg[r["strategy"]][0] += float(r["pnl"])
-            agg[r["strategy"]][1] += int(r["trades"])
-            agg[r["strategy"]][2] += 1
+            agg[r["strategy"]][0] += float(r["gross_pnl"])
+            agg[r["strategy"]][1] += float(r["charges"])
+            agg[r["strategy"]][2] += float(r["net_pnl"])
+            agg[r["strategy"]][3] += int(r["trades"])
         except (ValueError, TypeError):
             pass
     print(f"wrote {len(rows)} rows -> {args.out}\n")
-    print(f"{'strategy':<16}{'total P&L':>12}{'trades':>8}{'rows':>6}")
+    print(f"{'strategy':<16}{'gross':>11}{'charges':>10}{'net':>11}{'trades':>8}")
     for s in ("EMA_CROSSOVER", "EMA_REGIME", "STRADDLE"):
-        p, t, n = agg[s]
-        print(f"{s:<16}{p:>+12,.0f}{t:>8}{n:>6}")
+        g, c, n, t = agg[s]
+        print(f"{s:<16}{g:>+11,.0f}{c:>10,.0f}{n:>+11,.0f}{t:>8}")
 
 
 if __name__ == "__main__":

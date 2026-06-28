@@ -25,6 +25,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+import charges as chg
+
 LOT_SIZE, LOTS = 65, 3
 QTY = LOT_SIZE * LOTS                 # 195
 PROFIT_TARGET_PCT, STOPLOSS_PCT = 25.0, 50.0
@@ -133,8 +135,10 @@ def simulate_day(day_dir, prev_close):
         final_pnl = pnl
     if final_pnl is None:
         final_pnl = 0.0
+    rt_charges = chg.options_iron_butterfly_roundtrip(e["ce"], e["pe"], e["hce"], e["hpe"], QTY)
     return {"date": date, "traded": True, "atm": atm, "net_premium": round(net_premium),
-            "pnl": round(final_pnl), "pnl_pct": round(final_pnl / net_premium * 100, 1) if net_premium else 0,
+            "pnl": round(final_pnl), "charges": round(rt_charges), "net_pnl": round(final_pnl - rt_charges),
+            "pnl_pct": round(final_pnl / net_premium * 100, 1) if net_premium else 0,
             "exit_reason": exit_reason, "exit_t": exit_t,
             "peak": round(peak), "trough": round(trough)}
 
