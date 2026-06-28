@@ -1,15 +1,14 @@
 #!/usr/bin/env python
 """
-EMA(9/21) Crossover Strategy — BANKNIFTY 3-Minute (Option 1 / ATR-TSL variant)
-==============================================================================
+EMA(9/21) Crossover Strategy — BANKNIFTY 3-Minute (Option 1)
+============================================================
 Buys/sells BANKNIFTY futures on EMA crossover with volume confirmation.
-Distinct 3-min variant of the 5-min strategy (run side-by-side; different name/state).
+Distinct 3-min 9/21 variant (run side-by-side; own name/state/logs).
 
-Entry : EMA(9) crosses EMA(21) on 3-min candles
-Gate  : decisive gap ≥0.01% + close vs EMA9 + EMA9(now)>EMA9(3 bars ago) slope + volume
-Filter: Volume > 1.5x SMA(10) of volume (≈30-min)
+Entry : EMA(9) crosses EMA(21) on 3-min candles, no confirmation window (cross-candle only)
+Gate  : decisive gap ≥0.01% + close vs EMA9 + EMA9(now)>EMA9(3 bars ago) slope + volume>1.5×SMA(10)
 Exit  : APPE adaptive profit-protection (arm ₹2,000/lot = ₹4,000) OR dynamic
-        ATR trailing stop (1.5×ATR(14)) OR reverse crossover — first to fire wins
+        pure ATR trailing stop (1.5×ATR(14)) OR reverse crossover — first to fire wins
 Product: MIS (intraday, auto square-off by broker at 3:15 PM)
 
 Run standalone:
@@ -54,9 +53,10 @@ QUANTITY = int(os.getenv("QUANTITY", "60"))       # 2 lots x 30 units
 LOT_SIZE = int(os.getenv("LOT_SIZE", "30"))       # BANKNIFTY futures lot size (confirmed 30)
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
-FAST_EMA = int(os.getenv("FAST_EMA", "9"))
+FAST_EMA = int(os.getenv("FAST_EMA", "9"))       # Opt1: 9/21 EMA pair
 SLOW_EMA = int(os.getenv("SLOW_EMA", "21"))
 SLOPE_BARS = int(os.getenv("SLOPE_BARS", "3"))   # Opt1: EMA9(now) vs EMA9(3 bars ago)
+CROSS_CONFIRM_BARS = int(os.getenv("CROSS_CONFIRM_BARS", "0"))  # Opt1: no confirmation window (cross-candle only)
 CANDLE_TIMEFRAME = os.getenv("CANDLE_TIMEFRAME", "3m")   # Opt1: 3-minute candles
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
 
@@ -81,7 +81,7 @@ TIGHT_TSL_ENABLED = os.getenv("TIGHT_TSL_ENABLED", "false").lower() == "true"
 # won't widen an already-tightened stop, but a high ATR at entry sets the wide initial distance.
 # TIGHT_TSL applies to percent mode only. Validate on tick-replay before enabling live.
 # See ADAPTIVE_PROFIT_EXIT_DESIGN.md §17.
-TSL_MODE = os.getenv("TSL_MODE", "atr").strip().lower()   # Opt1: dynamic ATR trailing stop ("percent" | "atr")
+TSL_MODE = os.getenv("TSL_MODE", "atr").strip().lower()   # Opt1: pure 1.5×ATR(14) trailing stop ("percent" | "atr")
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 ATR_MULT = float(os.getenv("ATR_MULT", "1.5"))
 
@@ -122,13 +122,29 @@ FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
 # Re-emit the STALE ERROR line every N seconds while ticks are still missing, so the warning
 # does not get buried under hours of [SIGNAL CHECK] noise in long-running logs.
 FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
+# Startup grace: before the FIRST tick ever, suppress the STALE warning for this long so the
+# normal pre-first-tick window (tick #1 usually lands 1-4s after subscribe) does not trip a
+# spurious "no ticks yet, >Ns" ERROR. Entry-blocking is unaffected (gated on _feed_ok(), which
+# stays strict). A genuinely dead feed still flags once this elapses with ws_alive False;
+# mid-session stalls (ws_alive already True) bypass the grace and warn immediately.
+FEED_STARTUP_GRACE_SEC = float(os.getenv("FEED_STARTUP_GRACE_SEC", "30"))
+# Feed watchdog: if the WS delivered ticks this run then goes SILENT this long, force a WS
+# reconnect (the silent mid-session stall raises no exception, so the normal reconnect never
+# fires). 0 disables. Should be > FEED_STALE_SEC so the health-guard warns first.
+WS_WATCHDOG_SEC = float(os.getenv("WS_WATCHDOG_SEC", "120"))
+# [LTP] heartbeat: with a position open, the per-tick [LTP] line (price/P&L/TSL/peak) prints on
+# EVERY tick (~1/s) — useful but very noisy in the log. Throttle it to at most one line every N
+# seconds. The trailing-SL & APPE logic still run on EVERY tick — ONLY the logging is throttled;
+# exits ([ALERT]/[EXIT]) and APPE arm/breach have their own lines, so nothing material is lost.
+# 0 = log every tick (legacy behaviour).
+LTP_LOG_INTERVAL = float(os.getenv("LTP_LOG_INTERVAL", "15"))
 
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
 
 MAX_LOSS_PER_DAY = float(os.getenv("MAX_LOSS_PER_DAY", "5000"))  # daily circuit breaker
 
-STRATEGY_NAME = os.getenv("STRATEGY_NAME", "EMA_9_21_BANKNIFTY_3M")
+STRATEGY_NAME = os.getenv("STRATEGY_NAME", "EMA_9_21_BANKNIFTY_3M_OPT1")
 STRATEGY_TAG = STRATEGY_NAME.replace("/", "_").replace(" ", "_")
 
 STATE_DIR = Path(os.getenv("STATE_DIR", "/root/data/openalgo/strategies/state"))
@@ -169,6 +185,9 @@ class EMACrossoverBot:
         self.trailing_sl = 0.0
         self.peak_price = 0.0      # tracks best price for trailing SL
         self.atr = None            # latest ATR(ATR_PERIOD) in points (completed candle); ATR-TSL mode
+        self._last_signal_msg = None  # de-dup [SIGNAL CHECK] log: only emit when content changes
+        self._candle_seq = 0          # per-run candle counter (logged as #N to differentiate candles)
+        self._candle_marker = None    # detects a new completed candle (its EMAs change at close)
         self.ltp = None
         self.exit_in_progress = False
         self.entry_pending = False
@@ -187,6 +206,8 @@ class EMACrossoverBot:
         self.appe_breach_start = None  # time.monotonic() when the floor breach began
         self.pnl_window = deque()      # (monotonic_ts, unrealized) over TREND_WINDOW_SEC
         self.last_tick_ts = None       # time.monotonic() of last on_ltp_update (feed-health)
+        self.start_ts = time.monotonic()  # run start — anchors the feed STALE startup grace
+        self.last_ltp_log_ts = 0.0     # time.monotonic() of last [LTP] heartbeat log (throttle)
         self.feed_stale = False        # True while the WS tick feed is stale
         self.shadow_reverse = None     # §14 reverse-confirm SHADOW (log-only); set on a reverse exit
         self.last_stale_warn_ts = 0.0  # time.monotonic() of last STALE log (rate-limits re-warns)
@@ -201,8 +222,8 @@ class EMACrossoverBot:
         log(f"[INIT] {STRATEGY_NAME}")
         log(f"[INIT] {self.symbol} on {EXCHANGE} | EMA({FAST_EMA}/{SLOW_EMA}) | {CANDLE_TIMEFRAME}")
         log(f"[INIT] Volume filter: >{VOLUME_FILTER_MULT}x SMA({VOLUME_SMA_PERIOD})")
-        log(f"[INIT] Signal gate (entry & reverse): cross + |EMA9−EMA21|≥{REVERSE_CONFIRM_PCT*100:.2f}% "
-              f"+ close vs EMA9 + EMA9 slope + volume")
+        log(f"[INIT] Signal gate (entry & reverse): cross + |EMA{FAST_EMA}−EMA{SLOW_EMA}|≥{REVERSE_CONFIRM_PCT*100:.2f}% "
+              f"+ close vs EMA{FAST_EMA} + EMA{FAST_EMA} slope({SLOPE_BARS}b) + volume")
         if TSL_MODE == "atr":
             log(f"[INIT] Trailing SL: ATR mode — {ATR_MULT}× ATR({ATR_PERIOD}) on {CANDLE_TIMEFRAME} "
                 f"(dynamic, ratchet-only) | Max daily loss: {MAX_LOSS_PER_DAY}")
@@ -346,10 +367,14 @@ class EMACrossoverBot:
             hit_sl = self.ltp >= self.trailing_sl
 
         sign = "+" if unrealized > 0 else ""
-        log(
-            f"[LTP] {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
-            f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}"
-        )
+        _ltp_now = time.monotonic()
+        if LTP_LOG_INTERVAL <= 0 or (_ltp_now - self.last_ltp_log_ts) >= LTP_LOG_INTERVAL:
+            self.last_ltp_log_ts = _ltp_now
+            log(
+                f"[LTP] {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
+                f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | "
+                f"APPE: {self._appe_exit_str(unrealized)} | Peak: {self.peak_price:.2f}"
+            )
 
         # APPE — adaptive profit-protection exit. First-to-fire vs the price trail below.
         if not self.exit_in_progress:
@@ -383,6 +408,14 @@ class EMACrossoverBot:
         logs (a one-shot log line gets buried under hours of [SIGNAL CHECK] output).
         """
         if self._feed_ok():
+            return
+        # Startup grace: before the first tick EVER, give the WS pipeline a moment to deliver
+        # tick #1 (normally 1-4s post-subscribe) before crying STALE — otherwise the first
+        # health check fires a spurious "no ticks yet, >Ns" ERROR in the normal pre-first-tick
+        # window (entries are already blocked by _feed_ok(), so this is log-only noise). A truly
+        # dead feed still flags once the grace elapses (ws_alive stays False); a mid-session
+        # stall (ws_alive already True) bypasses the grace and warns immediately.
+        if not self.ws_alive and (time.monotonic() - self.start_ts) < FEED_STARTUP_GRACE_SEC:
             return
         now = time.monotonic()
         if self.feed_stale and (now - self.last_stale_warn_ts) < FEED_STALE_REWARN_SEC:
@@ -424,6 +457,29 @@ class EMACrossoverBot:
         slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False)) / den
         return slope < 0
 
+    def _appe_floor_pnl(self, peak):
+        """Soft give-back floor in ₹ P&L for a given peak, plus the budget G.
+        G = GIVEBACK_K·√peak·√(units/ref) — size-aware so give-back-in-points grows √-fast.
+        floor = peak − G. Shared by _appe_evaluate (the live exit check) and the [LTP] display
+        so the level shown never drifts from the one actually enforced."""
+        budget = GIVEBACK_K * math.sqrt(max(peak, 0.0)) * math.sqrt((QUANTITY / LOT_SIZE) / GIVEBACK_REF_UNITS)
+        return peak - budget, budget
+
+    def _appe_exit_str(self, unrealized):
+        """APPE soft give-back floor for the [LTP] line: exit PRICE (parallel to the TSL) with the
+        floor ₹ in parens. 'off' if APPE disabled; 'unarmed' until the peak crosses the arm."""
+        if not APPE_ENABLED:
+            return "off"
+        peak = max(self.appe_peak, unrealized)
+        if not self.appe_armed and peak < PROFIT_ARM_THRESHOLD:
+            return "unarmed"
+        floor_pnl, _ = self._appe_floor_pnl(peak)
+        if self.position == "BUY":
+            px = self.entry_price + floor_pnl / QUANTITY
+        else:
+            px = self.entry_price - floor_pnl / QUANTITY
+        return f"{px:.2f} ({'+' if floor_pnl >= 0 else ''}{floor_pnl:.0f})"
+
     def _appe_evaluate(self, unrealized, now):
         """Return an exit reason ('APPE_HARD' / 'APPE_RATCHET') or None. Design doc §4."""
         if not APPE_ENABLED:
@@ -445,10 +501,8 @@ class EMACrossoverBot:
             else:
                 return None
 
-        # size-aware: √-scale the budget by units so give-back-in-points grows √-fast, not linearly
-        _units_factor = math.sqrt((QUANTITY / LOT_SIZE) / GIVEBACK_REF_UNITS)
-        budget = GIVEBACK_K * math.sqrt(max(self.appe_peak, 0.0)) * _units_factor
-        floor = self.appe_peak - budget
+        # size-aware budget G = k·√peak·√(units/ref); floor = peak − G (shared with the display)
+        floor, budget = self._appe_floor_pnl(self.appe_peak)
         giveback = self.appe_peak - unrealized
 
         # Gate 4 — catastrophic give-back: exit immediately, skip confirmation
@@ -528,6 +582,14 @@ class EMACrossoverBot:
                 log(f"[WS] Subscribed to {self.symbol} ({FEED_MODE} mode) — waiting for first tick (see [WS] FIRST TICK RECEIVED)...")
                 while not self.stop_event.is_set():
                     time.sleep(1)
+                    # Feed watchdog: a live feed that goes silent > WS_WATCHDOG_SEC is the mid-session
+                    # stall (no exception → normal reconnect never fires). Break to force a fresh
+                    # connect+resubscribe via the outer loop, self-healing the stall (preserves position).
+                    age = self._feed_age()
+                    if WS_WATCHDOG_SEC and self.ws_alive and age is not None and age > WS_WATCHDOG_SEC:
+                        log_error(f"[WS WATCHDOG] no ticks for {age:.0f}s (>{WS_WATCHDOG_SEC:.0f}s) after a live feed "
+                                  f"— forcing WS reconnect to self-heal the stall")
+                        break
             except Exception as e:
                 log_error(f"WebSocket connection error: {e}")
             finally:
@@ -594,6 +656,14 @@ class EMACrossoverBot:
         if TSL_MODE == "atr" and "atr" in df.columns:
             self.atr = float(last["atr"])
 
+        # Candle counter: bump when a new completed candle appears (its EMAs/close change at
+        # close — stable within a candle across intraday refetches). Logged as #N so consecutive
+        # candles are easy to tell apart during log analysis.
+        _marker = (last["ema_fast"], last["ema_slow"], last["close"])
+        if _marker != self._candle_marker:
+            self._candle_seq += 1
+            self._candle_marker = _marker
+
         # Crossover-noise gates (design doc §14/§16) — a bare cross isn't enough. A signal needs:
         #   1. the EMA cross (on the completed candle)
         #   2. a DECISIVE gap: |EMA9-EMA21| >= REVERSE_CONFIRM_PCT x close (~0.05% = ~28 BANKNIFTY pts)
@@ -608,37 +678,53 @@ class EMACrossoverBot:
 
         atr_str = (f" | ATR({ATR_PERIOD}): {self.atr:.0f} (TSL {ATR_MULT}×={ATR_MULT*self.atr:.0f}pt)"
                    if (TSL_MODE == "atr" and self.atr) else "")
-        log(
-            f"[SIGNAL CHECK] EMA({FAST_EMA}): {last['ema_fast']:.2f} | EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
-            f"gap: {gap:+.1f} (min ±{min_gap:.0f}) | close: {last['close']:.2f} | slope9: {slope9:+.1f} | "
+        sig_msg = (
+            f"[SIGNAL CHECK] #{self._candle_seq} | EMA({FAST_EMA}): {last['ema_fast']:.2f} | EMA({SLOW_EMA}): {last['ema_slow']:.2f} | "
+            f"gap: {gap:+.1f} (min ±{min_gap:.0f}) | close: {last['close']:.2f} | slope({SLOPE_BARS}b): {slope9:+.1f} | "
             f"Vol: {last['volume']:.0f} vs {VOLUME_FILTER_MULT}x SMA: {last['vol_sma'] * VOLUME_FILTER_MULT:.0f} | "
             f"Vol OK: {vol_ok}{atr_str}"
         )
+        # De-dup: only emit when the line content changes (new candle / volume / Vol-OK / ATR).
+        # Avoids dozens of identical lines per candle so a crossover is easy to spot.
+        if sig_msg != self._last_signal_msg:
+            log(sig_msg)
+            self._last_signal_msg = sig_msg
 
-        bull_cross = prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]
-        bear_cross = prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"]
+        # Crossover detection with optional N-candle confirmation window (CROSS_CONFIRM_BARS).
+        # Default 0 = cross must be on the completed candle (original §16 behaviour). With N>0, scan
+        # back from the completed candle; the most-recent cross within N candles stays eligible, so a
+        # thin cross that turns decisive a candle or two later can still trade (gap/close/slope/vol
+        # below are still required on the CURRENT completed candle). Stateless — recomputed each cycle.
+        bull_cross = bear_cross = False
+        for _k in range(CROSS_CONFIRM_BARS + 1):
+            _c = df.iloc[-(2 + _k)]
+            _p = df.iloc[-(3 + _k)]
+            if _p["ema_fast"] <= _p["ema_slow"] and _c["ema_fast"] > _c["ema_slow"]:
+                bull_cross = True; break          # most-recent cross is bullish
+            if _p["ema_fast"] >= _p["ema_slow"] and _c["ema_fast"] < _c["ema_slow"]:
+                bear_cross = True; break          # most-recent cross is bearish
 
-        # Bullish: cross + decisive gap + close above EMA9 + EMA9 rising + volume
+        # Bullish: cross + decisive gap + close above fast EMA + fast EMA rising + volume
         if bull_cross and TRADE_DIRECTION in ("LONG", "BOTH"):
             fails = []
             if gap < min_gap:                 fails.append(f"thin gap {gap:.1f}<{min_gap:.0f}")
-            if last["close"] <= last["ema_fast"]: fails.append("close≤EMA9")
-            if slope9 <= 0:                   fails.append(f"EMA9 slope {slope9:+.1f}≤0")
+            if last["close"] <= last["ema_fast"]: fails.append(f"close≤EMA{FAST_EMA}")
+            if slope9 <= 0:                   fails.append(f"EMA{FAST_EMA} slope {slope9:+.1f}≤0")
             if not vol_ok:                    fails.append("volume")
             if not fails:
-                log("[SIGNAL] BUY — cross + gap≥0.05% + close>EMA9 + EMA9 rising + volume")
+                log(f"[SIGNAL] BUY — cross + gap≥{REVERSE_CONFIRM_PCT*100:.2f}% + close>EMA{FAST_EMA} + EMA{FAST_EMA} rising + volume")
                 return "BUY"
             log(f"[SIGNAL] BUY crossover REJECTED — {', '.join(fails)}")
 
-        # Bearish: cross + decisive gap + close below EMA9 + EMA9 falling + volume
+        # Bearish: cross + decisive gap + close below fast EMA + fast EMA falling + volume
         if bear_cross and TRADE_DIRECTION in ("SHORT", "BOTH"):
             fails = []
             if -gap < min_gap:                fails.append(f"thin gap {gap:.1f}, |gap|<{min_gap:.0f}")
-            if last["close"] >= last["ema_fast"]: fails.append("close≥EMA9")
-            if slope9 >= 0:                   fails.append(f"EMA9 slope {slope9:+.1f}≥0")
+            if last["close"] >= last["ema_fast"]: fails.append(f"close≥EMA{FAST_EMA}")
+            if slope9 >= 0:                   fails.append(f"EMA{FAST_EMA} slope {slope9:+.1f}≥0")
             if not vol_ok:                    fails.append("volume")
             if not fails:
-                log("[SIGNAL] SELL — cross + gap≥0.05% + close<EMA9 + EMA9 falling + volume")
+                log(f"[SIGNAL] SELL — cross + gap≥{REVERSE_CONFIRM_PCT*100:.2f}% + close<EMA{FAST_EMA} + EMA{FAST_EMA} falling + volume")
                 return "SELL"
             log(f"[SIGNAL] SELL crossover REJECTED — {', '.join(fails)}")
 
