@@ -131,6 +131,12 @@ FEED_STARTUP_GRACE_SEC = float(os.getenv("FEED_STARTUP_GRACE_SEC", "30"))
 # reconnect (the silent mid-session stall raises no exception, so the normal reconnect never
 # fires). 0 disables. Should be > FEED_STALE_SEC so the health-guard warns first.
 WS_WATCHDOG_SEC = float(os.getenv("WS_WATCHDOG_SEC", "120"))
+# [LTP] heartbeat: with a position open, the per-tick [LTP] line (price/P&L/TSL/peak) prints on
+# EVERY tick (~1/s) — useful but very noisy in the log. Throttle it to at most one line every N
+# seconds. The trailing-SL & APPE logic still run on EVERY tick — ONLY the logging is throttled;
+# exits ([ALERT]/[EXIT]) and APPE arm/breach have their own lines, so nothing material is lost.
+# 0 = log every tick (legacy behaviour).
+LTP_LOG_INTERVAL = float(os.getenv("LTP_LOG_INTERVAL", "15"))
 
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
@@ -200,6 +206,7 @@ class EMACrossoverBot:
         self.pnl_window = deque()      # (monotonic_ts, unrealized) over TREND_WINDOW_SEC
         self.last_tick_ts = None       # time.monotonic() of last on_ltp_update (feed-health)
         self.start_ts = time.monotonic()  # run start — anchors the feed STALE startup grace
+        self.last_ltp_log_ts = 0.0     # time.monotonic() of last [LTP] heartbeat log (throttle)
         self.feed_stale = False        # True while the WS tick feed is stale
         self.shadow_reverse = None     # §14 reverse-confirm SHADOW (log-only); set on a reverse exit
         self.last_stale_warn_ts = 0.0  # time.monotonic() of last STALE log (rate-limits re-warns)
@@ -359,10 +366,14 @@ class EMACrossoverBot:
             hit_sl = self.ltp >= self.trailing_sl
 
         sign = "+" if unrealized > 0 else ""
-        log(
-            f"[LTP] {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
-            f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}"
-        )
+        _ltp_now = time.monotonic()
+        if LTP_LOG_INTERVAL <= 0 or (_ltp_now - self.last_ltp_log_ts) >= LTP_LOG_INTERVAL:
+            self.last_ltp_log_ts = _ltp_now
+            log(
+                f"[LTP] {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
+                f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | "
+                f"APPE: {self._appe_exit_str(unrealized)} | Peak: {self.peak_price:.2f}"
+            )
 
         # APPE — adaptive profit-protection exit. First-to-fire vs the price trail below.
         if not self.exit_in_progress:
@@ -445,6 +456,29 @@ class EMACrossoverBot:
         slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False)) / den
         return slope < 0
 
+    def _appe_floor_pnl(self, peak):
+        """Soft give-back floor in ₹ P&L for a given peak, plus the budget G.
+        G = GIVEBACK_K·√peak·√(units/ref) — size-aware so give-back-in-points grows √-fast.
+        floor = peak − G. Shared by _appe_evaluate (the live exit check) and the [LTP] display
+        so the level shown never drifts from the one actually enforced."""
+        budget = GIVEBACK_K * math.sqrt(max(peak, 0.0)) * math.sqrt((QUANTITY / LOT_SIZE) / GIVEBACK_REF_UNITS)
+        return peak - budget, budget
+
+    def _appe_exit_str(self, unrealized):
+        """APPE soft give-back floor for the [LTP] line: exit PRICE (parallel to the TSL) with the
+        floor ₹ in parens. 'off' if APPE disabled; 'unarmed' until the peak crosses the arm."""
+        if not APPE_ENABLED:
+            return "off"
+        peak = max(self.appe_peak, unrealized)
+        if not self.appe_armed and peak < PROFIT_ARM_THRESHOLD:
+            return "unarmed"
+        floor_pnl, _ = self._appe_floor_pnl(peak)
+        if self.position == "BUY":
+            px = self.entry_price + floor_pnl / QUANTITY
+        else:
+            px = self.entry_price - floor_pnl / QUANTITY
+        return f"{px:.2f} ({'+' if floor_pnl >= 0 else ''}{floor_pnl:.0f})"
+
     def _appe_evaluate(self, unrealized, now):
         """Return an exit reason ('APPE_HARD' / 'APPE_RATCHET') or None. Design doc §4."""
         if not APPE_ENABLED:
@@ -466,10 +500,8 @@ class EMACrossoverBot:
             else:
                 return None
 
-        # size-aware: √-scale the budget by units so give-back-in-points grows √-fast, not linearly
-        _units_factor = math.sqrt((QUANTITY / LOT_SIZE) / GIVEBACK_REF_UNITS)
-        budget = GIVEBACK_K * math.sqrt(max(self.appe_peak, 0.0)) * _units_factor
-        floor = self.appe_peak - budget
+        # size-aware budget G = k·√peak·√(units/ref); floor = peak − G (shared with the display)
+        floor, budget = self._appe_floor_pnl(self.appe_peak)
         giveback = self.appe_peak - unrealized
 
         # Gate 4 — catastrophic give-back: exit immediately, skip confirmation
