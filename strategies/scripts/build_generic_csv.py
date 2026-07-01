@@ -53,8 +53,8 @@ def _opt_label(option):
     o = option.strip()
     if o.startswith("BASELINE"):
         return "Opt5 EMA 9/21 5m (original)"
-    for pfx, lbl in (("VAR1", "Opt1 EMA 9/21 3m"), ("VAR2", "Opt2 EMA 9/21 2m+5mTrend"),
-                     ("VAR3", "Opt3 EMA 9/21 2m"), ("VAR4", "Opt4 EMA 7/15 3m (LIVE)")):
+    for pfx, lbl in (("VAR1", "Opt1 EMA 9/21 3m (LIVE)"), ("VAR2", "Opt2 EMA 9/21 2m+5mTrend"),
+                     ("VAR3", "Opt3 EMA 9/21 2m"), ("VAR4", "Opt4 EMA 7/15 3m")):
         if o.startswith(pfx):
             return lbl
     return o
@@ -96,7 +96,7 @@ def regime_rows():
         ch = round(len(trades) * FUT_RT_CHARGE)
         out.append({
             "date": day, "regime_label": "", "strategy": "EMA_REGIME",
-            "variant": "5/13 ER0.60/0.40", "timeframe": "3m",
+            "variant": "5/13 ER0.60/0.40 (LIVE)", "timeframe": "3m",
             "params": "er_gate0.60;er_window60min;er_exit0.40;5/13EMA",
             "trades": len(trades), "wins": w, "losses": len(trades) - w,
             "gross_pnl": round(total), "charges": ch, "net_pnl": round(total - ch),
