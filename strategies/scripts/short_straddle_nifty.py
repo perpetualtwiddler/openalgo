@@ -41,7 +41,7 @@ UNDERLYING = os.getenv("UNDERLYING", "NIFTY")
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NFO"))
 INDEX_EXCHANGE = os.getenv("INDEX_EXCHANGE", "NSE_INDEX")
 LOT_SIZE = int(os.getenv("LOT_SIZE", "65"))
-LOTS = int(os.getenv("LOTS", "6"))          # 2x sizing — personal sizing knob; Dinesh: set your own LOTS (default was 3)
+LOTS = int(os.getenv("LOTS", "6"))          # 2x sizing — Mandar + Dinesh both run 6 (doubled straddle, effective 2026-07-02)
 QUANTITY = LOT_SIZE * LOTS
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
