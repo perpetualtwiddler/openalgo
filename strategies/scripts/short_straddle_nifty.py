@@ -41,7 +41,7 @@ UNDERLYING = os.getenv("UNDERLYING", "NIFTY")
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NFO"))
 INDEX_EXCHANGE = os.getenv("INDEX_EXCHANGE", "NSE_INDEX")
 LOT_SIZE = int(os.getenv("LOT_SIZE", "65"))
-LOTS = int(os.getenv("LOTS", "3"))
+LOTS = int(os.getenv("LOTS", "6"))          # 2x sizing — personal sizing knob; Dinesh: set your own LOTS (default was 3)
 QUANTITY = LOT_SIZE * LOTS
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
@@ -77,6 +77,9 @@ EVENT_CALENDAR_FILE = Path(os.getenv("EVENT_CALENDAR_FILE",
 # P&L targets (as % of total premium collected)
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "25"))    # exit at 25% profit
 STOPLOSS_PCT = float(os.getenv("STOPLOSS_PCT", "50"))            # exit at 50% loss
+# Short-strike breach: exit the iron fly if the underlying moves >= BREACH_PCT% from the entry
+# ATM (directional-move stop — cuts earlier/tighter than the % P&L stop). 0 disables. OUR-SERVER.
+BREACH_PCT = float(os.getenv("BREACH_PCT", "0.55"))             # 0.55% of ATM ~= 131pt @ 23900
 
 # Consecutive SL cooldown — skip entry after N consecutive SL days
 CONSECUTIVE_SL_LIMIT = int(os.getenv("CONSECUTIVE_SL_LIMIT", "2"))
@@ -135,6 +138,7 @@ class ShortStraddleBot:
         self.ce_entry_price = 0.0
         self.pe_entry_price = 0.0
         self.total_premium = 0.0
+        self.atm_strike = None          # entry ATM strike — reference for the short-strike breach
 
         # Hedge leg state (iron butterfly)
         self.hedge_ce_symbol = None
@@ -160,6 +164,8 @@ class ShortStraddleBot:
         log(f"[INIT] Hedge: {'ON — ' + HEDGE_OFFSET + ' wings (iron butterfly)' if ENABLE_HEDGE else 'OFF (naked straddle)'}")
         log(f"[INIT] Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
         log(f"[INIT] Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
+        if BREACH_PCT:
+            log(f"[INIT] Short-strike breach: exit if {UNDERLYING} moves ≥{BREACH_PCT}% from entry ATM (directional-move cut)")
         if self.is_positioned:
             log(f"[INIT] Resumed position — CE: {self.ce_symbol} @ {self.ce_entry_price:.2f} | PE: {self.pe_symbol} @ {self.pe_entry_price:.2f}")
 
@@ -183,6 +189,7 @@ class ShortStraddleBot:
                 "hedge_pe_symbol": self.hedge_pe_symbol,
                 "hedge_ce_price": self.hedge_ce_price,
                 "hedge_pe_price": self.hedge_pe_price,
+                "atm_strike": self.atm_strike,
             }
             STATE_FILE.write_text(json.dumps(state))
             log(f"[STATE] Saved: positioned={self.is_positioned}")
@@ -207,6 +214,7 @@ class ShortStraddleBot:
             self.entry_done_today = state.get("entry_done_today", False)
             self.hedge_ce_symbol = state.get("hedge_ce_symbol")
             self.hedge_pe_symbol = state.get("hedge_pe_symbol")
+            self.atm_strike = state.get("atm_strike")
             self.hedge_ce_price = state.get("hedge_ce_price", 0.0)
             self.hedge_pe_price = state.get("hedge_pe_price", 0.0)
             if self.ce_entry_price > 0:
@@ -444,7 +452,8 @@ class ShortStraddleBot:
             quote = self.client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
             if quote.get("status") == "success":
                 spot = float(quote["data"].get("ltp", 0))
-                log(f"[ENTRY] {UNDERLYING} spot: {spot:.2f}")
+                self.atm_strike = round(spot / 50) * 50   # NIFTY 50-pt strikes; breach reference
+                log(f"[ENTRY] {UNDERLYING} spot: {spot:.2f} | ATM {self.atm_strike:.0f} | breach ±{BREACH_PCT}%")
             else:
                 log_error(f"ENTRY aborted — could not fetch {UNDERLYING} spot (feed issue): {quote}")
                 return False
@@ -821,13 +830,31 @@ class ShortStraddleBot:
                 end="",
             )
 
+            # Short-strike breach — cut if the underlying moved beyond the band (directional-move stop).
+            # Uses the index spot vs the entry ATM; tighter/earlier than the % P&L stop below.
+            breach_spot, breached = 0.0, False
+            if BREACH_PCT and self.atm_strike and not self.exit_in_progress:
+                try:
+                    _sq = self.client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
+                    breach_spot = float(_sq["data"].get("ltp", 0)) if _sq.get("status") == "success" else 0.0
+                except Exception:
+                    breach_spot = 0.0
+                if breach_spot and abs(breach_spot - self.atm_strike) >= self.atm_strike * BREACH_PCT / 100:
+                    breached = True
+
             # Profit target hit
             if pnl_pct >= PROFIT_TARGET_PCT and not self.exit_in_progress:
                 self.exit_in_progress = True
                 log(f"\n[TARGET] Profit {pnl_pct:.1f}% >= {PROFIT_TARGET_PCT}% — closing straddle")
                 threading.Thread(target=self.close_straddle, args=("PROFIT_TARGET",), daemon=True).start()
 
-            # Stop-loss hit (% of premium)
+            # Short-strike breach — directional-move cut (tighter/earlier than the % stop)
+            elif breached:
+                self.exit_in_progress = True
+                log(f"\n[BREACH] {UNDERLYING} {breach_spot:.0f} moved ≥{BREACH_PCT:.2f}% from ATM {self.atm_strike:.0f} — closing straddle")
+                threading.Thread(target=self.close_straddle, args=("BREACH",), daemon=True).start()
+
+            # Stop-loss hit (% of premium) — backstop
             elif pnl_pct <= -STOPLOSS_PCT and not self.exit_in_progress:
                 self.exit_in_progress = True
                 log(f"\n[STOPLOSS] Loss {pnl_pct:.1f}% exceeds -{STOPLOSS_PCT}% — closing straddle")
