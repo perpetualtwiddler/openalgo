@@ -452,8 +452,8 @@ class ShortStraddleBot:
             quote = self.client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
             if quote.get("status") == "success":
                 spot = float(quote["data"].get("ltp", 0))
-                self.atm_strike = round(spot / 50) * 50   # NIFTY 50-pt strikes; breach reference
-                log(f"[ENTRY] {UNDERLYING} spot: {spot:.2f} | ATM {self.atm_strike:.0f} | breach ±{BREACH_PCT}%")
+                self.atm_strike = round(spot / 50) * 50   # provisional; overwritten with the ACTUAL sold strike after fill
+                log(f"[ENTRY] {UNDERLYING} spot: {spot:.2f} | breach guard ±{BREACH_PCT}% (map drawn after fill)")
             else:
                 log_error(f"ENTRY aborted — could not fetch {UNDERLYING} spot (feed issue): {quote}")
                 return False
@@ -575,6 +575,24 @@ class ShortStraddleBot:
                 log(f"  Net premium collected: {self.total_premium:.0f}")
                 log(f"  Profit target ({PROFIT_TARGET_PCT}%): +{self.total_premium * PROFIT_TARGET_PCT / 100:.0f}")
                 log(f"  Stop-loss ({STOPLOSS_PCT}%): -{self.total_premium * STOPLOSS_PCT / 100:.0f}")
+                # --- short-strike breach: re-center on the ACTUAL sold ATM strike + draw the map ---
+                if BREACH_PCT and self.atm_strike:
+                    import re
+                    def _strike(sym):
+                        m = re.search(r"\d{2}[A-Z]{3}\d{2}(\d+)(?:CE|PE)$", sym or "")
+                        return int(m.group(1)) if m else None
+                    _a = _strike(self.ce_symbol)
+                    if _a:
+                        self.atm_strike = _a          # authoritative: the strike we actually sold
+                    _band = self.atm_strike * BREACH_PCT / 100
+                    _lo, _hi = self.atm_strike - _band, self.atm_strike + _band
+                    _wlo = _strike(self.hedge_pe_symbol) or (self.atm_strike - 400)
+                    _whi = _strike(self.hedge_ce_symbol) or (self.atm_strike + 400)
+                    log("  " + "-" * 61)
+                    log(f"  Straddle map — breach exits if {UNDERLYING} leaves the band (ATM ±{BREACH_PCT}% ≈ ±{_band:.0f} pts):")
+                    log(f"    PE-wing         breach↓         ATM=max-profit         ↓breach         CE-wing")
+                    log(f"    BUY {_wlo:.0f} ···· {_lo:.0f} ═══════ {self.atm_strike:.0f} ═══════ {_hi:.0f} ···· BUY {_whi:.0f}")
+                    log(f"    → EXIT the fly if {UNDERLYING} < {_lo:.0f}  or  > {_hi:.0f}   (PT +{PROFIT_TARGET_PCT:.0f}% / SL -{STOPLOSS_PCT:.0f}% = backstops)")
                 log("=" * 65)
                 self.save_state()
                 return True
@@ -822,25 +840,32 @@ class ShortStraddleBot:
             pnl_pct = (total_pnl / self.total_premium * 100) if self.total_premium > 0 else 0
             sign = "+" if total_pnl > 0 else ""
 
-            log(
-                f"\r[{now.strftime('%H:%M:%S')}] "
-                f"CE: {self.ce_ltp:.2f} | PE: {self.pe_ltp:.2f} | "
-                f"Net P&L: {sign}{total_pnl:.0f} ({sign}{pnl_pct:.1f}%)"
-                f"{f' [short:{short_pnl:+.0f} hedge:{hedge_pnl:+.0f}]' if ENABLE_HEDGE else ''}    ",
-                end="",
-            )
-
             # Short-strike breach — cut if the underlying moved beyond the band (directional-move stop).
-            # Uses the index spot vs the entry ATM; tighter/earlier than the % P&L stop below.
+            # Computed BEFORE the heartbeat so the line can show live spot vs breach levels.
             breach_spot, breached = 0.0, False
-            if BREACH_PCT and self.atm_strike and not self.exit_in_progress:
+            if BREACH_PCT and self.atm_strike:
                 try:
                     _sq = self.client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
                     breach_spot = float(_sq["data"].get("ltp", 0)) if _sq.get("status") == "success" else 0.0
                 except Exception:
                     breach_spot = 0.0
-                if breach_spot and abs(breach_spot - self.atm_strike) >= self.atm_strike * BREACH_PCT / 100:
+                if breach_spot and not self.exit_in_progress and abs(breach_spot - self.atm_strike) >= self.atm_strike * BREACH_PCT / 100:
                     breached = True
+            breach_str = ""
+            if BREACH_PCT and self.atm_strike:
+                _b = self.atm_strike * BREACH_PCT / 100
+                _lo, _hi = self.atm_strike - _b, self.atm_strike + _b
+                breach_str = (f" | {UNDERLYING} {breach_spot:.0f} → breach {_lo:.0f}/{_hi:.0f}"
+                              if breach_spot else f" | breach {_lo:.0f}/{_hi:.0f}")
+
+            log(
+                f"\r[{now.strftime('%H:%M:%S')}] "
+                f"CE: {self.ce_ltp:.2f} | PE: {self.pe_ltp:.2f} | "
+                f"Net P&L: {sign}{total_pnl:.0f} ({sign}{pnl_pct:.1f}%)"
+                f"{f' [short:{short_pnl:+.0f} hedge:{hedge_pnl:+.0f}]' if ENABLE_HEDGE else ''}"
+                f"{breach_str}    ",
+                end="",
+            )
 
             # Profit target hit
             if pnl_pct >= PROFIT_TARGET_PCT and not self.exit_in_progress:
