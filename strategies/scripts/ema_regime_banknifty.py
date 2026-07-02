@@ -206,6 +206,11 @@ class EMARegimeBot:
         self.session_open_dt = None           # 09:15 anchor for time-bucketing
         self.cur_bar_idx = None
         self.cur_bar_close = None
+        # MONOTONIC count of bars completed this session. Do NOT use len(self.bar_closes) as a
+        # bar counter — that deque is capped (maxlen below), so it saturates ~bar 64 (~12:27 for
+        # 3m bars) and the ER-exit's once-per-bar gate would then never advance, silently killing
+        # ER-exit for the rest of the day. This counter is uncapped so the gate keeps firing.
+        self.completed_bars = 0
         # completed-bar closes; keep enough history to settle EMA(SLOW) before the ER window fills
         self.bar_closes = deque(maxlen=self.er_bars + 3 * SLOW_EMA + 5)
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
@@ -220,7 +225,8 @@ class EMARegimeBot:
             f"~{(max(SLOW_EMA, self.er_bars) + 2) * self.tf_min}min warmup before the first signal")
         if ER_EXIT_ENABLED:
             log(f"[INIT] Exit (primary): ER-exit {ER_EXIT:g} — close if ER({ER_WINDOW_MIN}min) < {ER_EXIT:g} "
-                f"at bar-close ({self.er_bars} bars, same window as entry gate)")
+                f"at bar-close ({self.er_bars} bars, same window as entry gate) "
+                f"[monotonic bar-gate — fires all session]")
         log(f"[INIT] Exit (backstop): trailing-SL {TRAILING_SL_PCT}% OR alignment-flip reverse OR EOD 15:14")
         if APPE_ENABLED:
             log(f"[INIT] APPE on: arm≥₹{PROFIT_ARM_THRESHOLD:.0f} "
@@ -366,6 +372,7 @@ class EMARegimeBot:
                 self.cur_bar_idx = None
                 self.cur_bar_close = None
                 self.bar_closes.clear()
+                self.completed_bars = 0
             if now < self.session_open_dt:
                 return                                  # pre-open ticks — don't build bars
             idx = int((now - self.session_open_dt).total_seconds() // (self.tf_min * 60))
@@ -373,8 +380,9 @@ class EMARegimeBot:
                 self.cur_bar_idx = idx
             elif idx != self.cur_bar_idx:               # bucket rolled over → prior bar closed
                 self.bar_closes.append(self.cur_bar_close)
+                self.completed_bars += 1                 # monotonic; drives the ER-exit gate
                 self.cur_bar_idx = idx
-                log(f"[BAR] {self.tf_min}m close={self.cur_bar_close:.2f} | {len(self.bar_closes)} completed")
+                log(f"[BAR] {self.tf_min}m close={self.cur_bar_close:.2f} | {self.completed_bars} completed")
             self.cur_bar_close = ltp                    # latest price = forming bar's close
 
     # -------------------------------------------------------------------------
@@ -486,7 +494,7 @@ class EMARegimeBot:
             return False
         with self.bar_lock:
             closes = list(self.bar_closes)
-        n = len(closes)
+            n = self.completed_bars  # MONOTONIC — not len(closes), which caps at the deque maxlen
         if n <= self.er_exit_last_bar_count or n < self.er_bars:
             return False  # same bar as last check, or still warming up
         self.er_exit_last_bar_count = n
@@ -631,7 +639,7 @@ class EMARegimeBot:
         self.exit_in_progress = False
         self.trade_count += 1
         with self.bar_lock:
-            self.er_exit_last_bar_count = len(self.bar_closes)
+            self.er_exit_last_bar_count = self.completed_bars
         self.save_state()
         log(f"[ENTRY] Reconciled {signal} position @ {self.entry_price:.2f} | TSL: {self.trailing_sl:.2f}")
         return True
@@ -735,7 +743,7 @@ class EMARegimeBot:
                     self.exit_in_progress = False
                     self.trade_count += 1
                     with self.bar_lock:
-                        self.er_exit_last_bar_count = len(self.bar_closes)
+                        self.er_exit_last_bar_count = self.completed_bars
                     self.save_state()
                     log(f"[ENTRY] Filled @ {price:.2f} | TSL: {self.trailing_sl:.2f} | Trade #{self.trade_count}")
                     return True
