@@ -19,10 +19,10 @@
 ### Position Sizing
 | Parameter | Value |
 |-----------|-------|
-| Lot size | 65 |
-| Lots | 3 |
-| Quantity | 195 per leg |
-| Estimated margin | ~40,000-55,000 INR |
+| Lot size | 65 (verified vs broker master contract 2026-07-02) |
+| Lots | 6 (doubled from 3 on 2026-07-02) |
+| Quantity | 390 per leg |
+| Estimated margin | ~80,000-110,000 INR (2x, hedged) |
 
 ### Entry Rules
 Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All checks must pass in order:
@@ -40,9 +40,12 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 | Trigger | Threshold | Action |
 |---------|-----------|--------|
 | Profit target | +25% of net premium | Close all 4 legs |
+| Short-strike breach | NIFTY moves ≥0.55% from entry ATM (directional-move cut) | Close all 4 legs |
 | Stop-loss | -50% of net premium | Close all 4 legs |
 | EOD square-off | 15:14 IST | Close all 4 legs (before analyzer 15:15 cutoff) |
 | Position sync | Every 5 seconds | Detect manual/system exits |
+
+At entry the log prints a **breach map** (PE-wing / breach-lo / ATM=max-profit / breach-hi / CE-wing) and every P&L heartbeat shows live `NIFTY <spot> → breach <lo>/<hi>` alongside the `[short/hedge]` split. Added 2026-07-01 (breach) / 2026-07-02 (map + display + ATM-centering fix).
 
 ### Safety Features
 - **Iron butterfly hedge:** OTM8 wings (~400pts) cap maximum loss; wider wings retain more theta profit on calm days
@@ -50,6 +53,23 @@ Entry at **9:35 AM IST** (delayed from 9:20 to let opening noise settle). All ch
 - **Consecutive SL cooldown:** Pauses after 2 straight stop-loss days
 - **Trade history:** Last 30 trades recorded in `_history.json` for cooldown logic
 - **State persistence:** JSON state file survives strategy restarts (same-day only)
+
+### Design decisions — tested & rejected
+**ER-based trend-exit — REJECTED 2026-07-03 (backtested, underperforms).**
+
+*Idea (Mandar + Dinesh):* the straddle (short-vol) is hurt when a trend starts, while the EMA strategies profit from trends — opposite natures. Since they trade different underlyings (straddle = NIFTY, EMA = BANKNIFTY) we can't cross-trigger, so give the straddle its **own** trend detector: Kaufman **ER on NIFTY** (same metric Regime uses). A trend *starting* = **ER ≥ ~0.6** (the level at which Regime *enters*). On that signal, arm a tight profit-lock (APPE-like) — or hard-exit — to bank the good profit before the trend erodes it. *(Direction matters: HIGH ER = trend; ER < 0.4 = chop = the straddle's best zone, so exiting on low ER is backwards.)*
+
+*Result — backtested 31 days (QTY 390, net of charges). Every ER variant lost to the breach-only baseline:*
+
+| Config | Net | vs baseline |
+|--------|----:|------------:|
+| **baseline — PT25/SL50 + 0.55% breach only** | **+52,649** | — |
+| ER-lock (3m ×20, trig 0.6, give-back 0.20) | +30,380 | −22,269 |
+| ER-lock (3m ×10, trig 0.6, give-back 0.20) | +14,975 | −37,674 |
+| ER-hard-exit (3m ×20, trig 0.6) | +31,862 | −20,787 |
+| WRONG-DIR: exit at ER<0.4 | −7,138 | −59,787 |
+
+*Why it fails:* ER≥0.6 fires far too often intraday — NIFTY nearly always has a 30–60 min efficient stretch (the 30-min ER tripped on 20 of 21 trade days). Each fire is an early exit that forfeits the slow theta decay the straddle earns into EOD. No ER setting *beats* the breach; the best it can do is approach baseline by firing rarely. The **0.55% breach is the better trend-guard** — it fires only on a real, sustained ±0.55% move, not on every efficient wiggle. (The WRONG-DIR run — exit at ER<0.4 — was worst of all, confirming that exiting on chop is exactly backwards.) **Conclusion: keep PT25/SL50 + 0.55% breach; do not add ER-protection.** Scan: `straddle_er_scan.py`.
 
 ### Key Files (Server)
 - Strategy: `/root/data/openalgo/strategies/scripts/short_straddle_nifty_20260507020539.py`
