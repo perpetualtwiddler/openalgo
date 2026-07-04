@@ -211,6 +211,10 @@ class EMARegimeBot:
         # 3m bars) and the ER-exit's once-per-bar gate would then never advance, silently killing
         # ER-exit for the rest of the day. This counter is uncapped so the gate keeps firing.
         self.completed_bars = 0
+        # [REGIME CHECK] is logged at most once per newly-completed bar (see check_signal): this
+        # tracks the completed_bars count at the last emission so we skip the ~18 identical repeats
+        # between bar closes. -1 forces the first check to log.
+        self.regime_last_log_bars = -1
         # completed-bar closes; keep enough history to settle EMA(SLOW) before the ER window fills
         self.bar_closes = deque(maxlen=self.er_bars + 3 * SLOW_EMA + 5)
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
@@ -556,10 +560,20 @@ class EMARegimeBot:
 
         with self.bar_lock:
             closes = list(self.bar_closes)   # completed bars only; the forming bar is excluded
+            bar_count = self.completed_bars  # monotonic; drives the once-per-bar log gate
+
+        # This function reads only completed bars, so it recomputes identical values on every
+        # 10s poll between bar closes — logging each one produced ~18 duplicate lines per bar
+        # (2,100+/day). Emit the line only when a new bar has completed; the entry decision below
+        # is still evaluated on every poll. A decision flip can only occur on a new bar, so this
+        # loses no information.
+        new_bar = bar_count != self.regime_last_log_bars
 
         need = max(SLOW_EMA, self.er_bars) + 2
         if len(closes) < need:
-            log(f"[REGIME CHECK] warming up — {len(closes)}/{need} completed {self.tf_min}m bars")
+            if new_bar:
+                self.regime_last_log_bars = bar_count
+                log(f"[REGIME CHECK] warming up — {len(closes)}/{need} completed {self.tf_min}m bars")
             return None
 
         ema_fast = _ema(closes, FAST_EMA)
@@ -567,10 +581,12 @@ class EMARegimeBot:
         er = efficiency_ratio(closes[-(self.er_bars + 1):])
         align = "BUY" if ema_fast > ema_slow else "SELL"
 
-        log(f"[REGIME CHECK] ER({ER_WINDOW_MIN}min)={er:.2f} vs gate {ER_GATE:g} | "
-            f"EMA({FAST_EMA})={ema_fast:.1f} {'>' if align == 'BUY' else '<'} "
-            f"EMA({SLOW_EMA})={ema_slow:.1f} → {align} | "
-            f"{'TREND — armed' if er >= ER_GATE else 'chop — standing down'}")
+        if new_bar:
+            self.regime_last_log_bars = bar_count
+            log(f"[REGIME CHECK] ER({ER_WINDOW_MIN}min)={er:.2f} vs gate {ER_GATE:g} | "
+                f"EMA({FAST_EMA})={ema_fast:.1f} {'>' if align == 'BUY' else '<'} "
+                f"EMA({SLOW_EMA})={ema_slow:.1f} → {align} | "
+                f"{'TREND — armed' if er >= ER_GATE else 'chop — standing down'}")
 
         if er < ER_GATE:
             return None
