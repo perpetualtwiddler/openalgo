@@ -227,6 +227,32 @@ Worst single day: 2026-06-25 (−7,008): entry at intraday top (BUY 58,670, MFE 
 
 ---
 
+## Go-Based Strategies (PROPOSED — under evaluation, NOT decided)
+
+**Status (2026-07-06): OPEN.** Whether to port **EMA Regime v1.0** + **Short Straddle v1.0** to Go is undecided — a deep analysis may well conclude we keep the working Python strategies as-is. This records the options + findings so far; to be tuned as we decide.
+
+**Motivation:** consolidate with Dinesh's Go work + (marginal) performance. Two candidate architectures:
+
+**A. Standalone Go (`manja`, Dinesh's current build)** — one Go binary talking *directly* to Zerodha Kite; own login, own WS feed, own systemd units.
+- ✅ No Python hop; lowest latency.
+- ❌ Reinvents what OpenAlgo already gives us — strategy start/stop/schedule/status, fund mgmt, reports — and duplicates infra (separate login/feed/ops).
+
+**B. Go on the OpenAlgo platform (`openalgo-go` SDK + `execv` shim)** — the cleaner path if we go Go.
+- Each Go strategy uses the **`openalgo-go` SDK** (a Go *client* for OpenAlgo's REST/WS API — `github.com/marketcalls/openalgo-go`, ~6 mo stale locally, `git pull` to update) for feed + orders → shares OpenAlgo's single broker session/feed + its order/fund/report layer.
+- Managed by the `/python` host via a **~2-line Python `os.execv` shim**: the host launches `python -u shim.py`, which `execv`s the Go binary **in place** (same PID; inherits stdout/env/cwd), so start/stop/schedule/status/log-streaming/restore-on-restart all work **unchanged** — no OpenAlgo core changes. (The host hardcodes `venv/python -u <file>` at `python_strategy.py:540` and accepts only `.py`, so a bare Go binary is NOT managed without this shim.)
+
+**Latency (the key question, settled):** in **B**, the Python OpenAlgo server IS in the I/O path (feed via WS-proxy + ZeroMQ; orders via REST) — Go does **not** remove it. But that overhead is ~single-digit ms, dwarfed by the broker round-trip, and **immaterial for these strategies** (EMA-Regime acts on 3-min bar closes; the straddle enters once at 09:35, monitors ~10 s). So latency is neither a reason to go Go nor a reason to fear it here. Only **A** removes Python from the path — solving a latency problem these strategies don't have.
+
+**Perf reality:** for two *low-frequency* strategies Python is already fast enough; the Go win (compute/concurrency) is marginal. The real driver would be code-consolidation/stack preference — weigh against the port + integration effort.
+
+**Prerequisites for B (confirm before committing):**
+1. `openalgo-go` SDK feature-parity — must cover history, quotes, the straddle's multi-leg option order (`optionsmultiorder`), and WS feed subscription.
+2. The Go binary must **log to stdout** — the host captures the subprocess's stdout for the `/python` live-log view.
+
+**Recommendation (draft):** latency shouldn't drive this; the platform-reuse instinct (B over A) is sound; but for *these* strategies the least-effort, already-working option is to **keep the Python strategies** unless the Go consolidation benefit clearly justifies the port + shim + SDK work. **Decision pending deep analysis.**
+
+---
+
 ## Capital Allocation
 
 | Strategy | Allocated | Notes |
