@@ -48,6 +48,38 @@ def options_iron_butterfly_roundtrip(atm_ce, atm_pe, hedge_ce, hedge_pe, qty, n_
     return brokerage + stt + txn + sebi + stamp + gst
 
 
+def charges_from_fills(fills, is_options):
+    """Exact Zerodha charges from ACTUAL executed fills (for the live EOD summary).
+
+    fills: iterable of dicts each with 'action' ('BUY'/'SELL'), 'quantity', 'price'.
+    is_options: True for NFO options (straddle), False for index futures (EMA legs).
+
+    Unlike the *_roundtrip() helpers (which assume a symmetric entry≈exit backtest
+    trade), this applies the rate card per real fill, so it handles asymmetric
+    prices, multiple round-trips in a day, and any leg count correctly. Same rate
+    card, so it reconciles with the backtest helpers on a clean symmetric day.
+    """
+    buy_val = sum(f["quantity"] * f["price"] for f in fills if f["action"].upper() == "BUY")
+    sell_val = sum(f["quantity"] * f["price"] for f in fills if f["action"].upper() == "SELL")
+    turnover = buy_val + sell_val
+
+    if is_options:
+        brokerage = len(fills) * 20.0                 # flat ₹20/order
+        stt = 0.0015 * sell_val                        # 0.15% sell-side premium
+        txn = 0.0003553 * turnover                     # NSE 0.03553% on premium
+        stamp = 0.00003 * buy_val                      # 0.003% buy side
+    else:
+        # futures: 0.03% or ₹20/order (lower), charged per order
+        brokerage = sum(min(0.0003 * f["quantity"] * f["price"], 20.0) for f in fills)
+        stt = 0.0005 * sell_val                        # 0.05% sell-side notional
+        txn = 0.0000183 * turnover                     # NSE 0.00183%
+        stamp = 0.00002 * buy_val                      # 0.002% buy side
+
+    sebi = SEBI_PER_CR * turnover / 1e7                # ₹10/crore
+    gst = GST * (brokerage + sebi + txn)
+    return brokerage + stt + txn + sebi + stamp + gst
+
+
 if __name__ == "__main__":
     # quick reference print
     f = futures_roundtrip(57800, 60)

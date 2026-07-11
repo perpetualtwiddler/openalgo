@@ -7,6 +7,7 @@ Call register_all() once during app initialization.
 from subscribers import (
     log_subscriber,
     socketio_subscriber,
+    telegram_fill_subscriber,
     telegram_subscriber,
     whatsapp_subscriber,
 )
@@ -103,14 +104,20 @@ def register_all():
     bus.subscribe("analyzer.error", telegram_subscriber.on_analyzer_error, "telegram:analyzer_error")
     bus.subscribe("analyzer.error", whatsapp_subscriber.on_analyzer_error, "whatsapp:analyzer_error")
 
-    # --- sandbox engine-internal events (analyze mode only, UI auto-refresh) ---
-    # Only the socketio subscriber is wired — these are engine-driven state
-    # changes, not user API calls, so they don't belong in analyzer_logs and
-    # would be noise on telegram.
+    # --- sandbox engine-internal events (analyze mode only) ---
+    # socketio -> UI auto-refresh. telegram_fill -> enriched ENTRY/EXIT+margin
+    # alert (carries the real fill price + strategy tag). In analyze mode the
+    # plain order.placed telegram alert is suppressed so this is the single,
+    # richer per-trade alert.
     bus.subscribe(
         "sandbox.order_filled",
         socketio_subscriber.on_sandbox_order_filled,
         "socketio:sandbox_order_filled",
+    )
+    bus.subscribe(
+        "sandbox.order_filled",
+        telegram_fill_subscriber.on_sandbox_order_filled,
+        "telegram:sandbox_order_filled",
     )
     bus.subscribe(
         "sandbox.auto_squareoff",

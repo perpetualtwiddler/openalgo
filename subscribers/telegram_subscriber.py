@@ -24,6 +24,12 @@ def _send_alert(api_type, order_data, response_data, api_key):
 
 
 def on_order_placed(event):
+    # In analyze (paper) mode the enriched sandbox.order_filled alert
+    # (telegram_fill_subscriber) covers this trade with ENTRY/EXIT + margin and
+    # the real fill price — skip the plain placement alert to avoid a duplicate.
+    # Live mode still sends the plain alert here.
+    if (event.response_data or {}).get("mode") == "analyze":
+        return
     _send_alert(event.api_type, event.request_data, event.response_data, event.api_key)
 
 
