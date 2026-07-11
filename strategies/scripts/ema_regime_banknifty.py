@@ -108,6 +108,13 @@ HARD_MULT = float(os.getenv("HARD_MULT", "2.0"))            # catastrophic give-
 FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
 FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
 
+# [LTP] heartbeat: with a position open, the per-tick [LTP] line (price/P&L/TSL/peak) prints on
+# EVERY tick (~1-2/s) — useful but very noisy in the log (thousands of near-identical lines).
+# Throttle it to at most one line every N seconds. The trailing-SL & (optional) APPE logic still
+# run on EVERY tick — ONLY the logging is throttled; exits emit their own [ALERT]/[EXIT] lines, so
+# nothing material is lost. 0 = log every tick (legacy behaviour). Mirrors the Opt1 3m strategy.
+LTP_LOG_INTERVAL = float(os.getenv("LTP_LOG_INTERVAL", "15"))
+
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
 MAX_LOSS_PER_DAY = float(os.getenv("MAX_LOSS_PER_DAY", "5000"))  # daily circuit breaker
@@ -215,6 +222,8 @@ class EMARegimeBot:
         # tracks the completed_bars count at the last emission so we skip the ~18 identical repeats
         # between bar closes. -1 forces the first check to log.
         self.regime_last_log_bars = -1
+        # [LTP] heartbeat throttle (see LTP_LOG_INTERVAL): monotonic ts of the last [LTP] line.
+        self.last_ltp_log_ts = 0.0
         # completed-bar closes; keep enough history to settle EMA(SLOW) before the ER window fills
         self.bar_closes = deque(maxlen=self.er_bars + 3 * SLOW_EMA + 5)
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
@@ -344,8 +353,12 @@ class EMARegimeBot:
             hit_sl = self.ltp >= self.trailing_sl
 
         sign = "+" if unrealized > 0 else ""
-        log(f"[LTP] {self.ltp:.2f} | {self.position} @ {self.entry_price:.2f} | "
-            f"P&L: {sign}{unrealized:.0f} | TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}")
+        _ltp_now = time.monotonic()
+        if LTP_LOG_INTERVAL <= 0 or (_ltp_now - self.last_ltp_log_ts) >= LTP_LOG_INTERVAL:
+            self.last_ltp_log_ts = _ltp_now
+            log(f"[LTP] candle#{self.completed_bars} | {self.ltp:.2f} | "
+                f"{self.position} @ {self.entry_price:.2f} | P&L: {sign}{unrealized:.0f} | "
+                f"TSL: {self.trailing_sl:.2f} | Peak: {self.peak_price:.2f}")
 
         # APPE — adaptive profit-protection exit, first-to-fire vs the price trail.
         if not self.exit_in_progress:
@@ -573,7 +586,8 @@ class EMARegimeBot:
         if len(closes) < need:
             if new_bar:
                 self.regime_last_log_bars = bar_count
-                log(f"[REGIME CHECK] warming up — {len(closes)}/{need} completed {self.tf_min}m bars")
+                log(f"[REGIME CHECK] candle#{bar_count} | warming up — "
+                    f"{len(closes)}/{need} completed {self.tf_min}m bars")
             return None
 
         ema_fast = _ema(closes, FAST_EMA)
@@ -583,7 +597,7 @@ class EMARegimeBot:
 
         if new_bar:
             self.regime_last_log_bars = bar_count
-            log(f"[REGIME CHECK] ER({ER_WINDOW_MIN}min)={er:.2f} vs gate {ER_GATE:g} | "
+            log(f"[REGIME CHECK] candle#{bar_count} | ER({ER_WINDOW_MIN}min)={er:.2f} vs gate {ER_GATE:g} | "
                 f"EMA({FAST_EMA})={ema_fast:.1f} {'>' if align == 'BUY' else '<'} "
                 f"EMA({SLOW_EMA})={ema_slow:.1f} → {align} | "
                 f"{'TREND — armed' if er >= ER_GATE else 'chop — standing down'}")
