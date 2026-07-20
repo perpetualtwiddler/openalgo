@@ -71,6 +71,22 @@ At entry the log prints a **breach map** (PE-wing / breach-lo / ATM=max-profit /
 
 *Why it fails:* ER≥0.6 fires far too often intraday — NIFTY nearly always has a 30–60 min efficient stretch (the 30-min ER tripped on 20 of 21 trade days). Each fire is an early exit that forfeits the slow theta decay the straddle earns into EOD. No ER setting *beats* the breach; the best it can do is approach baseline by firing rarely. The **0.55% breach is the better trend-guard** — it fires only on a real, sustained ±0.55% move, not on every efficient wiggle. (The WRONG-DIR run — exit at ER<0.4 — was worst of all, confirming that exiting on chop is exactly backwards.) **Conclusion: keep PT25/SL50 + 0.55% breach; do not add ER-protection.** Scan: `straddle_er_scan.py`.
 
+**VIX floor, time-based profit bank, tighter entry gates — REJECTED 2026-07-16 (backtested, none beat baseline).**
+
+*Idea (Mandar, 07-16):* harden the straddle further — raise win rate / cut loss / protect profit (APPE-analog). The gap (1.0%), opening-range-trend (ORB 0.5%) and VIX-ceiling (25) gates are **already live**, so tested only the untested levers: a **VIX floor** (skip ultra-low-VIX/thin-premium days), a **time-based profit bank** (exit if up ≥ X% after early afternoon), plus a light sweep tightening the existing gates.
+
+*Result — backtested 40 days (QTY 390, net of charges). Every variant is a no-op or a loss vs the current baseline (+48,087, 17W/11L, worst −17,522):*
+
+| Config | Net | vs baseline |
+|--------|----:|------------:|
+| **baseline (current live)** | **+48,087** | — |
+| VIX floor 12 / 13 | +38,746 / +17,547 | −9,341 / −30,540 |
+| bank 15% @13:00 | +43,115 | −4,972 |
+| bank 20% @13:00 | +47,151 | −936 |
+| tighter gap ≥0.75 | +33,626 | −14,461 |
+
+*Why it fails:* low-VIX days are still net-**positive** (theta works even when premium is thin) — skipping them just deletes winners. The time-bank caps upside on days that would have run to PT/EOD, and no lever moves the worst day (−17,522, already a breach-cut day). Tightening the gap gate removes profitable days too. **Conclusion: the current config is already well-tuned; do not add a VIX floor, time-bank, or tighter gates.** Scan: `straddle_harden_scan.py`. *(Preliminary — 40 days, one vol regime; re-confirm at month-end.)*
+
 ### Key Files (Server)
 - Strategy: `/root/data/openalgo/strategies/scripts/short_straddle_nifty_20260507020539.py`
 - Event calendar: `/root/data/openalgo/strategies/scripts/event_calendar.json`
@@ -274,18 +290,50 @@ Worst single day: 2026-06-25 (−7,008): entry at intraday top (BUY 58,670, MFE 
 
 ---
 
+## Manual Override / Kill-Switch (live)
+
+Exit a live position at any point-in-time from the OpenAlgo **Positions** page:
+- **Close** (per row) flattens one symbol; **Close All** squares off everything. In live mode both send real MARKET square-off orders to the broker (`close_position_service.py` → `broker_module.close_all_positions`). Fills at market (small slippage).
+
+Both strategies auto-detect a manual close via broker-positionbook reconciliation (`sync_position()` — commented *"detect manual exits via web UI"*) and reset to flat, so they never double-count. **But re-entry behaviour differs — this is the key thing:**
+
+| Strategy | After a manual Close | Re-enters same day? |
+|----------|----------------------|---------------------|
+| **Straddle** | `sync` clears position; `entry_done_today` stays **True** (not reset by `_clear_position_state`) | **No** — done for the day |
+| **Opt1 / EMA (& Regime)** | `sync` sets flat; the loop keeps evaluating signals | **Yes** — re-opens on the next crossover/regime signal |
+
+**Hard override (exit AND stay out for the day):**
+- **Straddle** → just **Close** it. It will not re-enter.
+- **EMA (Opt1 / Regime)** → **Close the position AND Stop the strategy** (Python Strategy page → *Stop*; sets `manually_stopped`, which blocks re-entry and auto-restart). Closing alone is **not** enough — it re-arms on the next signal.
+
+Notes: there is a few-second gap between your click and the strategy's next `sync` poll — harmless (it briefly monitors an already-flat position, then clears). `Close All` flattens all 4 straddle legs near-simultaneously.
+
+**Reporting stays correct after a manual close (fixed 2026-07-20).** A manual Close-All / broker auto-square-off fill loses its strategy tag — the sandbox stamps it `AUTO_SQUARE_OFF` (verified live: paper Close-All produced 4 `AUTO_SQUARE_OFF`-tagged exit fills). Both the Telegram fill-alerts (`telegram_fill_subscriber`) and the EOD digest (`eod_summary`) now **re-attribute** such fills to the strategy that opened that symbol the same day (when the owner is unique) — so a manually-closed straddle still shows a correct 🔴 EXIT alert, the realized-P&L block, and one clean line in the EOD digest (not a phantom `AUTO_SQUARE_OFF` line). Caveat: BANKNIFTY-fut is shared by both EMA strategies, so a square-off there can't be uniquely split — it stays under `AUTO_SQUARE_OFF` (a non-issue for the straddle-only live plan; unique option symbols resolve cleanly).
+
+**EXIT alerts carry realized P&L (added 2026-07-20).** On the fill that fully closes a position, the EXIT alert appends `Gross / Charges (Zerodha) / Net` — EMA on each exit, straddle once on the final leg (dedup). Charges use the same `charges.py` rate card as the EOD digest.
+
+---
+
 ## Operational Timers (systemd)
 
-Two systemd timers keep the trading server hands-off:
+Four systemd timers keep the trading server hands-off (all `Mon..Fri`, `Asia/Kolkata`):
 
-| Timer | Schedule | Purpose |
-|-------|----------|---------|
-| `openalgo-restart.timer` | Daily 08:00 IST | Restart openalgo to dodge APScheduler executor death |
-| `openalgo-capture-trade-data.timer` | Mon-Fri 15:35 IST | Auto-archive day's intraday data for backtesting |
+| Timer | Schedule (IST) | Purpose |
+|-------|----------------|---------|
+| `openalgo-restart.timer` | 09:05 | Restart openalgo pre-market (fresh scheduler + broker session) |
+| `openalgo-eod-summary.timer` | 15:31 | TradeBhau EOD per-strategy P&L digest → Telegram (`eod_summary.py`) |
+| `openalgo-capture-trade-data.timer` | 15:35 | Archive the day's intraday option-chain data (`~/data/zerodha/trade-data`) for backtesting |
+| `openalgo-backtest-eval.timer` | 15:45 | Append day's EMA-option rows + rebuild cross-strategy comparison CSVs |
 
-**Why daily restart at 08:00 IST?** APScheduler's `ThreadPoolExecutor` enters a "shutdown" state after ~2 days of uptime — the scheduler logs `"all checks passed, starting"` at 09:15 IST but the subprocess never spawns. Restarting daily at 08:00 IST (75 min before market open, after master contract cutoff) keeps the executor healthy. Observed twice in May 2026 (26th, 29th) before this timer was put in place.
+Post-close ordering is deliberate: **15:31** digest reads the day's trades → **15:35** capture archives the chain data → **15:45** eval backtests on it.
 
-**Setup:** run `setup_systemd_timers.sh` on the server with `OPENALGO_API_KEY` set. Script is idempotent — safe to re-run.
+**Why the 09:05 restart?** A fresh pre-market restart avoids APScheduler's `ThreadPoolExecutor` "shutdown-after-~2-days" death (scheduler logs `"all checks passed, starting"` at 09:15 IST but never spawns the subprocess; observed May 26 & 29 2026) and clears overnight drift.
+
+**⚠️ Known issue (found 2026-07-17): the 09:05 restart lands _before_ the ~09:15 daily Zerodha login**, so openalgo's WebSocket broker adapter boots **unauthenticated** and the WS feed comes up flapping (stall → reconnect every few minutes) until a manual post-login restart. REST paths (e.g. the straddle's quote polling) are unaffected — they authenticate per call; only the WS-fed EMA strategies are hit. Daily ordering: `~08:55` feed config → `09:05` restart (pre-auth) → `~09:15` login → `09:15` strategies start.
+
+**Decision (2026-07-20): keep the 09:05 restart.** Retiming it *after* login was rejected — it would land at/after the 09:15 strategy start and could interrupt an active EMA entry. Since "before strategies" (09:15) and "after login" (~09:15) collide, retiming can't solve it. Mitigation options (one still to be chosen): (a) **log in before 09:05** — zero-code, makes the restart boot authenticated; (b) **broker-adapter reconnect-on-auth** code fix — keeps current login time, more work, deferred; (c) status-quo — the strategies' own WS auto-reconnect self-recovers, do a manual `systemctl restart openalgo` on a bad day. Regime candle-persistence (2026-07-20) now makes such a manual restart safe — warmup/ER-window survive it.
+
+**Setup:** run `setup_systemd_timers.sh` on the server with `OPENALGO_API_KEY` set (idempotent — safe to re-run). Note: `openalgo-eod-summary.timer` was added manually on 2026-07-11 and may not yet be in the script — fold it in when convenient.
 
 ```bash
 OPENALGO_API_KEY=<key> ./strategies/scripts/setup_systemd_timers.sh

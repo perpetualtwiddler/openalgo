@@ -122,9 +122,27 @@ def load_fills(date_str):
 
 def compute(fills):
     """Return per-strategy result dicts."""
+    # A manual Close-All / broker auto-square-off fill loses its strategy tag (stamped
+    # AUTO_SQUARE_OFF / blank). Re-attribute it to the strategy that opened that symbol
+    # today, when the owner is unique — else leave it as its own line (honest for the
+    # shared BANKNIFTY-fut case where it can't be split between Opt1/Regime).
+    squareoff = {"AUTO_SQUARE_OFF", "", None}
+    owners = {}
+    for r in fills:
+        tag = r["strategy"]
+        if tag and tag not in squareoff:
+            owners.setdefault(r["symbol"], set()).add(tag)
+
+    def _owner(r):
+        tag = r["strategy"]
+        if tag and tag not in squareoff:
+            return tag
+        o = owners.get(r["symbol"], set())
+        return next(iter(o)) if len(o) == 1 else (tag or "AUTO_SQUARE_OFF")
+
     strat = {}
     for r in fills:
-        strat.setdefault(r["strategy"], []).append(
+        strat.setdefault(_owner(r), []).append(
             {
                 "action": r["action"].upper(),
                 "quantity": int(r["quantity"]),

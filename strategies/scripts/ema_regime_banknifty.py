@@ -226,6 +226,8 @@ class EMARegimeBot:
         self.last_ltp_log_ts = 0.0
         # completed-bar closes; keep enough history to settle EMA(SLOW) before the ER window fills
         self.bar_closes = deque(maxlen=self.er_bars + 3 * SLOW_EMA + 5)
+        self.state_lock = threading.Lock()   # serialize state-file writes across threads
+        self._last_saved_bar_count = -1       # persist bar state once per newly-completed bar
         self.instrument = [{"exchange": EXCHANGE, "symbol": self.symbol}]
 
         self.load_state()
@@ -260,7 +262,19 @@ class EMARegimeBot:
 
     def save_state(self):
         try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            # Snapshot the locally-built bar state under bar_lock (WS thread mutates it).
+            with self.bar_lock:
+                bar_state = {
+                    "session_open_dt": (
+                        self.session_open_dt.isoformat() if self.session_open_dt else None
+                    ),
+                    "cur_bar_idx": self.cur_bar_idx,
+                    "cur_bar_close": self.cur_bar_close,
+                    "completed_bars": self.completed_bars,
+                    "bar_closes": list(self.bar_closes),
+                    "er_exit_last_bar_count": self.er_exit_last_bar_count,
+                    "regime_last_log_bars": self.regime_last_log_bars,
+                }
             state = {
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "symbol": self.symbol,
@@ -272,9 +286,13 @@ class EMARegimeBot:
                 "trade_count": self.trade_count,
                 "appe_peak": self.appe_peak,
                 "appe_armed": self.appe_armed,
+                **bar_state,
             }
-            STATE_FILE.write_text(json.dumps(state))
-            log(f"[STATE] Saved: {self.position} @ {self.entry_price:.2f}")
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with self.state_lock:   # serialize concurrent writes (loop / exit-thread / sync)
+                STATE_FILE.write_text(json.dumps(state))
+            if self.position:       # stay quiet on the per-bar flat-warmup saves
+                log(f"[STATE] Saved: {self.position} @ {self.entry_price:.2f}")
         except Exception as e:
             log(f"[STATE ERROR] Save failed: {e}")
 
@@ -299,6 +317,25 @@ class EMARegimeBot:
             self.trade_count = state.get("trade_count", 0)
             self.appe_peak = state.get("appe_peak", 0.0)
             self.appe_armed = state.get("appe_armed", False)
+            # Restore the locally-built candle window so a mid-day restart rebuilds ER/warmup
+            # instantly instead of resetting to zero. Same-day guard already passed above; the
+            # restored session_open_dt (today's 09:15) makes _update_bar keep, not clear, these.
+            sod = state.get("session_open_dt")
+            if sod:
+                try:
+                    self.session_open_dt = datetime.fromisoformat(sod)
+                except ValueError:
+                    self.session_open_dt = None
+            self.cur_bar_idx = state.get("cur_bar_idx")
+            self.cur_bar_close = state.get("cur_bar_close")
+            self.completed_bars = state.get("completed_bars", 0)
+            self.bar_closes.clear()
+            self.bar_closes.extend(state.get("bar_closes", []))
+            self.er_exit_last_bar_count = state.get("er_exit_last_bar_count", 0)
+            self.regime_last_log_bars = state.get("regime_last_log_bars", -1)
+            if self.completed_bars:
+                log(f"[STATE] Restored {self.completed_bars} completed bars "
+                    f"({len(self.bar_closes)} in ER window) — warmup/ER-exit preserved across restart")
         except Exception as e:
             log(f"[STATE ERROR] Load failed: {e}")
 
@@ -901,6 +938,13 @@ class EMARegimeBot:
                 self._check_feed_health()
                 self.reconcile_pending_entry()
                 self.reconcile_pending_exit()
+
+                # Persist bar state once per newly-completed bar, so a mid-day restart rebuilds
+                # the ER window instead of resetting warmup (candles are feed-only — no history
+                # reseed). Fires while flat during warmup too; save_state stays quiet then.
+                if self.completed_bars != self._last_saved_bar_count:
+                    self._last_saved_bar_count = self.completed_bars
+                    self.save_state()
 
                 if self.position:
                     self.sync_position()
