@@ -98,6 +98,17 @@ FEED_STALE_SEC = float(os.getenv("FEED_STALE_SEC", "60"))
 # does not get buried under hours of PNL output in long-running logs.
 FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
 
+# Quote-fetch resilience: batch the legs into ONE multiquotes call (fewer broker hits near the
+# close than 4 separate quotes), and retry a failed fetch a few times with a short backoff to
+# ride out transient broker-API timeouts (root cause of the 2026-07-24 stale window).
+QUOTE_RETRIES = int(os.getenv("QUOTE_RETRIES", "2"))          # extra attempts after the first
+QUOTE_RETRY_SEC = float(os.getenv("QUOTE_RETRY_SEC", "1.0"))  # backoff between attempts
+# On feed-stale, alert the user on Telegram (TradeBhau) so they can manually Close-All — the
+# quote feed going stale can't be prevented (upstream broker), but awareness can. username is the
+# linked OpenAlgo account; TG_ALERT_INTERVAL throttles re-alerts during a long stale window.
+ALERT_TG_USER = os.getenv("ALERT_TG_USER", "admin")
+TG_ALERT_INTERVAL = float(os.getenv("TG_ALERT_INTERVAL", "120"))
+
 
 def log_error(msg):
     """Emit a clearly-marked, flushed ERROR line for abnormal conditions (greppable)."""
@@ -130,6 +141,7 @@ class ShortStraddleBot:
         self.last_quote_ts = None   # time.monotonic() of last successful option quote
         self.feed_stale = False
         self.last_stale_warn_ts = 0.0  # time.monotonic() of last STALE log (rate-limits re-warns)
+        self.last_tg_alert_ts = 0.0    # time.monotonic() of last Telegram stale-alert (throttle)
 
         # Position state
         self.is_positioned = False
@@ -750,6 +762,23 @@ class ShortStraddleBot:
     # P&L Monitor
     # -------------------------------------------------------------------------
 
+    def _tg_notify(self, message):
+        """Best-effort TradeBhau alert via the OpenAlgo /telegram/notify API. Fire-and-forget
+        on a daemon thread; swallows all errors — must NEVER disrupt the monitor loop or PT/SL."""
+        def _send():
+            try:
+                import httpx
+
+                httpx.post(
+                    f"{API_HOST}/api/v1/telegram/notify",
+                    json={"apikey": API_KEY, "username": ALERT_TG_USER, "message": message},
+                    timeout=8,
+                )
+            except Exception as e:
+                log_error(f"Telegram notify failed (non-fatal): {e}")
+
+        threading.Thread(target=_send, daemon=True).start()
+
     def monitor_pnl(self):
         log("[MONITOR] P&L monitoring started")
 
@@ -772,45 +801,55 @@ class ShortStraddleBot:
                     self.close_straddle("EOD_SQUAREOFF")
                 continue
 
-            # Fetch current option LTPs
-            try:
-                ce_quote_ok = not self.ce_symbol
-                pe_quote_ok = not self.pe_symbol
-                hedge_ce_quote_ok = not self.hedge_ce_symbol
-                hedge_pe_quote_ok = not self.hedge_pe_symbol
-                if self.ce_symbol:
-                    ce_quote = self.client.quotes(symbol=self.ce_symbol, exchange="NFO")
-                    if ce_quote.get("status") == "success":
-                        self.ce_ltp = float(ce_quote["data"].get("ltp", self.ce_ltp))
-                        ce_quote_ok = True
+            # Fetch current option LTPs — ONE batched multiquotes call for all legs (fewer broker
+            # hits near the close), retried a few times to ride out transient timeouts. Any leg
+            # not returned keeps its last value; last_quote_ts advances only when ALL legs are
+            # fresh (so the stale-guard below fires if the feed is genuinely down).
+            legs = [
+                s for s in (
+                    self.ce_symbol, self.pe_symbol,
+                    self.hedge_ce_symbol if ENABLE_HEDGE else None,
+                    self.hedge_pe_symbol if ENABLE_HEDGE else None,
+                ) if s
+            ]
+            got = {}
+            for attempt in range(QUOTE_RETRIES + 1):
+                try:
+                    resp = self.client.multiquotes(
+                        symbols=[{"symbol": s, "exchange": "NFO"} for s in legs]
+                    )
+                    if resp.get("status") == "success":
+                        # Response shape: {"status","results":[{"symbol","exchange","data":{"ltp",..}}]}
+                        for item in (resp.get("results") or []):
+                            sym = item.get("symbol")
+                            ltp = (item.get("data") or {}).get("ltp")
+                            if sym and ltp is not None:
+                                got[sym] = float(ltp)
+                        if all(s in got for s in legs):
+                            break
+                except Exception as e:
+                    if attempt == 0:
+                        log_error(f"Option multiquotes exception: {e}")
+                if attempt < QUOTE_RETRIES:
+                    time.sleep(QUOTE_RETRY_SEC)
 
-                if self.pe_symbol:
-                    pe_quote = self.client.quotes(symbol=self.pe_symbol, exchange="NFO")
-                    if pe_quote.get("status") == "success":
-                        self.pe_ltp = float(pe_quote["data"].get("ltp", self.pe_ltp))
-                        pe_quote_ok = True
+            if self.ce_symbol in got:
+                self.ce_ltp = got[self.ce_symbol]
+            if self.pe_symbol in got:
+                self.pe_ltp = got[self.pe_symbol]
+            if ENABLE_HEDGE:
+                if self.hedge_ce_symbol in got:
+                    self.hedge_ce_ltp = got[self.hedge_ce_symbol]
+                if self.hedge_pe_symbol in got:
+                    self.hedge_pe_ltp = got[self.hedge_pe_symbol]
 
-                if ENABLE_HEDGE:
-                    if self.hedge_ce_symbol:
-                        hce_quote = self.client.quotes(symbol=self.hedge_ce_symbol, exchange="NFO")
-                        if hce_quote.get("status") == "success":
-                            self.hedge_ce_ltp = float(hce_quote["data"].get("ltp", self.hedge_ce_ltp))
-                            hedge_ce_quote_ok = True
-                    if self.hedge_pe_symbol:
-                        hpe_quote = self.client.quotes(symbol=self.hedge_pe_symbol, exchange="NFO")
-                        if hpe_quote.get("status") == "success":
-                            self.hedge_pe_ltp = float(hpe_quote["data"].get("ltp", self.hedge_pe_ltp))
-                            hedge_pe_quote_ok = True
-                if ce_quote_ok and pe_quote_ok and hedge_ce_quote_ok and hedge_pe_quote_ok:
-                    self.last_quote_ts = time.monotonic()
-                    if self.feed_stale:
-                        log("\n[FEED] Recovered — option quotes resuming")
-                        self.feed_stale = False
-                        self.last_stale_warn_ts = 0.0
-            except Exception as e:
-                log_error(f"Option quote fetch exception: {e}")
-                time.sleep(PNL_CHECK_INTERVAL)
-                continue
+            if legs and all(s in got for s in legs):
+                self.last_quote_ts = time.monotonic()
+                if self.feed_stale:
+                    log("\n[FEED] Recovered — option quotes resuming")
+                    self.feed_stale = False
+                    self.last_stale_warn_ts = 0.0
+                    self._tg_notify("✅ Straddle — option-quote feed RECOVERED; monitoring resumed.")
 
             # Feed-health: PT/SL rely on fresh quotes — if none for FEED_STALE_SEC, position is unprotected.
             # Re-warn every FEED_STALE_REWARN_SEC so the issue stays visible in long-running logs.
@@ -818,11 +857,21 @@ class ShortStraddleBot:
             if age is not None and age > FEED_STALE_SEC:
                 now_mono = time.monotonic()
                 if not self.feed_stale or (now_mono - self.last_stale_warn_ts) >= FEED_STALE_REWARN_SEC:
+                    onset = not self.feed_stale
                     self.feed_stale = True
                     self.last_stale_warn_ts = now_mono
                     log_error(f"Option-quote feed STALE (no successful quote for {age:.0f}s, >{FEED_STALE_SEC:.0f}s) "
                               f"— PT/SL evaluating on stale prices; straddle position is effectively UNPROTECTED. "
                               f"Consider manual square-off.")
+                    # Alert the user on Telegram — on onset immediately, then throttled re-alerts
+                    # while still stale (so a missed onset ping gets a follow-up).
+                    if onset or (now_mono - self.last_tg_alert_ts) >= TG_ALERT_INTERVAL:
+                        self.last_tg_alert_ts = now_mono
+                        self._tg_notify(
+                            f"⚠️ *Straddle feed STALE* (~{age:.0f}s) — option quotes not updating; "
+                            f"PT/SL/breach are on stale prices and the position is effectively "
+                            f"UNPROTECTED. Consider a manual Close All."
+                        )
 
             # Short legs P&L: profit when prices DROP from entry
             ce_pnl = (self.ce_entry_price - self.ce_ltp) * QUANTITY

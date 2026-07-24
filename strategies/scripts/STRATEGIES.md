@@ -53,6 +53,7 @@ At entry the log prints a **breach map** (PE-wing / breach-lo / ATM=max-profit /
 - **Consecutive SL cooldown:** Pauses after 2 straight stop-loss days
 - **Trade history:** Last 30 trades recorded in `_history.json` for cooldown logic
 - **State persistence:** JSON state file survives strategy restarts (same-day only)
+- **Stale-feed guard + alert (2026-07-24):** option LTPs fetched in ONE batched `multiquotes` call with a short retry (fewer broker hits + transient-timeout resilience near the close). If quotes still stop succeeding for `FEED_STALE_SEC`, the position is effectively unprotected (PT/SL/breach on stale prices) — the guard fires a **TradeBhau alert** (`/telegram/notify`, on onset + throttled re-alerts + recovery) so you can manually **Close All**. Root cause is upstream (Zerodha data-API timeouts), so this hardens *awareness + resilience*, not prevention; the wings still cap max loss and the EOD square-off is a feed-independent clock.
 
 ### Design decisions — tested & rejected
 **ER-based trend-exit — REJECTED 2026-07-03 (backtested, underperforms).**
