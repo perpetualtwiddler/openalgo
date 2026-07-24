@@ -7,6 +7,20 @@
 
 ---
 
+## Open TODOs / Backlog
+
+Tracked here so nothing slips (most recent context first).
+
+| # | Item | Priority | Notes |
+|---|------|----------|-------|
+| 1 | **Month-end report → Aug-1 straddle go-live decision** | HIGH (~Jul 31) | Decide straddle-only LIVE (real money, 390 qty, ~₹2L) on data: win rate, worst-day, **slippage estimate**, margin fit, + re-run the hardening scan on the full month. |
+| 2 | **Live-slippage measurement** | HIGH (go-live prep) | On the first live days, log fill-price vs LTP per fill → true live edge (paper P&L is an optimistic ceiling; matters most for the thin-edge straddle). |
+| 3 | **Pre-auth WS mitigation** (09:05 restart lands before ~09:15 login → EMA WS flaps, self-heals) | MED (parked) | Pick one: (a) log in before 09:05 (zero-code); (b) broker-adapter reconnect-on-auth (code fix); (c) status-quo + manual restart on a bad day. Regime now survives a mid-day restart, so (c) is safe. |
+| 4 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
+| 5 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
+
+---
+
 ## 1. NIFTY Iron Butterfly (Short Straddle + OTM Hedge)
 
 **File:** `short_straddle_nifty.py` (server: `short_straddle_nifty_20260507020539.py`)
