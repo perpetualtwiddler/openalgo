@@ -6,9 +6,16 @@ Self-contained: reads ONLY the per-day capture folders (no broker API), so it ca
 run offline. Mirrors the LIVE short_straddle_nifty params + gates:
 
   entry 09:35 | ATM CE+PE SELL + OTM8 (±400) CE+PE BUY (iron butterfly)
-  3 lots x 65 = 195 qty | profit target +25% / stop-loss -50% of net premium
+  6 lots x 65 = 390 qty | profit target +25% / stop-loss -50% of net premium
   gates: skip expiry day | |gap| < 1.0% | India VIX < 25 | ORB(15m) breakout < 0.5%
-  exit: PROFIT_TARGET / STOPLOSS / EOD 15:14
+  exit: PROFIT_TARGET / BREACH (0.55% from ATM) / STOPLOSS / EOD 15:14
+
+NOTE (2026-07-27): sizing and the breach exit are kept in lockstep with the LIVE strategy.
+Live doubled 195 -> 390 qty and added the 0.55% short-strike breach exit effective 2026-07-01;
+this engine ran stale at 195/no-breach until now, which understated straddle rows in the
+comparison CSVs. The whole series is now replayed at the CURRENT live config, i.e. it answers
+"what would today's configuration have earned over all captured history" (it is deliberately
+NOT a re-enactment of the smaller size actually traded before 2026-07-01).
 
 Per-day capture folder layout (date/):
   metadata.json            date, nifty_expiry(_tag), atm_strike, nifty_open/close, vix_*
@@ -27,9 +34,12 @@ from pathlib import Path
 
 import charges as chg
 
-LOT_SIZE, LOTS = 65, 3
-QTY = LOT_SIZE * LOTS                 # 195
+LOT_SIZE, LOTS = 65, 6
+QTY = LOT_SIZE * LOTS                 # 390 (live size since 2026-07-01)
 PROFIT_TARGET_PCT, STOPLOSS_PCT = 25.0, 50.0
+# Short-strike breach: cut if the underlying moves >= this % away from the sold ATM strike
+# (directional-move stop; live since 2026-07-01). 0 disables.
+BREACH_PCT = 0.55
 ENTRY_HHMM, EOD_HHMM = "09:35", "15:14"
 HEDGE_OFFSET_PTS = 400               # OTM8 = 8 strikes x 50pt
 GAP_THRESHOLD_PCT, VIX_THRESHOLD = 1.0, 25.0
@@ -121,6 +131,7 @@ def simulate_day(day_dir, prev_close):
     sl = net_premium * STOPLOSS_PCT / 100
     final_pnl, exit_reason, exit_t = None, "EOD", EOD_HHMM
     peak = trough = 0.0
+    breach_pts = atm * BREACH_PCT / 100 if BREACH_PCT else 0
     for t in minutes:
         if not all(t in d for d in legs.values()):
             continue
@@ -130,6 +141,9 @@ def simulate_day(day_dir, prev_close):
         peak, trough = max(peak, pnl), min(trough, pnl)
         if pnl >= pt:
             final_pnl, exit_reason, exit_t = pnl, "PROFIT_TARGET", t; break
+        # short-strike breach — directional-move cut (same precedence as live: PT, breach, SL)
+        if breach_pts and t in idx_close and abs(idx_close[t] - atm) >= breach_pts:
+            final_pnl, exit_reason, exit_t = pnl, "BREACH", t; break
         if pnl <= -sl:
             final_pnl, exit_reason, exit_t = pnl, "STOPLOSS", t; break
         final_pnl = pnl
