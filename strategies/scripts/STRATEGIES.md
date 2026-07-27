@@ -18,6 +18,7 @@ Tracked here so nothing slips (most recent context first).
 | 3 | **Pre-auth WS mitigation** (09:05 restart lands before ~09:15 login → EMA WS flaps, self-heals) | MED (parked) | Pick one: (a) log in before 09:05 (zero-code); (b) broker-adapter reconnect-on-auth (code fix); (c) status-quo + manual restart on a bad day. Regime now survives a mid-day restart, so (c) is safe. |
 | 4 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
 | 5 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
+| 6 | **Regenerate backtest comparison CSVs across ALL captured history** | MED (feeds #1, ~Jul 31) | Full rebuild (not just the daily append) of CSV#1 `options_history.csv` (EMA variants) + CSV#2 `strategies_comparison.csv` (all strategies: gross/charges/net via `charges.py`) over **every captured day — July 2026 + earlier months** in `~/data/zerodha/trade-data` (+ `log/market_data_capture`). Gives the complete multi-month view for the go-live decision. Recipe: `backtest_ema_dev.py` (CSV#1) + `build_generic_csv.py` (CSV#2). Also covers ad-hoc counterfactuals (e.g. the 2026-07-27 "if-started-on-time" run). |
 
 ---
 
