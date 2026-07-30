@@ -14,6 +14,7 @@ alert per fill. Live-mode alerts still flow through the plain path unchanged.
 """
 
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,38 @@ _charges_mod = None
 
 def _is_option(symbol):
     return symbol.endswith("CE") or symbol.endswith("PE")
+
+
+# Strike = the digits after the DDMMMYY expiry and before CE/PE in an option symbol.
+_STRIKE_RE = re.compile(r"\d{2}[A-Z]{3}\d{2}(\d+)(?:CE|PE)$")
+
+
+def _parse_strike(sym):
+    m = _STRIKE_RE.search(sym)
+    return int(m.group(1)) if m else None
+
+
+def _ironfly_margin(entry_fills, credit):
+    """Utilised margin for a hedged iron-fly ≈ its defined max loss:
+    wing_width × leg_qty − net_credit. Mirrors eod_summary._ironfly_margin so the
+    per-trade alert and the EOD digest report the SAME number. None if unparseable
+    (e.g. a naked/unhedged structure, where a single leg's margin isn't meaningful).
+    """
+    try:
+        sell = {"CE": None, "PE": None, "q": 0}
+        buy = {"CE": None, "PE": None}
+        for f in entry_fills:
+            side = "CE" if f["symbol"].endswith("CE") else "PE"
+            k = _parse_strike(f["symbol"])
+            if f["action"] == "SELL":
+                sell[side] = k
+                sell["q"] = max(sell["q"], f["quantity"])
+            else:
+                buy[side] = k
+        width = max(abs(buy["CE"] - sell["CE"]), abs(sell["PE"] - buy["PE"]))
+        return width * sell["q"] - credit
+    except (TypeError, KeyError, ValueError):
+        return None
 
 
 def _rupees(x):
@@ -114,7 +147,8 @@ def _strategy_pnl_today(strategy, tradeid):
         day = _day_for(con, tradeid)
         rows = con.execute(
             "SELECT symbol, action, quantity, CAST(price AS FLOAT), strategy "
-            "FROM sandbox_trades WHERE substr(trade_timestamp,1,10)=?",
+            "FROM sandbox_trades WHERE substr(trade_timestamp,1,10)=? "
+            "ORDER BY trade_timestamp",
             (day,),
         ).fetchall()
     finally:
@@ -140,7 +174,7 @@ def _strategy_pnl_today(strategy, tradeid):
         else:
             d["net"] -= qty
             d["sv"] += qty * price
-        fills.append({"action": act, "quantity": qty, "price": price})
+        fills.append({"action": act, "quantity": qty, "price": price, "symbol": sym})
     if not fills:
         return None
     fully_flat = all(v["net"] == 0 for v in by_sym.values())
@@ -150,7 +184,23 @@ def _strategy_pnl_today(strategy, tradeid):
         charges = _charges().charges_from_fills(fills, is_opt)
     except Exception:
         charges = 0.0
-    return fully_flat, gross, charges, gross - charges, len(fills)
+
+    # Consolidated utilised margin for the whole structure. Options (iron-fly) =
+    # defined max loss from the ENTRY legs (fills are chronological, so the opening
+    # legs are the first half of a flat round-trip). Futures = margin on the entry
+    # notional. Same basis as the EOD digest.
+    margin = None
+    entry = fills[: len(fills) // 2] if fully_flat and len(fills) >= 2 else []
+    if is_opt:
+        if entry:
+            credit = sum(f["quantity"] * f["price"] for f in entry if f["action"] == "SELL") - sum(
+                f["quantity"] * f["price"] for f in entry if f["action"] == "BUY"
+            )
+            margin = _ironfly_margin(entry, credit)
+    elif entry:
+        margin = sum(f["quantity"] * f["price"] for f in entry) * FUT_MARGIN_PCT
+
+    return fully_flat, gross, charges, gross - charges, len(fills), margin
 
 
 def _position_before(strategy, symbol, tradeid):
@@ -254,19 +304,25 @@ def on_sandbox_order_filled(event):
             except Exception:
                 pnl = None
             if pnl and pnl[0]:  # fully_flat
-                _, gross, charges, net, n_fills = pnl
+                _, gross, charges, net, n_fills, margin = pnl
                 key = (strategy, datetime.now(IST).strftime("%Y-%m-%d"), n_fills)
                 with _pnl_lock:
                     first = key not in _pnl_reported
                     if first:
                         _pnl_reported.add(key)
                 if first:
+                    legs_txt = f" ({n_fills // 2} legs)" if n_fills > 2 else ""
+                    message += f"\n──── Position closed{legs_txt} · realized P&L ────"
+                    if margin:
+                        # consolidated across all legs of the structure
+                        message += f"\nUtilised margin: ~{_rupees(margin)}"
                     message += (
-                        "\n──── Position closed · realized P&L ────"
                         f"\nGross: {_signed_rupees(gross)}"
                         f"\nCharges: −{_rupees(charges)}  (Zerodha)"
                         f"\nNet: *{_signed_rupees(net)}*"
                     )
+                    if margin:
+                        message += f"\nReturn on margin: {net / margin * 100:+.1f}%"
         telegram_alert_service.send_broadcast_alert(message)
         logger.info(
             f"[telegram-fill] {label} alert sent: {strategy} "

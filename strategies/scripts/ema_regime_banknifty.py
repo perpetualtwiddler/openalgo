@@ -115,6 +115,13 @@ FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
 # nothing material is lost. 0 = log every tick (legacy behaviour). Mirrors the Opt1 3m strategy.
 LTP_LOG_INTERVAL = float(os.getenv("LTP_LOG_INTERVAL", "15"))
 
+# Feed-stale Telegram alert (TradeBhau): the WS tick feed going stale can't be prevented
+# (upstream broker), but awareness can — push an alert so a stale window isn't silent while a
+# position may be open and unprotected. ALERT_TG_USER = the linked OpenAlgo account;
+# TG_ALERT_INTERVAL throttles re-alerts during a long stale window.
+ALERT_TG_USER = os.getenv("ALERT_TG_USER", "admin")
+TG_ALERT_INTERVAL = float(os.getenv("TG_ALERT_INTERVAL", "120"))
+
 TRADE_DIRECTION = os.getenv("TRADE_DIRECTION", "BOTH")
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "10"))
 MAX_LOSS_PER_DAY = float(os.getenv("MAX_LOSS_PER_DAY", "5000"))  # daily circuit breaker
@@ -204,6 +211,7 @@ class EMARegimeBot:
         self.last_tick_ts = None
         self.feed_stale = False
         self.last_stale_warn_ts = 0.0
+        self.last_tg_alert_ts = 0.0    # time.monotonic() of last Telegram stale-alert (throttle)
         self.ws_alive = False
         self.tf_min = _tf_minutes(CANDLE_TIMEFRAME)
         self.er_bars = max(2, ER_WINDOW_MIN // self.tf_min)  # completed bars in the ER window
@@ -364,6 +372,7 @@ class EMARegimeBot:
             log("[FEED] Recovered — market-data ticks resumed")
             self.feed_stale = False
             self.last_stale_warn_ts = 0.0
+            self._tg_notify(f"✅ *{STRATEGY_NAME}* — market-data feed RECOVERED; ticks resumed.")
 
         # Build local candles from the tick stream — every tick, whether flat or in a trade.
         self._update_bar(self.ltp)
@@ -450,12 +459,30 @@ class EMARegimeBot:
         age = self._feed_age()
         return age is not None and age <= FEED_STALE_SEC
 
+    def _tg_notify(self, message):
+        """Best-effort TradeBhau alert via the OpenAlgo /telegram/notify API. Fire-and-forget
+        on a daemon thread; swallows all errors — must NEVER disrupt the strategy loop."""
+        def _send():
+            try:
+                import httpx
+
+                httpx.post(
+                    f"{API_HOST}/api/v1/telegram/notify",
+                    json={"apikey": API_KEY, "username": ALERT_TG_USER, "message": message},
+                    timeout=8,
+                )
+            except Exception as e:
+                log_error(f"Telegram notify failed (non-fatal): {e}")
+
+        threading.Thread(target=_send, daemon=True).start()
+
     def _check_feed_health(self):
         if self._feed_ok():
             return
         now = time.monotonic()
         if self.feed_stale and (now - self.last_stale_warn_ts) < FEED_STALE_REWARN_SEC:
             return
+        onset = not self.feed_stale
         self.feed_stale = True
         self.last_stale_warn_ts = now
         age = self._feed_age()
@@ -466,6 +493,15 @@ class EMARegimeBot:
             f"trailing-SL & APPE are INACTIVE; blocking new entries"
             + ("; a POSITION IS OPEN AND UNPROTECTED — consider manual square-off." if self.position else ".")
         )
+        # Alert on Telegram — immediately on onset, then throttled while still stale.
+        if onset or (now - self.last_tg_alert_ts) >= TG_ALERT_INTERVAL:
+            self.last_tg_alert_ts = now
+            pos_txt = (f"A {self.position} POSITION IS OPEN and UNPROTECTED (trailing-SL/ER-exit "
+                       f"inactive) — consider a manual Close All."
+                       if self.position else "Currently flat; new entries are blocked.")
+            self._tg_notify(
+                f"⚠️ *{STRATEGY_NAME}* — market-data feed STALE ({age_str}). {pos_txt}"
+            )
 
     def _reset_appe(self):
         self.appe_peak = 0.0
