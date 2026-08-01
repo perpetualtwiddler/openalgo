@@ -126,6 +126,11 @@ STATE_DIR = Path(os.getenv("STATE_DIR", "/root/data/openalgo/strategies/state"))
 STATE_FILE = STATE_DIR / f"{STRATEGY_TAG}_state.json"
 HISTORY_FILE = STATE_DIR / f"{STRATEGY_TAG}_history.json"
 
+# Slippage log — append-only CSV, one row per leg fill. MARKET orders cross the spread, and
+# with 8 option legs a day that drag is the biggest unknown in whether the paper edge survives
+# live. Records fill price vs a reference price so the real cost can be measured.
+SLIPPAGE_LOG = Path(os.getenv("SLIPPAGE_LOG", "/root/data/openalgo/log/slippage.csv"))
+
 
 # =============================================================================
 # BOT
@@ -608,6 +613,20 @@ class ShortStraddleBot:
                 log("=" * 65)
                 self.save_state()
                 self._notify_entry()
+                # Slippage: snapshot the legs right AFTER the fills (we can't do it before —
+                # the API resolves ATM/OTM8 into symbols only when the order returns). Taken
+                # post-fill so it never delays entry; the reference is therefore a moment
+                # later than submission and already includes our own market impact, so treat
+                # entry slippage as a conservative LOWER bound. (Exit refs are exact.)
+                _ref = self._quote_snapshot([self.ce_symbol, self.pe_symbol,
+                                             self.hedge_ce_symbol, self.hedge_pe_symbol])
+                self._log_slippage("ENTRY", [
+                    (self.ce_symbol, "SELL", self.ce_entry_price, _ref.get(self.ce_symbol), "post-fill-quote"),
+                    (self.pe_symbol, "SELL", self.pe_entry_price, _ref.get(self.pe_symbol), "post-fill-quote"),
+                ] + ([
+                    (self.hedge_ce_symbol, "BUY", self.hedge_ce_price, _ref.get(self.hedge_ce_symbol), "post-fill-quote"),
+                    (self.hedge_pe_symbol, "BUY", self.hedge_pe_price, _ref.get(self.hedge_pe_symbol), "post-fill-quote"),
+                ] if ENABLE_HEDGE else []))
                 return True
             else:
                 log_error("ENTRY fill prices not confirmed — flattening any live legs instead of monitoring with invalid P&L thresholds")
@@ -790,6 +809,61 @@ class ShortStraddleBot:
     # persisted locally (they live in the broker's tradebook). Emitting here uses
     # the strategy's own fill prices and P&L, so it behaves identically in both
     # modes and is the authoritative source for the numbers.
+
+    def _log_slippage(self, phase, legs):
+        """Append per-leg slippage rows. `legs` = [(symbol, action, fill, ref, ref_src)].
+
+        cost = money LOST to crossing the spread, in ₹ (positive = worse than reference):
+          SELL -> ref - fill   (sold below reference)
+          BUY  -> fill - ref   (paid above reference)
+        Best-effort and fully guarded — this is measurement only and must never affect
+        trading. Called AFTER the orders are done, so it can't delay an entry or exit.
+        """
+        try:
+            import csv as _csv
+
+            SLIPPAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            new = not SLIPPAGE_LOG.exists()
+            now = datetime.now()
+            total = 0.0
+            with open(SLIPPAGE_LOG, "a", newline="") as f:
+                w = _csv.writer(f)
+                if new:
+                    w.writerow(["date", "time", "strategy", "phase", "symbol", "action",
+                                "qty", "fill_price", "ref_price", "ref_source",
+                                "slip_per_unit", "slip_rupees"])
+                for sym, action, fill, ref, ref_src in legs:
+                    if not sym or not fill or not ref:
+                        continue
+                    per = (ref - fill) if action.upper() == "SELL" else (fill - ref)
+                    cost = per * QUANTITY
+                    total += cost
+                    w.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"),
+                                STRATEGY_NAME, phase, sym, action.upper(), QUANTITY,
+                                f"{fill:.2f}", f"{ref:.2f}", ref_src,
+                                f"{per:.4f}", f"{cost:.2f}"])
+            log(f"[SLIPPAGE] {phase}: {total:+.0f} INR across {len(legs)} legs "
+                f"(ref={legs[0][4] if legs else 'n/a'})")
+        except Exception as e:
+            log(f"[SLIPPAGE] log skipped (non-fatal): {e}")
+
+    def _quote_snapshot(self, symbols):
+        """LTPs for the given legs in one batched call. Returns {symbol: ltp}."""
+        try:
+            resp = self.client.multiquotes(
+                symbols=[{"symbol": s, "exchange": "NFO"} for s in symbols if s]
+            )
+            if resp.get("status") != "success":
+                return {}
+            out = {}
+            for item in (resp.get("results") or []):
+                sym = item.get("symbol")
+                ltp = (item.get("data") or {}).get("ltp")
+                if sym and ltp is not None:
+                    out[sym] = float(ltp)
+            return out
+        except Exception:
+            return {}
 
     @staticmethod
     def _md(s):
@@ -1143,6 +1217,17 @@ class ShortStraddleBot:
         prem_pct = total_pnl / self.total_premium * 100 if self.total_premium > 0 else 0
         log(f"  Total P&L: {sign}{total_pnl:.0f} ({sign}{prem_pct:.1f}% of premium)")
         log("=" * 65)
+
+        # Slippage: the monitor loop stops polling once exit_in_progress is set, so the stored
+        # LTPs are frozen at the prices the exit DECISION was made on — an exact reference for
+        # "we decided to exit at X, we actually got Y". Only legs that really filled are logged.
+        self._log_slippage("EXIT", [
+            (self.ce_symbol, "BUY", ce_exit, self.ce_ltp, "decision-ltp"),
+            (self.pe_symbol, "BUY", pe_exit, self.pe_ltp, "decision-ltp"),
+        ] + ([
+            (self.hedge_ce_symbol, "SELL", hedge_ce_exit, self.hedge_ce_ltp, "decision-ltp"),
+            (self.hedge_pe_symbol, "SELL", hedge_pe_exit, self.hedge_pe_ltp, "decision-ltp"),
+        ] if ENABLE_HEDGE else []))
 
         # Alert BEFORE clearing state — _notify_exit reads entry prices/premium/strikes.
         self._notify_exit(reason, ce_exit or self.ce_ltp, pe_exit or self.pe_ltp,
