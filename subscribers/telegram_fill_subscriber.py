@@ -41,6 +41,12 @@ _pnl_reported = set()
 _pnl_lock = threading.Lock()
 _charges_mod = None
 
+# Strategies that emit their OWN trade alerts (mode-agnostic, from the strategy process) are
+# skipped here — otherwise analyze mode would double-alert. This subscriber only ever fires in
+# analyze mode (it hooks a sandbox event), so anything that must also work LIVE has to
+# self-alert; the straddle does. Matched as a case-insensitive substring of the strategy tag.
+SELF_ALERTING = ("straddle",)
+
 
 def _is_option(symbol):
     return symbol.endswith("CE") or symbol.endswith("PE")
@@ -294,6 +300,9 @@ def on_sandbox_order_filled(event):
     """Send an enriched ENTRY/EXIT + margin alert for a sandbox fill."""
     try:
         message, label, strategy = _build_message(event)
+        if any(s in (strategy or "").lower() for s in SELF_ALERTING):
+            logger.debug(f"[telegram-fill] skipped (self-alerting strategy): {strategy}")
+            return
         # On the fill that fully closes the position, append realized P&L
         # (gross / Zerodha charges / net). EMA: every exit closes it. Straddle:
         # only the leg that observes all legs flat, reported once (dedup).

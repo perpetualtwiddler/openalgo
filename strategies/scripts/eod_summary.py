@@ -104,7 +104,20 @@ def _ironfly_margin(entry_fills, credit):
         return None
 
 
-def load_fills(date_str):
+STRADDLE_TAG = "9:20 AM Short Straddle - Nifty ATM"
+
+
+def _analyze_mode():
+    """True = paper (sandbox) engine; False = real broker orders."""
+    try:
+        from database.settings_db import get_analyze_mode
+
+        return bool(get_analyze_mode())
+    except Exception:
+        return True   # fail safe: assume paper rather than hitting the broker
+
+
+def _load_fills_sandbox(date_str):
     import sqlite3
 
     con = sqlite3.connect(DB_PATH)
@@ -118,6 +131,52 @@ def load_fills(date_str):
     ).fetchall()
     con.close()
     return rows
+
+
+def _load_fills_live(date_str):
+    """LIVE: read the broker tradebook. Two honest limitations vs the sandbox path:
+
+    1. The broker tradebook has NO strategy tag (brokers don't know ours), so trades are
+       attributed by instrument: NIFTY options -> the straddle (the only live strategy).
+       Anything else is surfaced as an explicit 'LIVE (untagged)' line rather than being
+       silently folded into a strategy — if a second strategy goes live, that line is the
+       signal that real per-order tagging is needed.
+    2. A broker tradebook only covers the CURRENT day, so a past date can't be rebuilt.
+    """
+    from database.auth_db import get_api_key_for_tradingview
+    from services.tradebook_service import get_tradebook
+
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    if date_str != today:
+        print(f"[warn] live mode: broker tradebook only covers today ({today}); "
+              f"cannot rebuild {date_str}")
+        return []
+
+    api_key = get_api_key_for_tradingview("admin")
+    ok, resp, _ = get_tradebook(api_key=api_key)
+    if not ok or resp.get("status") != "success":
+        print(f"[warn] live tradebook fetch failed: {resp.get('message')}")
+        return []
+
+    out = []
+    for t in resp.get("data") or []:
+        sym = t.get("symbol") or ""
+        out.append({
+            "strategy": STRADDLE_TAG if is_option_symbol(sym) else f"LIVE untagged · {sym}",
+            "symbol": sym,
+            "exchange": t.get("exchange", ""),
+            "action": (t.get("action") or "").upper(),
+            "quantity": int(t.get("quantity") or 0),
+            "price": float(t.get("average_price") or 0),
+            "trade_timestamp": str(t.get("timestamp") or ""),
+        })
+    return out
+
+
+def load_fills(date_str):
+    """Analyze mode -> sandbox_trades (carries per-strategy tags).
+    Live -> broker tradebook (see _load_fills_live for the attribution caveats)."""
+    return _load_fills_sandbox(date_str) if _analyze_mode() else _load_fills_live(date_str)
 
 
 def compute(fills):

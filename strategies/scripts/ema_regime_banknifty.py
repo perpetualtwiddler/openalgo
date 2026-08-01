@@ -137,6 +137,13 @@ def log_error(msg):
     print(f"\n[ERROR] [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _md(s):
+    """Escape interpolated text for Telegram's legacy-Markdown parser — a lone `_` (e.g. the
+    default STRATEGY_NAME 'EMA_9_21_BANKNIFTY_3M_OPT1') breaks parsing and silently downgrades
+    the whole message to plain text."""
+    return str(s).replace("_", " ")
+
+
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts}  {msg}", flush=True)
@@ -372,7 +379,7 @@ class EMARegimeBot:
             log("[FEED] Recovered — market-data ticks resumed")
             self.feed_stale = False
             self.last_stale_warn_ts = 0.0
-            self._tg_notify(f"✅ *{STRATEGY_NAME}* — market-data feed RECOVERED; ticks resumed.")
+            self._tg_notify(f"✅ *{_md(STRATEGY_NAME)}* — market-data feed RECOVERED; ticks resumed.")
 
         # Build local candles from the tick stream — every tick, whether flat or in a trade.
         self._update_bar(self.ltp)
@@ -500,7 +507,7 @@ class EMARegimeBot:
                        f"inactive) — consider a manual Close All."
                        if self.position else "Currently flat; new entries are blocked.")
             self._tg_notify(
-                f"⚠️ *{STRATEGY_NAME}* — market-data feed STALE ({age_str}). {pos_txt}"
+                f"⚠️ *{_md(STRATEGY_NAME)}* — market-data feed STALE ({age_str}). {pos_txt}"
             )
 
     def _reset_appe(self):

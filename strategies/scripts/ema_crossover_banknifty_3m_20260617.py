@@ -161,6 +161,13 @@ def log_error(msg):
     """Emit a clearly-marked, flushed ERROR line for abnormal conditions (greppable)."""
     print(f"\n[ERROR] [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
+def _md(s):
+    """Escape interpolated text for Telegram's legacy-Markdown parser — a lone `_` (e.g. the
+    default STRATEGY_NAME 'EMA_9_21_BANKNIFTY_3M_OPT1') breaks parsing and silently downgrades
+    the whole message to plain text."""
+    return str(s).replace("_", " ")
+
+
 def log(msg):
     """Timestamped, append-mode log — no \r, no overwriting, safe outside a TTY."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -341,7 +348,7 @@ class EMACrossoverBot:
             log("[FEED] Recovered — market-data ticks resumed")
             self.feed_stale = False
             self.last_stale_warn_ts = 0.0
-            self._tg_notify(f"✅ *{STRATEGY_NAME}* — market-data feed RECOVERED; ticks resumed.")
+            self._tg_notify(f"✅ *{_md(STRATEGY_NAME)}* — market-data feed RECOVERED; ticks resumed.")
 
         # §14 reverse-confirm SHADOW — resolve any pending shadow each tick (log-only, no trade change).
         # Placed before the flat-position return so it keeps tracking after the reverse exit / while paused.
@@ -464,7 +471,7 @@ class EMACrossoverBot:
                        f"inactive) — consider a manual Close All."
                        if self.position else "Currently flat; new entries are blocked.")
             self._tg_notify(
-                f"⚠️ *{STRATEGY_NAME}* — market-data feed STALE ({age_str}). {pos_txt}"
+                f"⚠️ *{_md(STRATEGY_NAME)}* — market-data feed STALE ({age_str}). {pos_txt}"
             )
 
     def _reset_appe(self):

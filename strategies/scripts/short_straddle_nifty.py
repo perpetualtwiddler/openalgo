@@ -607,6 +607,7 @@ class ShortStraddleBot:
                     log(f"    → EXIT the fly if {UNDERLYING} < {_lo:.0f}  or  > {_hi:.0f}   (PT +{PROFIT_TARGET_PCT:.0f}% / SL -{STOPLOSS_PCT:.0f}% = backstops)")
                 log("=" * 65)
                 self.save_state()
+                self._notify_entry()
                 return True
             else:
                 log_error("ENTRY fill prices not confirmed — flattening any live legs instead of monitoring with invalid P&L thresholds")
@@ -778,6 +779,142 @@ class ShortStraddleBot:
                 log_error(f"Telegram notify failed (non-fatal): {e}")
 
         threading.Thread(target=_send, daemon=True).start()
+
+    # -------------------------------------------------------------------------
+    # Trade notifications (mode-agnostic — work in LIVE and analyze alike)
+    # -------------------------------------------------------------------------
+    #
+    # These are emitted BY THE STRATEGY rather than by the sandbox fill-event
+    # subscriber, because that event (`sandbox.order_filled`) only exists in
+    # analyze mode — there is no live fill event, and live trades are not
+    # persisted locally (they live in the broker's tradebook). Emitting here uses
+    # the strategy's own fill prices and P&L, so it behaves identically in both
+    # modes and is the authoritative source for the numbers.
+
+    @staticmethod
+    def _md(s):
+        """Make interpolated text safe for Telegram's legacy-Markdown parser. A lone `_`
+        (e.g. reason 'EOD_SQUAREOFF', or the default STRATEGY_NAME 'SHORT_STRADDLE_NIFTY')
+        is read as an italic marker and makes the whole message fail to parse — Telegram
+        then re-sends it as plain text, silently dropping every bold marker."""
+        return str(s).replace("_", " ")
+
+    @staticmethod
+    def _strike_of(sym):
+        import re
+
+        m = re.search(r"\d{2}[A-Z]{3}\d{2}(\d+)(?:CE|PE)$", sym or "")
+        return int(m.group(1)) if m else None
+
+    def _wing_width(self):
+        """Points between the sold ATM and a bought wing, from the ACTUAL leg symbols."""
+        if not ENABLE_HEDGE:
+            return None
+        a_ce, a_pe = self._strike_of(self.ce_symbol), self._strike_of(self.pe_symbol)
+        w_ce, w_pe = self._strike_of(self.hedge_ce_symbol), self._strike_of(self.hedge_pe_symbol)
+        try:
+            return max(abs(w_ce - a_ce), abs(a_pe - w_pe))
+        except TypeError:
+            return None
+
+    def _utilised_margin(self):
+        """Defined-risk margin for the fly = wing width x qty - net credit. Same basis as
+        eod_summary / the fill-alert block, so every report agrees."""
+        w = self._wing_width()
+        if not w or self.total_premium is None:
+            return None
+        return w * QUANTITY - self.total_premium
+
+    def _roundtrip_charges(self, exits):
+        """Zerodha charges for the full 8-leg round trip, from actual entry+exit prices."""
+        try:
+            import charges as chg
+
+            entries = [
+                {"action": "SELL", "quantity": QUANTITY, "price": self.ce_entry_price},
+                {"action": "SELL", "quantity": QUANTITY, "price": self.pe_entry_price},
+            ]
+            if ENABLE_HEDGE:
+                entries += [
+                    {"action": "BUY", "quantity": QUANTITY, "price": self.hedge_ce_price},
+                    {"action": "BUY", "quantity": QUANTITY, "price": self.hedge_pe_price},
+                ]
+            return chg.charges_from_fills(entries + exits, True)
+        except Exception as e:
+            log(f"[NOTIFY] charge calc skipped (non-fatal): {e}")
+            return None
+
+    def _notify_entry(self):
+        """Consolidated ENTRY alert — one message covering all legs."""
+        try:
+            margin = self._utilised_margin()
+            lines = [
+                f"🟢 *{self._md(STRATEGY_NAME)}* — POSITIONED",
+                f"{'Iron butterfly' if ENABLE_HEDGE else 'Short straddle'} · {UNDERLYING} · "
+                f"{LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty",
+                "─────────────────────",
+                f"SELL {self.ce_symbol} @ ₹{self.ce_entry_price:,.2f}",
+                f"SELL {self.pe_symbol} @ ₹{self.pe_entry_price:,.2f}",
+            ]
+            if ENABLE_HEDGE:
+                lines += [
+                    f"BUY  {self.hedge_ce_symbol} @ ₹{self.hedge_ce_price:,.2f}",
+                    f"BUY  {self.hedge_pe_symbol} @ ₹{self.hedge_pe_price:,.2f}",
+                ]
+            lines.append(f"Premium collected: ₹{self.total_premium:,.0f}")
+            if margin:
+                lines.append(f"Utilised margin: ~₹{margin:,.0f}")
+            if BREACH_PCT and self.atm_strike:
+                b = self.atm_strike * BREACH_PCT / 100
+                lines.append(
+                    f"Breach band: {self.atm_strike - b:,.0f} / {self.atm_strike + b:,.0f}"
+                    f"  (ATM {self.atm_strike:,.0f} ±{BREACH_PCT}%)"
+                )
+            lines.append(
+                f"Targets: PT +{PROFIT_TARGET_PCT:.0f}% / SL −{STOPLOSS_PCT:.0f}% · "
+                f"EOD {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}"
+            )
+            self._tg_notify("\n".join(lines))
+        except Exception as e:
+            log(f"[NOTIFY] entry alert skipped (non-fatal): {e}")
+
+    def _notify_exit(self, reason, ce_exit, pe_exit, hce_exit, hpe_exit, total_pnl):
+        """Consolidated EXIT alert — realized P&L for the whole structure."""
+        try:
+            exits = [
+                {"action": "BUY", "quantity": QUANTITY, "price": ce_exit},
+                {"action": "BUY", "quantity": QUANTITY, "price": pe_exit},
+            ]
+            if ENABLE_HEDGE:
+                exits += [
+                    {"action": "SELL", "quantity": QUANTITY, "price": hce_exit},
+                    {"action": "SELL", "quantity": QUANTITY, "price": hpe_exit},
+                ]
+            charges = self._roundtrip_charges(exits)
+            net = total_pnl - charges if charges is not None else None
+            margin = self._utilised_margin()
+            emoji = "🔴" if total_pnl < 0 else "🟢"
+            n_legs = 4 if ENABLE_HEDGE else 2
+            lines = [
+                f"{emoji} *{self._md(STRATEGY_NAME)}* — CLOSED ({self._md(reason)})",
+                f"{n_legs} legs · {QUANTITY} qty",
+                "─────────────────────",
+                f"CE: sold ₹{self.ce_entry_price:,.2f} → bought ₹{ce_exit:,.2f}",
+                f"PE: sold ₹{self.pe_entry_price:,.2f} → bought ₹{pe_exit:,.2f}",
+            ]
+            if margin:
+                lines.append(f"Utilised margin: ~₹{margin:,.0f}")
+            lines.append(f"Gross: {'+' if total_pnl >= 0 else '−'}₹{abs(total_pnl):,.0f}")
+            if charges is not None:
+                lines.append(f"Charges: −₹{charges:,.0f}  (Zerodha)")
+                lines.append(f"Net: *{'+' if net >= 0 else '−'}₹{abs(net):,.0f}*")
+                if margin:
+                    lines.append(f"Return on margin: {net / margin * 100:+.1f}%")
+            if self.total_premium:
+                lines.append(f"({total_pnl / self.total_premium * 100:+.1f}% of premium)")
+            self._tg_notify("\n".join(lines))
+        except Exception as e:
+            log(f"[NOTIFY] exit alert skipped (non-fatal): {e}")
 
     def monitor_pnl(self):
         log("[MONITOR] P&L monitoring started")
@@ -1007,6 +1144,10 @@ class ShortStraddleBot:
         log(f"  Total P&L: {sign}{total_pnl:.0f} ({sign}{prem_pct:.1f}% of premium)")
         log("=" * 65)
 
+        # Alert BEFORE clearing state — _notify_exit reads entry prices/premium/strikes.
+        self._notify_exit(reason, ce_exit or self.ce_ltp, pe_exit or self.pe_ltp,
+                          hedge_ce_exit if ENABLE_HEDGE else None,
+                          hedge_pe_exit if ENABLE_HEDGE else None, total_pnl)
         self.record_trade(reason, total_pnl)
         self._clear_position_state()
 
