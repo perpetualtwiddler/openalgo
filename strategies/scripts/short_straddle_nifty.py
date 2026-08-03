@@ -41,7 +41,11 @@ UNDERLYING = os.getenv("UNDERLYING", "NIFTY")
 EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NFO"))
 INDEX_EXCHANGE = os.getenv("INDEX_EXCHANGE", "NSE_INDEX")
 LOT_SIZE = int(os.getenv("LOT_SIZE", "65"))
-LOTS = int(os.getenv("LOTS", "6"))          # 2x sizing — Mandar + Dinesh both run 6 (doubled straddle, effective 2026-07-02)
+LOTS = int(os.getenv("LOTS", "2"))          # LIVE-CONSTRAINED 2026-08-03: 6 lots needs Rs4.87L of
+# real margin (Zerodha /margins/basket, hedge benefit already applied: SPAN 1.51L + exposure 3.84L)
+# but only Rs2.0L is funded, so live starts at 2 lots (130 qty, ~Rs1.62L). Exposure margin is ~2% of
+# the SHORT legs' notional and does NOT shrink with the wings — that, not SPAN, is the binding limit.
+# Paper ran 6 lots because sandbox margin is a simplified model, not the exchange's SPAN+exposure.
 QUANTITY = LOT_SIZE * LOTS
 PRODUCT = os.getenv("PRODUCT", "MIS")
 
