@@ -15,8 +15,23 @@ Tracked here so nothing slips (most recent context first).
 |---|------|----------|-------|
 | 1 | **Month-end report → Aug-1 straddle go-live decision** | HIGH (~Jul 31) | Decide straddle-only LIVE (real money, 390 qty, ~₹2L) on data: win rate, worst-day, **slippage estimate**, margin fit, + re-run the hardening scan on the full month. |
 | 2 | **Live-slippage measurement** | HIGH (go-live prep) | On the first live days, log fill-price vs LTP per fill → true live edge (paper P&L is an optimistic ceiling; matters most for the thin-edge straddle). |
-| 3 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
-| 4 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
+| 3 | **Egress firewall allowlist (server hardening)** | LOW (no urgency — audit found nothing leaking) | Restrict outbound 443 to **`api.kite.trade`, `kite.zerodha.com`, `api.telegram.org`** + OS essentials (DNS, apt/NTP); default-deny the rest. Converts "we audited and found no exfiltration" into "nothing else is *possible*", and covers the two gaps a code audit can't: (a) a future malicious/compromised **dependency** in `.venv` beaconing independently of OpenAlgo's code, (b) obfuscated exfil a keyword grep wouldn't catch. **Stage carefully — a wrong rule silently breaks order placement; test outside market hours** and re-run the zero-cost order-path test (unfillable LIMIT + cancel) afterwards to confirm the broker path still works. Note Cloudflare-fronted Zerodha IPs rotate, so allowlist by hostname/ipset with refresh, not a static IP. Audit basis: see "Security audit 2026-08-04" below. |
+| 4 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
+| 5 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
+
+### Security audit 2026-08-04 — does OpenAlgo leak our trade/strategy data?
+
+Asked before trusting the platform with real money. **Finding: no evidence of any data going anywhere except Zerodha (broker) and Telegram (our own TradeBhau bot, which we configured).**
+
+- **No telemetry/analytics/error-reporting** anywhere — no Sentry / Mixpanel / PostHog / Segment / GA / Amplitude in the Python backend or `frontend/package.json`.
+- **`openalgo.in` appears 61× but in ZERO executable requests** — all comments and doc links. No update / version / license phone-home either.
+- **Frontend loads no external scripts** — `dist/index.html` references only local assets, no CDN at load. `cdn.plot.ly` exists in the bundle solely as the default `topojsonURL` for *geographic* maps (never rendered by our charts, and would carry no trade data regardless).
+- **Strategy info is local-only** — `openalgo.db` / `strategy_configs.json`; "upload strategy" is a local file upload to our own server, not a registration with any remote service.
+- **All 30+ broker hosts** exist in the repo but only the configured broker's module is loaded (Zerodha).
+- **The two outbound `POST` sites are benign:** `blueprints/chartink.py` posts to `BASE_URL` = **our own** API (`HOST_SERVER`/loopback) and has 0 configured strategies; the Flow HTTP node posts to a **user-supplied** URL from `node_data` and the `flows` table doesn't exist here.
+- **Runtime evidence:** a 60-second sample of all outbound sockets from the openalgo processes showed exactly one endpoint — `149.154.166.110` = `api.telegram.org`. Zerodha (`104.16.x.x`) appears only when broker calls are actually made.
+
+**Limits of this audit (stated honestly):** static grep + a 60s runtime sample would not catch deliberately obfuscated exfiltration (encoded hostnames, DNS tunnelling); and it covered **OpenAlgo's own code, not the dependency tree** — a compromised transitive package in `.venv` could beacon independently. Those two gaps are exactly what TODO #3 (egress allowlist) closes structurally. Also note the WhatsApp feature relies on an unofficial Rust client (`wars`) — unused by us, but it would be an unaudited binary path if ever enabled.
 
 ### Recently completed
 
