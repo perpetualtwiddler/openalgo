@@ -134,6 +134,12 @@ HISTORY_FILE = STATE_DIR / f"{STRATEGY_TAG}_history.json"
 # with 8 option legs a day that drag is the biggest unknown in whether the paper edge survives
 # live. Records fill price vs a reference price so the real cost can be measured.
 SLIPPAGE_LOG = Path(os.getenv("SLIPPAGE_LOG", "/root/data/openalgo/log/slippage.csv"))
+# Margin actually blocked by the broker, snapshotted AT ENTRY. It cannot be read later: by
+# EOD-digest time (15:31) the position is closed and the margin already released (utiliseddebits
+# back to 0). Our defined-risk formula (wing width x qty - credit) is the position's MAX LOSS,
+# which is a different and much smaller number than exchange SPAN+exposure — on 2026-08-06 the
+# formula said 22,392 while the broker actually blocked 1,48,271.
+MARGIN_LOG = Path(os.getenv("MARGIN_LOG", "/root/data/openalgo/log/margin.csv"))
 
 
 # =============================================================================
@@ -631,6 +637,7 @@ class ShortStraddleBot:
                     (self.hedge_ce_symbol, "BUY", self.hedge_ce_price, _ref.get(self.hedge_ce_symbol), "post-fill-quote"),
                     (self.hedge_pe_symbol, "BUY", self.hedge_pe_price, _ref.get(self.hedge_pe_symbol), "post-fill-quote"),
                 ] if ENABLE_HEDGE else []))
+                self._record_margin()
                 return True
             else:
                 log_error("ENTRY fill prices not confirmed — flattening any live legs instead of monitoring with invalid P&L thresholds")
@@ -850,6 +857,34 @@ class ShortStraddleBot:
                 f"(ref={legs[0][4] if legs else 'n/a'})")
         except Exception as e:
             log(f"[SLIPPAGE] log skipped (non-fatal): {e}")
+
+    def _record_margin(self):
+        """Snapshot the margin the broker ACTUALLY blocked, right after entry -> margin.csv.
+
+        Must happen now: by EOD-digest time the position is flat and utiliseddebits is back to
+        0, so this can never be recovered retrospectively. Caveat: utiliseddebits is an
+        ACCOUNT-level figure — with only the straddle live it is this position's margin, but if
+        a second strategy ever trades live concurrently the number would be the combined total.
+        """
+        try:
+            import csv as _csv
+
+            d = (self.client.funds().get("data") or {})
+            used = float(d.get("utiliseddebits") or 0)
+            if used <= 0:
+                return
+            MARGIN_LOG.parent.mkdir(parents=True, exist_ok=True)
+            new = not MARGIN_LOG.exists()
+            with open(MARGIN_LOG, "a", newline="") as f:
+                w = _csv.writer(f)
+                if new:
+                    w.writerow(["date", "strategy", "margin_blocked", "premium", "qty"])
+                w.writerow([datetime.now().strftime("%Y-%m-%d"), STRATEGY_NAME,
+                            f"{used:.2f}", f"{self.total_premium:.2f}", QUANTITY])
+            log(f"[MARGIN] broker blocked ~Rs{used:,.0f} "
+                f"(vs defined max-loss Rs{self._utilised_margin() or 0:,.0f})")
+        except Exception as e:
+            log(f"[MARGIN] snapshot skipped (non-fatal): {e}")
 
     def _quote_snapshot(self, symbols):
         """LTPs for the given legs in one batched call. Returns {symbol: ltp}."""

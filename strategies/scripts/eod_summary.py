@@ -106,6 +106,27 @@ def _ironfly_margin(entry_fills, credit):
 
 STRADDLE_TAG = "9:20 AM Short Straddle - Nifty ATM"
 
+# Margin the broker ACTUALLY blocked, snapshotted at entry by the strategy (see
+# short_straddle_nifty._record_margin). Preferred over our computed figure, which is the
+# position's defined MAX LOSS (wing width x qty - credit) — a different, much smaller number
+# than exchange SPAN+exposure (2026-08-06: formula 22,392 vs broker 1,48,271).
+MARGIN_LOG = os.path.join(REPO_ROOT, "log", "margin.csv")
+
+
+def load_actual_margin(date_str):
+    """{strategy: margin_blocked} recorded at entry for this date, or {}."""
+    import csv as _csv
+
+    out = {}
+    try:
+        if os.path.exists(MARGIN_LOG):
+            for r in _csv.DictReader(open(MARGIN_LOG)):
+                if r.get("date") == date_str:
+                    out[r.get("strategy")] = float(r.get("margin_blocked") or 0)
+    except Exception:
+        pass
+    return out
+
 
 def _analyze_mode():
     """True = paper (sandbox) engine; False = real broker orders."""
@@ -262,6 +283,7 @@ def compute(fills):
                 "charges": charges,
                 "net": net,
                 "margin": margin,
+                "tag": name,
                 "premium": premium,
                 "nfills": len(fl),
                 "open_pos": open_pos,
@@ -272,7 +294,8 @@ def compute(fills):
     return results
 
 
-def format_message(date_str, results):
+def format_message(date_str, results, actual_margin=None):
+    actual_margin = actual_margin or {}
     d = datetime.strptime(date_str, "%Y-%m-%d")
     header = d.strftime("%a %d %b %Y")
     lines = ["\U0001f4ca *TradeBhau — EOD Summary*", f"_{header}_", ""]
@@ -284,8 +307,15 @@ def format_message(date_str, results):
     tot_gross = tot_charges = tot_net = tot_margin = 0.0
     for r in results:
         lines.append(f"*{r['label']}*")
-        margin_txt = f"~{_rupees(r['margin'], signed=False)}" if r["margin"] else "n/a"
-        lines.append(f"Margin blocked: {margin_txt}  ({r['nfills']} fills)")
+        act = actual_margin.get(r.get("tag"))
+        if act:
+            lines.append(f"Margin blocked: {_rupees(act, signed=False)}  ({r['nfills']} fills)")
+            if r["margin"]:
+                lines.append(f"Max risk (defined): {_rupees(r['margin'], signed=False)}")
+        else:
+            # no broker snapshot -> show what we can actually compute, correctly labelled
+            mt = f"~{_rupees(r['margin'], signed=False)}" if r["margin"] else "n/a"
+            lines.append(f"Max risk (defined): {mt}  ({r['nfills']} fills)")
         if r["premium"] is not None:
             lines.append(f"Premium collected: {_rupees(r['premium'], signed=False)}")
         lines.append(f"Gross: {_rupees(r['gross'])}")
@@ -298,11 +328,12 @@ def format_message(date_str, results):
         tot_gross += r["gross"]
         tot_charges += r["charges"]
         tot_net += r["net"]
-        tot_margin += r["margin"] or 0.0
+        tot_margin += actual_margin.get(r.get("tag")) or r["margin"] or 0.0
 
     lines.append("━" * 13)
     lines.append("*TOTAL*")
-    lines.append(f"Capital deployed: ~{_rupees(tot_margin, signed=False)}")
+    _approx = "" if actual_margin else "~"
+    lines.append(f"Capital deployed: {_approx}{_rupees(tot_margin, signed=False)}")
     lines.append(f"Gross: {_rupees(tot_gross)}")
     lines.append(f"Charges: −{_rupees(tot_charges, signed=False)}")
     lines.append(f"Net: *{_rupees(tot_net)}*")
@@ -316,7 +347,7 @@ def main(argv):
 
     fills = load_fills(date_str)
     results = compute(fills)
-    message = format_message(date_str, results)
+    message = format_message(date_str, results, load_actual_margin(date_str))
 
     print(message)
     print()
