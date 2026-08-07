@@ -77,7 +77,11 @@ def charges_from_fills(fills, is_options):
 
     sebi = SEBI_PER_CR * turnover / 1e7                # ₹10/crore
     gst = GST * (brokerage + sebi + txn)
-    return brokerage + stt + txn + sebi + stamp + gst
+    # Zerodha bills STT and stamp duty ROUNDED TO THE NEAREST RUPEE. Verified against the real
+    # contract note for 2026-08-06: our unrounded model gave 285.20 vs 284.91 actual, and the
+    # entire 0.29 gap was these two lines (STT 61.07 vs 61.00, stamp 1.21 vs 1.00). Every other
+    # component matched to the paisa.
+    return brokerage + round(stt) + txn + sebi + round(stamp) + gst
 
 
 if __name__ == "__main__":

@@ -107,6 +107,24 @@ FEED_STALE_REWARN_SEC = float(os.getenv("FEED_STALE_REWARN_SEC", "60"))
 # ride out transient broker-API timeouts (root cause of the 2026-07-24 stale window).
 QUOTE_RETRIES = int(os.getenv("QUOTE_RETRIES", "2"))          # extra attempts after the first
 QUOTE_RETRY_SEC = float(os.getenv("QUOTE_RETRY_SEC", "1.0"))  # backoff between attempts
+
+# ENTRY retry (added 2026-08-07 after a live miss): on 08-07 Zerodha's quote API failed mid-order
+# ("Failed to fetch LTP for NIFTY ... kt-quotes"), so 2 of 4 legs could not even be resolved into
+# symbols. The safety path correctly flattened the 2 that filled, but the whole day was then
+# forfeited (entry_done_today is set before the attempt) at a cost of Rs249. A transient broker
+# hiccup should not cost a trading day, so we re-attempt — but ONLY for clearly TECHNICAL
+# failures, never for genuine rejections (margin / freeze / not-allowed), where retrying would
+# just repeat a real problem. Retries stay inside the 09:35-09:39 entry window.
+ENTRY_RETRIES = int(os.getenv("ENTRY_RETRIES", "2"))          # extra attempts after the first
+ENTRY_RETRY_SEC = float(os.getenv("ENTRY_RETRY_SEC", "8"))    # pause for the broker to recover
+
+# Failure-message classification. Retry ONLY on these; anything unmatched is treated as
+# permanent (fail-safe: a missed day is cheaper than blindly repeating a real rejection).
+_TRANSIENT_PAT = ("failed to fetch ltp", "error fetching quotes", "api request failed",
+                  "request failed", "kt-quotes", "expecting value", "timed out", "timeout",
+                  "connection", "temporarily", "try again", "502", "503", "504", "gateway")
+_PERMANENT_PAT = ("margin", "insufficient", "not allowed", "disabled", "blocked", "rejected",
+                  "freeze", "frozen", "banned", "circuit", "limit exceeded", "not permitted")
 # On feed-stale, alert the user on Telegram (TradeBhau) so they can manually Close-All — the
 # quote feed going stale can't be prevented (upstream broker), but awareness can. username is the
 # linked OpenAlgo account; TG_ALERT_INTERVAL throttles re-alerts during a long stale window.
@@ -180,6 +198,7 @@ class ShortStraddleBot:
         self.hedge_pe_ltp = 0.0
         self.exit_in_progress = False
         self.entry_done_today = False
+        self._entry_retryable = False
 
         self.load_state()
 
@@ -483,12 +502,15 @@ class ShortStraddleBot:
                 log(f"[ENTRY] {UNDERLYING} spot: {spot:.2f} | breach guard ±{BREACH_PCT}% (map drawn after fill)")
             else:
                 log_error(f"ENTRY aborted — could not fetch {UNDERLYING} spot (feed issue): {quote}")
+                self._entry_retryable = True
                 return False
         except Exception as e:
             log_error(f"ENTRY aborted — spot fetch exception (feed issue): {e}")
+            self._entry_retryable = True
             return False
 
         mode = "iron butterfly" if ENABLE_HEDGE else "short straddle"
+        self._entry_retryable = False   # set True only for clearly transient broker failures
         log(f"[ENTRY] Placing ATM {mode} — expiry {expiry}, qty {QUANTITY}")
 
         legs = [
@@ -518,12 +540,14 @@ class ShortStraddleBot:
 
             if resp.get("status") != "success":
                 log_error(f"ENTRY straddle order REJECTED/failed — no position taken: {resp}")
+                self._entry_retryable = self._is_transient(resp.get("message") or resp)
                 return False
 
             results = resp.get("results", [])
             expected_legs = 4 if ENABLE_HEDGE else 2
             if len(results) < expected_legs:
                 log_error(f"ENTRY straddle returned {len(results)}/{expected_legs} legs — partial fill risk: {resp}")
+                self._entry_retryable = self._is_transient(results)
                 self._capture_leg_symbols(results)
                 if self._has_any_tracked_symbol():
                     self.is_positioned = True
@@ -534,6 +558,7 @@ class ShortStraddleBot:
             failed_results = [r for r in results if r.get("status") != "success"]
             if failed_results:
                 log_error(f"ENTRY straddle had failed leg(s) — flattening any successful legs: {failed_results}")
+                self._entry_retryable = self._is_transient(failed_results)
                 if self._has_any_tracked_symbol():
                     self.is_positioned = True
                     self.close_straddle("ENTRY_PARTIAL_FAILURE")
@@ -843,9 +868,11 @@ class ShortStraddleBot:
                     w.writerow(["date", "time", "strategy", "phase", "symbol", "action",
                                 "qty", "fill_price", "ref_price", "ref_source",
                                 "slip_per_unit", "slip_rupees"])
+                written = 0
                 for sym, action, fill, ref, ref_src in legs:
                     if not sym or not fill or not ref:
                         continue
+                    written += 1
                     per = (ref - fill) if action.upper() == "SELL" else (fill - ref)
                     cost = per * QUANTITY
                     total += cost
@@ -853,10 +880,37 @@ class ShortStraddleBot:
                                 STRATEGY_NAME, phase, sym, action.upper(), QUANTITY,
                                 f"{fill:.2f}", f"{ref:.2f}", ref_src,
                                 f"{per:.4f}", f"{cost:.2f}"])
-            log(f"[SLIPPAGE] {phase}: {total:+.0f} INR across {len(legs)} legs "
-                f"(ref={legs[0][4] if legs else 'n/a'})")
+            if written:
+                log(f"[SLIPPAGE] {phase}: {total:+.0f} INR across {written} leg(s) "
+                    f"(ref={legs[0][4] if legs else 'n/a'})")
+            else:
+                # e.g. an aborted entry: no fills and/or no reference price -> nothing to measure
+                log(f"[SLIPPAGE] {phase}: 0 legs logged (no fill/reference available)")
         except Exception as e:
             log(f"[SLIPPAGE] log skipped (non-fatal): {e}")
+
+    @staticmethod
+    def _is_transient(results):
+        """True only if EVERY failure looks like a broker/technical hiccup worth retrying.
+
+        Fail-safe by design: an unrecognised message counts as PERMANENT. Missing a day is
+        cheaper than re-firing orders into a real rejection (margin, freeze, not-allowed).
+        """
+        msgs = []
+        if isinstance(results, (list, tuple)):
+            for r in results:
+                msgs.append(str(r.get("message", "")) if isinstance(r, dict) else str(r))
+        else:
+            msgs.append(str(results))
+        msgs = [m.lower() for m in msgs if m]
+        if not msgs:
+            return False
+        for m in msgs:
+            if any(p in m for p in _PERMANENT_PAT):
+                return False
+            if not any(p in m for p in _TRANSIENT_PAT):
+                return False      # unrecognised -> treat as permanent
+        return True
 
     def _record_margin(self):
         """Snapshot the margin the broker ACTUALLY blocked, right after entry -> margin.csv.
@@ -1344,7 +1398,26 @@ class ShortStraddleBot:
                     elif self.check_trend():
                         log("[SKIP] Trend day (ORB breakout) — no trade today")
                     else:
-                        self.place_straddle()
+                        # Re-attempt on transient broker failures only, and only while still
+                        # inside the entry window. Each failed attempt has already flattened
+                        # any legs that filled, so every retry starts from a clean flat state.
+                        for _try in range(ENTRY_RETRIES + 1):
+                            if self.place_straddle():
+                                break
+                            if not self._entry_retryable:
+                                log("[ENTRY] failure is not transient — no retry")
+                                break
+                            if _try >= ENTRY_RETRIES:
+                                log_error(f"[ENTRY] still failing after {ENTRY_RETRIES + 1} "
+                                          f"attempts — giving up for today")
+                                break
+                            _n = datetime.now()
+                            if not (_n.hour == ENTRY_HOUR and _n.minute < ENTRY_MINUTE + 5):
+                                log_error("[ENTRY] entry window closed — abandoning retries")
+                                break
+                            log(f"[ENTRY] transient broker failure — retry "
+                                f"{_try + 1}/{ENTRY_RETRIES} in {ENTRY_RETRY_SEC:.0f}s")
+                            time.sleep(ENTRY_RETRY_SEC)
 
                 if now.hour >= 16:
                     self.entry_done_today = False
