@@ -88,9 +88,19 @@ BREACH_PCT = float(os.getenv("BREACH_PCT", "0.55"))             # 0.55% of ATM ~
 # Consecutive SL cooldown — skip entry after N consecutive SL days
 CONSECUTIVE_SL_LIMIT = int(os.getenv("CONSECUTIVE_SL_LIMIT", "2"))
 
-# Square-off time
+# Square-off time. MOVED 15:14 -> 15:01 on 2026-08-10 after NSE shortened the session:
+# regular trading in stocks and F&O now ends 15:15 (was 15:30), effective 2026-08-03. The old
+# 15:14 exit had ~16 min of headroom before a 15:30 close; against a 15:15 close it left ~50
+# SECONDS, and a clean 4-leg exit already takes ~7s (2026-08-10) while a transient failure needs
+# a full retry cycle (8s x2). 15:01 restores ~14 min of buffer.
+# Measured support: on 2026-08-10 the 15:00-15:15 window was the MOST volatile of the session
+# (avg NIFTY 1m range 9.6 vs 5.8 midday, max 18.2); our 15:14 exit landed inside a 16.7-range
+# minute and paid Rs169 of exit slippage (5x the entry's Rs32). Same-day counterfactual: exiting
+# ~15:00 would have netted ~Rs260 MORE than 15:14. Note the earlier 55-day tail study that
+# favoured 15:05 was fitted to the OLD 15:30-close session, so its timing no longer transfers —
+# the closing turbulence has shifted ~15 min earlier.
 SQUAREOFF_HOUR = int(os.getenv("SQUAREOFF_HOUR", "15"))
-SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "14"))
+SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "1"))
 
 # P&L check interval (seconds)
 PNL_CHECK_INTERVAL = int(os.getenv("PNL_CHECK_INTERVAL", "5"))
