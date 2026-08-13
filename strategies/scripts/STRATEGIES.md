@@ -16,8 +16,12 @@ Tracked here so nothing slips (most recent context first).
 | 1 | **Month-end report → Aug-1 straddle go-live decision** | HIGH (~Jul 31) | Decide straddle-only LIVE (real money, 390 qty, ~₹2L) on data: win rate, worst-day, **slippage estimate**, margin fit, + re-run the hardening scan on the full month. |
 | 2 | **Live-slippage measurement** | HIGH (go-live prep) | On the first live days, log fill-price vs LTP per fill → true live edge (paper P&L is an optimistic ceiling; matters most for the thin-edge straddle). |
 | 3 | **Egress firewall allowlist (server hardening)** | LOW (no urgency — audit found nothing leaking) | Restrict outbound 443 to **`api.kite.trade`, `kite.zerodha.com`, `api.telegram.org`** + OS essentials (DNS, apt/NTP); default-deny the rest. Converts "we audited and found no exfiltration" into "nothing else is *possible*", and covers the two gaps a code audit can't: (a) a future malicious/compromised **dependency** in `.venv` beaconing independently of OpenAlgo's code, (b) obfuscated exfil a keyword grep wouldn't catch. **Stage carefully — a wrong rule silently breaks order placement; test outside market hours** and re-run the zero-cost order-path test (unfillable LIMIT + cancel) afterwards to confirm the broker path still works. Note Cloudflare-fronted Zerodha IPs rotate, so allowlist by hostname/ipset with refresh, not a static IP. Audit basis: see "Security audit 2026-08-04" below. |
-| 4 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
-| 5 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
+| 4 | **Extend option-chain capture to the NEXT weekly expiry** | MEDIUM (blocks validating the expiry-day roll) | Capture stores only the front series, so expiry-day 7-DTE trades cannot be backtested at all — `2026-08-11` has 22 files, all `NIFTY11AUG26`. Add the next weekly so a replay becomes possible; until then the roll is measured live only, via `trade_journal.csv` (`series_code`, `dte`). |
+| 5 | **Populate `market_holidays[]` in `event_calendar.json`** | LOW | Deliberately left EMPTY — the dates were not verified against the NSE circular, and a wrong one would move a skip onto the wrong session. Only matters when a `next_session` roll lands beside a holiday; weekends are handled in code, and the `[EVENT]` log always prints the release date it resolved from, so a bad roll is visible. |
+| 6 | **Reconcile the 2026-08-10 ₹50.45 charge gap** | LOW | Fill-derived net +₹1,981.26 vs the broker reading of +₹1,930.81 recorded that day. Not a clean ₹20 multiple, so not just fill-counting. Needs that day's contract note. |
+| 7 | **Wire `trade_journal.py` + `exit_timing_eval.py` into the 15:45 IST timer** | MEDIUM | Both are run by hand today. The journal is the durable record (the broker tradebook is current-day only, so a missed day is unrecoverable); automate it before a day gets lost. |
+| 8 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
+| 9 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
 
 ### Security audit 2026-08-04 — does OpenAlgo leak our trade/strategy data?
 
@@ -84,7 +88,7 @@ At entry the log prints a **breach map** (PE-wing / breach-lo / ATM=max-profit /
 
 ### Safety Features
 - **Iron butterfly hedge:** OTM8 wings (~400pts) cap maximum loss; wider wings retain more theta profit on calm days
-- **Event calendar:** `event_calendar.json` with 16 confirmed high-volatility dates (Jun–Dec 2026) covering RBI MPC, FOMC, US CPI
+- **Event calendar:** `event_calendar.json` with 16 confirmed high-volatility dates (Jun–Dec 2026) covering RBI MPC, FOMC, US CPI. Each entry declares `impact: same_session | next_session` — US releases land after the NSE close, so the session that reacts is the NEXT trading day (see "Event-calendar dating" below)
 - **Consecutive SL cooldown:** Pauses after 2 straight stop-loss days
 - **Trade history:** Last 30 trades recorded in `_history.json` for cooldown logic
 - **State persistence:** JSON state file survives strategy restarts (same-day only)
@@ -355,7 +359,31 @@ Notes: there is a few-second gap between your click and the strategy's next `syn
 
 **Also learned day 1 — real margin is ~4x our estimate.** Zerodha's own `/margins/basket` (hedge benefit applied) for the 390-qty fly: **SPAN ₹1,51,449 + exposure ₹3,84,129 = ₹4,86,639** — vs the ~₹1–1.3L we had assumed from the sandbox model and our defined-risk formula (neither is exchange SPAN+exposure). **Exposure margin is ~2% of the SHORT legs' notional and does NOT shrink with the wings**, so it — not SPAN — caps our size. At ₹2.0L funded, the max is **2 lots / 130 qty (₹1,62,188)**; 3 lots needs ₹2.43L. Live therefore starts at 2 lots. Note charges/slippage don't scale down with size (brokerage is a flat ₹20/order), so at 130 qty charges are ~1.0% of premium vs ~0.5% at 390 — the small size is structurally less efficient.
 
-**Still unverified against real broker data** (nothing has filled yet): the live-tradebook branch of the EOD digest, the live per-trade alert path, and `charges.py` vs an actual contract note.
+**Now verified against real broker data** (superseding the earlier "still unverified" note): the live-tradebook branch of the EOD digest, the live per-trade alert path, and `charges.py` — the 2026-08-06 contract note came in at **₹284.91** vs our model's ₹285.20 unrounded, and the whole ₹0.29 gap was STT/stamp rounding, now handled. One reconciliation remains open: 2026-08-10 shows **₹50.45** between the fill-derived net (+₹1,981.26) and the broker reading taken that day (+₹1,930.81); it is not a clean multiple of ₹20, so it is not merely fill-counting. Pending that day's contract note.
+
+**🐛 Brokerage was billed per FILL instead of per ORDER (fixed 2026-08-13).** Zerodha charges a flat **₹20 per executed order**, and a single 130-qty order can arrive as several fills. On 2026-08-13 the 24300CE exit filled as **65 + 65 under one order id**, so the broker tradebook showed 9 fills for 8 orders and `charges_from_fills()` billed ₹180 of brokerage instead of ₹160 — overstating that day's loss by **₹23.60** (₹20 + GST) and pushing the TradeBhau digest to −₹709 when the truth was −₹685.52. `charges.py::_group_orders()` now collapses fills by `orderid`, `eod_summary.py` threads the id through (it was silently dropping it), and the digest prints `8 orders / 9 fills` so a partial fill is visible rather than quietly inflating the charge line. The futures branch had a subtler version of the same flaw — `min(0.03%, ₹20)` was assessed per tranche instead of per order, which *understates* cost near the cap. This matters more as we size up: partial fills get likelier at 4–6 lots.
+
+**📅 Event-calendar dating was wrong for every US event (fixed 2026-08-13).** A US release lands *after* the NSE close, so the Indian session that can react to it is the **next** one:
+
+| Event | Release | IST | NSE open? | Reacting session |
+|---|---|---|---|---|
+| RBI MPC | ~10:00 IST | 10:00 | yes | same day |
+| US CPI | 08:30 ET | 18:00 | no | **next trading day** |
+| FOMC | 14:00 ET | 23:30 | no | **next trading day** |
+
+We had been skipping the release date itself — a session that closed *before the data existed* — and then trading the session that absorbed it. 2026-08-13 is the live example: we skipped the calm 12-Aug anticipation day, traded the 13-Aug reaction, and lost ₹686 on an MFE +1,443 / MAE −2,886 chop. **12 of the 16 calendar entries were mis-dated.** Each entry now declares `impact: same_session | next_session`; `next_session` rolls forward over weekends and `market_holidays`, and a missing/misspelled value degrades to `same_session` (the old behaviour) rather than silently relocating a skip. The count of skipped days per event is **unchanged at one** — the skip moved, it did not multiply.
+
+**⚠️ Open question: is the event gate worth keeping at all?** Replaying every US event inside the 45-day capture window says both candidate days *beat* the baseline:
+
+| | mean net |
+|---|---|
+| event day (D), n=3 | **+₹700** |
+| next session (D+1), n=4 incl. today | **+₹1,011** |
+| all 45 captured days | +₹579 |
+
+So the gate looks like pure cost, and the corrected version aims our one skip at the historically better day. Kept ON regardless, for two reasons: n=4 cannot detect the rare gap day that a short-vol filter exists to dodge (short-straddle P&L is left-skewed — many small wins, rare large losses), and one wing-capped loss (−₹24.7k) erases ~12 average winners. `SKIP_EVENT_DAYS=false` settles it whenever we want to test the other side; the journal now measures the cost either way.
+
+**🔄 Expiry day now trades NEXT week's series instead of skipping (live 2026-08-13).** Weekly expiry is Tuesday, so skipping cost ~4–5 sessions/month — roughly **25% of our trade count**. We still never sell the expiring series (near-zero extrinsic, explosive gamma); `EXPIRY_DAY_USE_NEXT_WEEK=true` rolls to the next weekly (~7 DTE), which has **lower** gamma than our usual 1–5 DTE. Every other rule is unchanged and verified expiry-agnostic — in particular the breach band is `abs(spot − entry_atm) >= entry_atm × 0.55%`, a function of the entry strike and live spot only, with nothing about the series in it. `is_expiry_day()` and `get_expiry()` read one shared `_expiries()` so the gate and the order path cannot disagree (a disagreement would sell 0-DTE while the log claimed otherwise); if the broker returns no next series it skips rather than falling back. Two honest caveats: **(a) unvalidated** — our option-chain capture stores only the FRONT expiry, so there is no next-week data on any past expiry day to replay (see backlog); **(b)** `PROFIT_TARGET_PCT`/`STOPLOSS_PCT` are percentages *of premium*, and 7-DTE premium is larger, so both thresholds silently become bigger rupee numbers. Measuring live at 2 lots with the wings capping risk. First live test: **Tue 18-Aug 2026**.
 
 **⏰ Square-off moved 15:14 → 15:01 (2026-08-10) — NSE shortened the session.** Regular trading in stocks and F&O now ends **15:15** (was 15:30), effective **2026-08-03**. The old 15:14 exit had ~16 min of headroom before a 15:30 close; against a 15:15 close it left **~50 seconds**. That is not survivable: a clean 4-leg exit already takes ~7s (measured 2026-08-10, 15:14:03→15:14:10), and a transient failure needs a full retry cycle (8s × 2). 15:01 restores ~14 min of buffer.
 

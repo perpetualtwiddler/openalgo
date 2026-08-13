@@ -48,10 +48,43 @@ def options_iron_butterfly_roundtrip(atm_ce, atm_pe, hedge_ce, hedge_pe, qty, n_
     return brokerage + stt + txn + sebi + stamp + gst
 
 
+def _group_orders(fills):
+    """Collapse fills into the ORDERS that produced them: [{'action', 'value'}, ...].
+
+    Zerodha bills brokerage per executed ORDER, never per fill. A single 130-qty order
+    that the exchange fills in two 65-qty tranches is ONE order = ₹20. Broker tradebook
+    rows carry 'orderid', so distinct ids give the true order count. Callers with no
+    order information (sandbox fills, and the strategy's own per-leg reconstruction)
+    are one-fill-per-order by construction, so each row falls back to its own order.
+
+    Found live on 2026-08-13: the 24300CE exit filled as 65+65 under one orderid, and
+    billing per fill overstated that day's charges by ₹23.60 (₹20 brokerage + GST).
+    """
+    def _oid(row):
+        # Tolerate dicts AND sqlite3.Row (no .get(), raises IndexError on a missing key).
+        for key in ("orderid", "order_id"):
+            try:
+                v = row[key]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if v:
+                return str(v)
+        return None
+
+    groups = {}
+    for i, f in enumerate(fills):
+        oid = _oid(f) or f"_row{i}"
+        g = groups.setdefault(oid, {"action": f["action"].upper(), "value": 0.0})
+        g["value"] += f["quantity"] * f["price"]
+    return list(groups.values())
+
+
 def charges_from_fills(fills, is_options):
     """Exact Zerodha charges from ACTUAL executed fills (for the live EOD summary).
 
-    fills: iterable of dicts each with 'action' ('BUY'/'SELL'), 'quantity', 'price'.
+    fills: iterable of dicts each with 'action' ('BUY'/'SELL'), 'quantity', 'price',
+           and optionally 'orderid' — supply it whenever you have it, or brokerage is
+           billed per fill instead of per order (see _group_orders).
     is_options: True for NFO options (straddle), False for index futures (EMA legs).
 
     Unlike the *_roundtrip() helpers (which assume a symmetric entry≈exit backtest
@@ -63,14 +96,17 @@ def charges_from_fills(fills, is_options):
     sell_val = sum(f["quantity"] * f["price"] for f in fills if f["action"].upper() == "SELL")
     turnover = buy_val + sell_val
 
+    orders = _group_orders(fills)                      # brokerage is per ORDER, not per fill
+
     if is_options:
-        brokerage = len(fills) * 20.0                 # flat ₹20/order
+        brokerage = len(orders) * 20.0                 # flat ₹20/order
         stt = 0.0015 * sell_val                        # 0.15% sell-side premium
         txn = 0.0003553 * turnover                     # NSE 0.03553% on premium
         stamp = 0.00003 * buy_val                      # 0.003% buy side
     else:
-        # futures: 0.03% or ₹20/order (lower), charged per order
-        brokerage = sum(min(0.0003 * f["quantity"] * f["price"], 20.0) for f in fills)
+        # futures: 0.03% or ₹20/order (lower), charged per order — so the 0.03% is
+        # assessed on the ORDER's full value, not on each tranche separately.
+        brokerage = sum(min(0.0003 * o["value"], 20.0) for o in orders)
         stt = 0.0005 * sell_val                        # 0.05% sell-side notional
         txn = 0.0000183 * turnover                     # NSE 0.00183%
         stamp = 0.00002 * buy_val                      # 0.002% buy side

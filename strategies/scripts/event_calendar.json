@@ -1,21 +1,28 @@
 {
-  "description": "High-volatility event days — short straddle skips entry on these dates",
+  "description": "High-volatility events. The straddle skips the SESSION THAT ABSORBS each event, which is not always the release date — see `impact`.",
+  "_impact": {
+    "same_session": "Released while NSE is open, so the release date itself is the reacting session. RBI MPC lands ~10:00 IST, mid-session.",
+    "next_session": "Released after the 15:15 NSE close, so the reacting session is the next trading day. US CPI 08:30 ET = 18:00 IST; FOMC 14:00 ET = 23:30 IST. Rolls forward over weekends and `market_holidays`.",
+    "_note": "A missing or misspelled `impact` degrades to same_session (the pre-2026-08-13 behaviour) rather than silently relocating a skip."
+  },
+  "_market_holidays_note": "NSE trading holidays, needed only so a next_session roll can step over one. INTENTIONALLY EMPTY — these were not verified against the NSE circular, and a wrong date here would move a skip onto the wrong session. Weekends are handled in code. Populate from the official NSE holiday list before relying on a roll that lands adjacent to a holiday; until then the [EVENT] log line always prints the release date it resolved from, so a bad roll is visible.",
+  "market_holidays": [],
   "events": [
-    {"date": "2026-06-05", "event": "RBI MPC announcement"},
-    {"date": "2026-06-10", "event": "US CPI release"},
-    {"date": "2026-06-17", "event": "FOMC rate decision"},
-    {"date": "2026-07-14", "event": "US CPI release"},
-    {"date": "2026-07-29", "event": "FOMC rate decision"},
-    {"date": "2026-08-05", "event": "RBI MPC announcement"},
-    {"date": "2026-08-12", "event": "US CPI release"},
-    {"date": "2026-09-11", "event": "US CPI release"},
-    {"date": "2026-09-16", "event": "FOMC rate decision"},
-    {"date": "2026-10-07", "event": "RBI MPC announcement"},
-    {"date": "2026-10-14", "event": "US CPI release"},
-    {"date": "2026-10-28", "event": "FOMC rate decision"},
-    {"date": "2026-11-10", "event": "US CPI release"},
-    {"date": "2026-12-04", "event": "RBI MPC announcement"},
-    {"date": "2026-12-09", "event": "FOMC rate decision"},
-    {"date": "2026-12-10", "event": "US CPI release"}
+    {"date": "2026-06-05", "event": "RBI MPC announcement", "impact": "same_session", "release_ist": "10:00"},
+    {"date": "2026-06-10", "event": "US CPI release", "impact": "next_session", "release_ist": "18:00"},
+    {"date": "2026-06-17", "event": "FOMC rate decision", "impact": "next_session", "release_ist": "23:30"},
+    {"date": "2026-07-14", "event": "US CPI release", "impact": "next_session", "release_ist": "18:00"},
+    {"date": "2026-07-29", "event": "FOMC rate decision", "impact": "next_session", "release_ist": "23:30"},
+    {"date": "2026-08-05", "event": "RBI MPC announcement", "impact": "same_session", "release_ist": "10:00"},
+    {"date": "2026-08-12", "event": "US CPI release", "impact": "next_session", "release_ist": "18:00"},
+    {"date": "2026-09-11", "event": "US CPI release", "impact": "next_session", "release_ist": "18:00"},
+    {"date": "2026-09-16", "event": "FOMC rate decision", "impact": "next_session", "release_ist": "23:30"},
+    {"date": "2026-10-07", "event": "RBI MPC announcement", "impact": "same_session", "release_ist": "10:00"},
+    {"date": "2026-10-14", "event": "US CPI release", "impact": "next_session", "release_ist": "18:00"},
+    {"date": "2026-10-28", "event": "FOMC rate decision", "impact": "next_session", "release_ist": "23:30"},
+    {"date": "2026-11-10", "event": "US CPI release", "impact": "next_session", "release_ist": "18:00"},
+    {"date": "2026-12-04", "event": "RBI MPC announcement", "impact": "same_session", "release_ist": "10:00"},
+    {"date": "2026-12-09", "event": "FOMC rate decision", "impact": "next_session", "release_ist": "23:30"},
+    {"date": "2026-12-10", "event": "US CPI release", "impact": "next_session", "release_ist": "18:00"}
   ]
 }

@@ -70,10 +70,31 @@ ENTRY_MINUTE = int(os.getenv("ENTRY_MINUTE", "35"))
 VIX_THRESHOLD = float(os.getenv("VIX_THRESHOLD", "25.0"))
 SKIP_VIX_CHECK = os.getenv("SKIP_VIX_CHECK", "false").lower() == "true"
 
-# Skip trading on expiry day (gamma risk)
+# Expiry day. Same-day ATM options carry near-zero extrinsic and explosive gamma, so we
+# never sell THIS week's series on its expiry date. Two ways to honour that:
+#   EXPIRY_DAY_USE_NEXT_WEEK=true  -> trade the NEXT weekly series instead (~7 DTE, lower
+#                                     gamma than our usual 1-5 DTE) and keep the day
+#   EXPIRY_DAY_USE_NEXT_WEEK=false -> skip the day entirely (the original behaviour)
+# Enabled live 2026-08-13: weekly expiry is Tuesday, so skipping cost ~4-5 sessions/month
+# (~25% of trade count). Every other rule — breach band, PT/SL, wings, gap/VIX/trend gates
+# — is unchanged and expiry-agnostic; the breach band keys off the entry ATM strike, not
+# the series. UNVALIDATED against history: our option-chain capture only stores the FRONT
+# expiry, so there is no next-week data on any past expiry day to replay. Measuring live
+# at 2 lots with defined-risk wings; trade_journal.py records dte for later comparison.
 SKIP_EXPIRY_DAY = os.getenv("SKIP_EXPIRY_DAY", "true").lower() == "true"
+EXPIRY_DAY_USE_NEXT_WEEK = os.getenv("EXPIRY_DAY_USE_NEXT_WEEK", "true").lower() == "true"
 
 # Skip trading on high-volatility event days (RBI, FOMC, CPI, etc.)
+#
+# TIMEZONE — the thing this gate got wrong until 2026-08-13. A US release lands after the
+# Indian close, so the Indian session that can actually react to it is the NEXT one:
+#     US CPI   08:30 ET = 18:00 IST   (NSE shut at 15:15)  -> next session
+#     FOMC     14:00 ET = 23:30 IST   (NSE shut)           -> next session
+#     RBI MPC  ~10:00 IST             (NSE open)           -> same session
+# We were skipping the release date itself, i.e. a session that closed BEFORE the data
+# existed, and then trading the session that absorbed it (2026-08-13: -Rs686 on an
+# MFE +1,443 / MAE -2,886 chop). Each calendar entry now declares its own `impact`, and
+# `next_session` rolls forward over weekends/holidays. See event_calendar.json.
 SKIP_EVENT_DAYS = os.getenv("SKIP_EVENT_DAYS", "true").lower() == "true"
 EVENT_CALENDAR_FILE = Path(os.getenv("EVENT_CALENDAR_FILE",
     str(Path(__file__).parent / "event_calendar.json")))
@@ -194,6 +215,9 @@ class ShortStraddleBot:
         self.pe_entry_price = 0.0
         self.total_premium = 0.0
         self.atm_strike = None          # entry ATM strike — reference for the short-strike breach
+        self.traded_expiry = None       # 'DD-MMM-YY' of the series we actually sold
+        self.traded_dte = None          # calendar days from today to that expiry
+        self.expiry_rolled = False      # True = expiry day, sold NEXT week's series instead
 
         # Hedge leg state (iron butterfly)
         self.hedge_ce_symbol = None
@@ -218,7 +242,10 @@ class ShortStraddleBot:
         log(f"[INIT] Entry: {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} IST | Exit: {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d} IST")
         log(f"[INIT] VIX threshold: {'disabled' if SKIP_VIX_CHECK else f'< {VIX_THRESHOLD}'}")
         log(f"[INIT] Hedge: {'ON — ' + HEDGE_OFFSET + ' wings (iron butterfly)' if ENABLE_HEDGE else 'OFF (naked straddle)'}")
-        log(f"[INIT] Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
+        if SKIP_EXPIRY_DAY and EXPIRY_DAY_USE_NEXT_WEEK:
+            log("[INIT] Expiry day: TRADE next weekly series (never the expiring one)")
+        else:
+            log(f"[INIT] Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
         log(f"[INIT] Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
         if BREACH_PCT:
             log(f"[INIT] Short-strike breach: exit if {UNDERLYING} moves ≥{BREACH_PCT}% from entry ATM (directional-move cut)")
@@ -360,22 +387,45 @@ class ShortStraddleBot:
     # Expiry-day check
     # -------------------------------------------------------------------------
 
+    def _expiries(self):
+        """Sorted option expiries as ['DD-MMM-YY', ...], nearest first. [] on failure."""
+        resp = self.client.expiry(symbol=UNDERLYING, exchange=EXCHANGE, instrumenttype="options")
+        if resp.get("status") != "success":
+            log(f"[EXPIRY] Could not fetch: {resp}")
+            return []
+        return resp.get("data", []) or []
+
     def is_expiry_day(self):
+        """True = skip the day. False = trade it (possibly on next week's series).
+
+        Detection is independent of what we do about it, so the log always states which
+        series we are about to sell — the one fact that makes an expiry-day trade auditable.
+        """
         if not SKIP_EXPIRY_DAY:
             return False
         try:
-            resp = self.client.expiry(symbol=UNDERLYING, exchange=EXCHANGE, instrumenttype="options")
-            if resp.get("status") == "success":
-                expiries = resp.get("data", [])
-                if expiries:
-                    nearest = expiries[0]  # "DD-MMM-YY" format
-                    expiry_date = datetime.strptime(nearest, "%d-%b-%y").date()
-                    today = datetime.now().date()
-                    if expiry_date == today:
-                        log(f"[EXPIRY] Today ({today}) is expiry day — skipping straddle (gamma risk)")
-                        return True
-                    log(f"[EXPIRY] Next expiry: {nearest} | Today: {today} — not expiry day")
-            return False
+            expiries = self._expiries()
+            if not expiries:
+                return False
+            nearest = expiries[0]                        # "DD-MMM-YY"
+            today = datetime.now().date()
+            if datetime.strptime(nearest, "%d-%b-%y").date() != today:
+                log(f"[EXPIRY] Next expiry: {nearest} | Today: {today} — not expiry day")
+                return False
+            # It IS expiry day.
+            if EXPIRY_DAY_USE_NEXT_WEEK and len(expiries) > 1:
+                nxt = expiries[1]
+                dte = (datetime.strptime(nxt, "%d-%b-%y").date() - today).days
+                log(f"[EXPIRY] Today ({today}) is expiry day for {nearest} — NOT skipping: "
+                    f"rolling to next series {nxt} ({dte} DTE, lower gamma). "
+                    f"All other rules unchanged.")
+                return False
+            if EXPIRY_DAY_USE_NEXT_WEEK:
+                log(f"[EXPIRY] Today ({today}) is expiry day and no next series was returned "
+                    f"— skipping straddle (cannot roll)")
+            else:
+                log(f"[EXPIRY] Today ({today}) is expiry day — skipping straddle (gamma risk)")
+            return True
         except Exception as e:
             log(f"[EXPIRY CHECK ERROR] {e} — proceeding with caution")
             return False
@@ -383,6 +433,26 @@ class ShortStraddleBot:
     # -------------------------------------------------------------------------
     # Event calendar check
     # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _impact_date(entry, holidays):
+        """The trading date an event actually lands on, as 'YYYY-MM-DD'.
+
+        `same_session` -> the release date itself (RBI: announced ~10:00 IST, mid-session).
+        `next_session` -> the first trading day AFTER it (US releases land 18:00-23:30 IST,
+        hours after NSE closes), rolling over Sat/Sun and any date in `market_holidays`.
+
+        Unknown/missing `impact` is treated as same_session, i.e. the old behaviour — a
+        typo degrades to the previous semantics rather than silently moving a skip.
+        """
+        d = datetime.strptime(entry["date"], "%Y-%m-%d").date()
+        if entry.get("impact", "same_session") != "next_session":
+            return d.isoformat()
+        for _ in range(10):                       # bounded: a 10-day market closure is absurd
+            d += timedelta(days=1)
+            if d.weekday() < 5 and d.isoformat() not in holidays:
+                return d.isoformat()
+        return d.isoformat()
 
     def is_event_day(self):
         if not SKIP_EVENT_DAYS:
@@ -392,12 +462,21 @@ class ShortStraddleBot:
                 log(f"[EVENT] Calendar not found: {EVENT_CALENDAR_FILE}")
                 return False
             cal = json.loads(EVENT_CALENDAR_FILE.read_text())
+            holidays = set(cal.get("market_holidays", []))
             today = datetime.now().strftime("%Y-%m-%d")
             for entry in cal.get("events", []):
-                if entry.get("date") == today:
-                    log(f"[EVENT] Today is a high-volatility event day: {entry.get('event')} — skipping straddle")
-                    return True
-            log(f"[EVENT] No events today ({today}) — proceeding")
+                impact = self._impact_date(entry, holidays)
+                if impact != today:
+                    continue
+                if entry["date"] == today:
+                    log(f"[EVENT] Today is a high-volatility event day: "
+                        f"{entry.get('event')} — skipping straddle")
+                else:
+                    log(f"[EVENT] Today absorbs {entry.get('event')} released "
+                        f"{entry['date']} at {entry.get('release_ist', '?')} IST — after the "
+                        f"NSE close, so THIS is the reacting session — skipping straddle")
+                return True
+            log(f"[EVENT] No event impact today ({today}) — proceeding")
             return False
         except Exception as e:
             log(f"[EVENT CHECK ERROR] {e} — proceeding with caution")
@@ -483,17 +562,34 @@ class ShortStraddleBot:
     # -------------------------------------------------------------------------
 
     def get_expiry(self):
+        """The series we actually sell, as 'DDMMMYY'.
+
+        MUST agree with is_expiry_day()'s roll decision — if the gate says "rolling to next
+        series" and this returned the expiring one, we would sell 0-DTE options with the
+        gate believing otherwise. Both read the same expiry list and apply the same rule.
+        """
         try:
-            resp = self.client.expiry(symbol=UNDERLYING, exchange=EXCHANGE, instrumenttype="options")
-            if resp.get("status") == "success":
-                expiries = resp.get("data", [])
-                if expiries:
-                    nearest = expiries[0]
-                    # API returns "DD-MMM-YY" but optionsmultiorder expects "DDMMMYY"
-                    expiry_formatted = nearest.replace("-", "")
-                    log(f"[EXPIRY] Nearest: {nearest} -> {expiry_formatted}")
-                    return expiry_formatted
-            log(f"[EXPIRY] Could not fetch: {resp}")
+            expiries = self._expiries()
+            if not expiries:
+                return None
+            pick = expiries[0]
+            today = datetime.now().date()
+            self.expiry_rolled = False
+            if (EXPIRY_DAY_USE_NEXT_WEEK and len(expiries) > 1
+                    and datetime.strptime(pick, "%d-%b-%y").date() == today):
+                pick = expiries[1]
+                dte = (datetime.strptime(pick, "%d-%b-%y").date() - today).days
+                self.expiry_rolled = True
+                log(f"[EXPIRY] Expiry day roll: selling {pick} ({dte} DTE) "
+                    f"instead of today's {expiries[0]}")
+            else:
+                log(f"[EXPIRY] Nearest: {pick} -> {pick.replace('-', '')}")
+            # Recorded for the entry alert and for post-hoc debugging: DTE is the single
+            # biggest driver of this position's gamma/theta/vega, so it belongs on the record.
+            self.traded_expiry = pick
+            self.traded_dte = (datetime.strptime(pick, "%d-%b-%y").date() - today).days
+            # API returns "DD-MMM-YY" but optionsmultiorder expects "DDMMMYY"
+            return pick.replace("-", "")
         except Exception as e:
             log(f"[EXPIRY ERROR] {e}")
         return None
@@ -1038,6 +1134,10 @@ class ShortStraddleBot:
                     f"BUY  {self.hedge_ce_symbol} @ ₹{self.hedge_ce_price:,.2f}",
                     f"BUY  {self.hedge_pe_symbol} @ ₹{self.hedge_pe_price:,.2f}",
                 ]
+            if self.traded_expiry:
+                _roll = " · ROLLED (expiry day)" if self.expiry_rolled else ""
+                lines.append(f"Expiry: {self.traded_expiry} ({self.traded_dte} DTE)"
+                             f"{self._md(_roll)}")
             lines.append(f"Premium collected: ₹{self.total_premium:,.0f}")
             if margin:
                 lines.append(f"Utilised margin: ~₹{margin:,.0f}")
@@ -1351,7 +1451,10 @@ class ShortStraddleBot:
         if ENABLE_HEDGE:
             log(f"  Hedge: {HEDGE_OFFSET} wings (capped max loss)")
         log(f"  VIX threshold: {'disabled' if SKIP_VIX_CHECK else f'< {VIX_THRESHOLD}'}")
-        log(f"  Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
+        if SKIP_EXPIRY_DAY and EXPIRY_DAY_USE_NEXT_WEEK:
+            log("  Expiry day: TRADE next weekly series (never the expiring one)")
+        else:
+            log(f"  Skip expiry day: {'yes' if SKIP_EXPIRY_DAY else 'no'}")
         log(f"  Profit target: {PROFIT_TARGET_PCT}% | Stop-loss: {STOPLOSS_PCT}%")
         log(f"  Entry: {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} | Exit: {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}")
         log("=" * 65)

@@ -28,7 +28,7 @@ REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))
 # (the scheduled job runs from an arbitrary directory).
 sys.path.insert(0, SCRIPT_DIR)
 sys.path.insert(0, REPO_ROOT)
-from charges import charges_from_fills  # noqa: E402
+from charges import _group_orders, charges_from_fills  # noqa: E402
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DB_PATH = os.path.join(REPO_ROOT, "db", "sandbox.db")
@@ -189,6 +189,9 @@ def _load_fills_live(date_str):
             "action": (t.get("action") or "").upper(),
             "quantity": int(t.get("quantity") or 0),
             "price": float(t.get("average_price") or 0),
+            # Needed so brokerage is billed per ORDER: one order can arrive as several
+            # fills (a 130-qty leg filling 65+65), and Zerodha still charges ₹20 once.
+            "orderid": str(t.get("orderid") or ""),
             "trade_timestamp": str(t.get("timestamp") or ""),
         })
     return out
@@ -198,6 +201,17 @@ def load_fills(date_str):
     """Analyze mode -> sandbox_trades (carries per-strategy tags).
     Live -> broker tradebook (see _load_fills_live for the attribution caveats)."""
     return _load_fills_sandbox(date_str) if _analyze_mode() else _load_fills_live(date_str)
+
+
+def _fillnote(r):
+    """'8 orders' normally; '8 orders / 9 fills' when a leg partial-filled.
+
+    Brokerage follows the ORDER count, so surfacing both makes a partial fill visible
+    instead of silently inflating the charge line (which is how the per-fill billing
+    bug hid until 2026-08-13).
+    """
+    n_o, n_f = r.get("norders", r["nfills"]), r["nfills"]
+    return f"{n_o} orders" if n_o == n_f else f"{n_o} orders / {n_f} fills"
 
 
 def compute(fills):
@@ -220,6 +234,13 @@ def compute(fills):
         o = owners.get(r["symbol"], set())
         return next(iter(o)) if len(o) == 1 else (tag or "AUTO_SQUARE_OFF")
 
+    def _opt(row, key):
+        """Read an optional key from a dict OR a sqlite3.Row (no .get(), IndexErrors)."""
+        try:
+            return row[key]
+        except (KeyError, IndexError, TypeError):
+            return None
+
     strat = {}
     for r in fills:
         strat.setdefault(_owner(r), []).append(
@@ -228,6 +249,9 @@ def compute(fills):
                 "quantity": int(r["quantity"]),
                 "price": float(r["price"]),
                 "symbol": r["symbol"],
+                # Carried so charges_from_fills bills brokerage per order, not per fill.
+                # Absent in sandbox_trades, where each row IS its own order.
+                "orderid": _opt(r, "orderid") or "",
             }
         )
 
@@ -286,6 +310,7 @@ def compute(fills):
                 "tag": name,
                 "premium": premium,
                 "nfills": len(fl),
+                "norders": len(_group_orders(fl)),
                 "open_pos": open_pos,
             }
         )
@@ -309,13 +334,13 @@ def format_message(date_str, results, actual_margin=None):
         lines.append(f"*{r['label']}*")
         act = actual_margin.get(r.get("tag"))
         if act:
-            lines.append(f"Margin blocked: {_rupees(act, signed=False)}  ({r['nfills']} fills)")
+            lines.append(f"Margin blocked: {_rupees(act, signed=False)}  ({_fillnote(r)})")
             if r["margin"]:
                 lines.append(f"Max risk (defined): {_rupees(r['margin'], signed=False)}")
         else:
             # no broker snapshot -> show what we can actually compute, correctly labelled
             mt = f"~{_rupees(r['margin'], signed=False)}" if r["margin"] else "n/a"
-            lines.append(f"Max risk (defined): {mt}  ({r['nfills']} fills)")
+            lines.append(f"Max risk (defined): {mt}  ({_fillnote(r)})")
         if r["premium"] is not None:
             lines.append(f"Premium collected: {_rupees(r['premium'], signed=False)}")
         lines.append(f"Gross: {_rupees(r['gross'])}")
