@@ -1,0 +1,12 @@
+[Unit]
+Description=Archive tradebook + append trade-journal row at 15:22 IST Mon-Fri
+
+[Timer]
+# 15:22: after the 15:15 market close AND after the strategy's 15:20 schedule_stop, so the
+# strategy log is final. Before the 15:31 EOD digest. Must be same-day — see the service.
+OnCalendar=Mon..Fri *-*-* 15:22:00 Asia/Kolkata
+Persistent=false
+Unit=openalgo-trade-journal.service
+
+[Install]
+WantedBy=timers.target

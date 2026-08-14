@@ -1,0 +1,19 @@
+[Unit]
+Description=Archive broker tradebook + append the straddle trade-journal row (durable per-day ledger)
+After=openalgo.service
+
+[Service]
+Type=oneshot
+# cwd = repo root so python-dotenv finds .env (needed to decrypt the API key)
+WorkingDirectory=/root/data/openalgo
+Environment=TZ=Asia/Kolkata
+# 1) ARCHIVE FIRST — and this is the load-bearing step. The Zerodha tradebook API returns
+#    the CURRENT DAY ONLY; once the date rolls, fill-level truth is gone permanently. A day
+#    closed by hand writes no [EXIT] lines to our log, so without this archive that day can
+#    never be fill-verified (2026-08-06 is stuck at `low` confidence for exactly this reason).
+ExecStart=/root/data/openalgo/.venv/bin/python /root/data/openalgo/strategies/scripts/archive_tradebook.py
+# 2) Then build the row. '-' prefix: a journal hiccup must never leave step 1 un-run on a
+#    retry, and the archive is the irreplaceable half.
+ExecStart=-/root/data/openalgo/.venv/bin/python /root/data/openalgo/strategies/scripts/trade_journal.py
+StandardOutput=append:/root/data/openalgo/log/trade_journal.log
+StandardError=append:/root/data/openalgo/log/trade_journal.log

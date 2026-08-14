@@ -1,0 +1,10 @@
+[Unit]
+Description=Capture trade data daily at 15:35 IST (Mon-Fri)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:35:00 Asia/Kolkata
+Persistent=true
+Unit=openalgo-capture-trade-data.service
+
+[Install]
+WantedBy=timers.target

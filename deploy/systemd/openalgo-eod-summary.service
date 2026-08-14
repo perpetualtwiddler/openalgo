@@ -1,0 +1,12 @@
+[Unit]
+Description=TradeBhau EOD per-strategy P&L summary -> Telegram broadcast
+After=openalgo.service
+
+[Service]
+Type=oneshot
+# cwd must be the repo root so python-dotenv finds .env (Fernet key to decrypt bot token)
+WorkingDirectory=/root/data/openalgo
+Environment=TZ=Asia/Kolkata
+ExecStart=/root/data/openalgo/.venv/bin/python /root/data/openalgo/strategies/scripts/eod_summary.py --send
+StandardOutput=append:/root/data/openalgo/log/eod_summary.log
+StandardError=append:/root/data/openalgo/log/eod_summary.log

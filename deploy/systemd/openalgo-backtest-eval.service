@@ -1,0 +1,20 @@
+[Unit]
+Description=Daily EMA-options eval (append to options_history.csv) + refresh cross-strategy comparison CSV
+After=openalgo.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/data/openalgo/strategies/scripts
+Environment=BACKTEST_DATA_DIR=/root/data/openalgo/log/market_data_capture
+Environment=TZ=Asia/Kolkata
+# 1) append today's 5 EMA-option rows to the EMA-specific CSV (CSV#1).
+#    '-' prefix => a hiccup here still lets CSV#2 refresh from existing data (error still logged).
+ExecStart=-/root/data/openalgo/.venv/bin/python /root/data/openalgo/strategies/scripts/backtest_ema_dev.py --csv /root/data/openalgo/strategies/scripts/options_history.csv
+# 2) rebuild the generic cross-strategy comparison CSV (CSV#2): EMA (from CSV#1) + regime + straddle.
+ExecStart=/root/data/openalgo/.venv/bin/python /root/data/openalgo/strategies/scripts/build_generic_csv.py --out /root/data/openalgo/strategies/scripts/strategies_comparison.csv
+# 3) exit-timing evidence for the straddle: replay today out to 15:01/15:05/15:10/15:14 and
+#    append to log/exit_timing.csv. MUST run after the 15:35 chain capture (step 2's data
+#    source) — running it at 15:30 on 2026-08-14 found no files and silently skipped.
+ExecStart=-/root/data/openalgo/.venv/bin/python /root/data/openalgo/strategies/scripts/exit_timing_eval.py
+StandardOutput=append:/root/data/openalgo/log/backtest_eval.log
+StandardError=append:/root/data/openalgo/log/backtest_eval.log

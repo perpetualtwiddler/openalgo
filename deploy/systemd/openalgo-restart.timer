@@ -1,0 +1,10 @@
+[Unit]
+Description=Restart OpenAlgo at 09:05 IST Mon-Fri (post-auth, pre-09:15 strategies)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:05:00 Asia/Kolkata
+Persistent=false
+Unit=openalgo-restart.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily capture of trade data for backtest archive
+After=openalgo.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/data/openalgo
+# SECRET REDACTED FOR GIT. On the server this line carries a real OPENALGO_API_KEY.
+# Do NOT paste a key here. See deploy/systemd/README.md — preferred fix is to move it
+# to an EnvironmentFile with 0600 perms, or drop it entirely and read the key from the
+# DB via get_api_key_for_tradingview('admin') as the other jobs already do.
+Environment=OPENALGO_API_KEY=__REDACTED__
+Environment=OPENALGO_HOST=http://127.0.0.1:5000
+Environment=TZ=Asia/Kolkata
+ExecStart=/root/data/openalgo/.venv/bin/python /root/data/openalgo/strategies/scripts/capture_trade_data.py
+StandardOutput=journal
+StandardError=journal

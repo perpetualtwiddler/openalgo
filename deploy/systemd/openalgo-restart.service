@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart OpenAlgo after daily Zerodha auth (WS tick-delivery stall fix)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart openalgo

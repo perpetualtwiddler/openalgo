@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenAlgo Trading Platform
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/data/openalgo
+Environment=PATH=/root/data/openalgo/.venv/bin:/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TZ=Asia/Kolkata
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/data/openalgo/.venv/bin/gunicorn --worker-class eventlet -w 1 --bind 127.0.0.1:5000 --timeout 120 --graceful-timeout 30 app:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
