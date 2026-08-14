@@ -19,9 +19,71 @@ Tracked here so nothing slips (most recent context first).
 | 4 | **Extend option-chain capture to the NEXT weekly expiry** | MEDIUM (blocks validating the expiry-day roll) | Capture stores only the front series, so expiry-day 7-DTE trades cannot be backtested at all — `2026-08-11` has 22 files, all `NIFTY11AUG26`. Add the next weekly so a replay becomes possible; until then the roll is measured live only, via `trade_journal.csv` (`series_code`, `dte`). |
 | 5 | **Populate `market_holidays[]` in `event_calendar.json`** | LOW | Deliberately left EMPTY — the dates were not verified against the NSE circular, and a wrong one would move a skip onto the wrong session. Only matters when a `next_session` roll lands beside a holiday; weekends are handled in code, and the `[EVENT]` log always prints the release date it resolved from, so a bad roll is visible. |
 | 6 | **Reconcile the 2026-08-10 ₹50.45 charge gap** | LOW | Fill-derived net +₹1,981.26 vs the broker reading of +₹1,930.81 recorded that day. Not a clean ₹20 multiple, so not just fill-counting. Needs that day's contract note. |
-| 7 | **Wire `trade_journal.py` + `exit_timing_eval.py` into the 15:45 IST timer** | MEDIUM | Both are run by hand today. The journal is the durable record (the broker tradebook is current-day only, so a missed day is unrecoverable); automate it before a day gets lost. |
+| 7 | **Schedule `archive_tradebook.py` + `trade_journal.py` + `exit_timing_eval.py` daily** | **HIGH** | All three are run by hand today. Order matters: **archive_tradebook must run on the trading day** (the broker tradebook is CURRENT-DAY ONLY — miss it and the fills are gone forever, which is why 2026-08-06 is permanently `low` confidence), and **exit_timing_eval must run AFTER the 15:35 option-chain capture** (learned 08-14: running it at 15:30 found no data). Suggested: archive at 15:20, journal at 15:25, exit_timing_eval at 15:45. |
+| 7b | **Collect composition-at-decision data for the theta-vs-vega exit hypothesis** | MEDIUM | See "Hypothesis: composition-aware exit" below. Needs ≥15–20 paired observations before any rule change. Cheap to gather — log the durable/vega split at a fixed checkpoint each day. |
 | 8 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
 | 9 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
+
+### ⚠️ Manual-exit unwind order — buy back the SHORTS first, then sell the wings
+
+Observed twice on 2026-08-14 during a manual Zerodha exit: **two orders were REJECTED**, both
+wing SELLs, and both when attempted while the short straddle was still open.
+
+```
+5.  23950 PE SELL   rejected   <- wing sold first, shorts still open
+6.  24350 PE BUY    complete   <- short closed
+7.  24350 CE BUY    complete   <- short closed
+8.  24750 CE SELL   rejected   <- wing again, still too early
+9.  24750 CE SELL   complete   <- retried after shorts were flat
+10. 23950 PE SELL   complete
+```
+
+**Why:** selling a long wing while short the ATM options destroys the hedge benefit. For a
+moment the position reads as a *naked* short to Zerodha's RMS, required margin spikes past
+available cash, and the order is refused. Once the shorts are bought back the wings sell
+freely.
+
+Our code already gets this right — `[EXIT]` closes CE then PE (BUY) before HEDGE CE / HEDGE PE
+(SELL), the mirror of entry placing BUY hedges before SELL shorts (`options_multiorder_service.py`
+orders legs 3,4 then 1,2) so there is never a transient naked-straddle margin spike. **Only the
+manual path can trip over this.** Rejections are free (brokerage is per *executed* order), so the
+cost is a failed click, not money — but under time pressure near the close it could mean sitting
+in a position you meant to be out of.
+
+### 💡 Hypothesis: composition-aware exit (theta vs vega) — NOT implemented, needs data
+
+Surfaced by Mandar's 2026-08-14 manual exit, which beat every systematic alternative. The idea:
+**bank early when the day's gain is mostly vega, hold when it is mostly theta.**
+
+Rationale — the two are not equally durable. Theta is earned and permanent; vega is a
+mark-to-market on an opinion and fully reversible. We can now measure the split live by
+back-solving each leg's IV from its entry fill and repricing at current spot/time: the gap
+between that counterfactual and actual P&L *is* the vega contribution.
+
+Evidence from 08-14 (n=1, do not act on this yet):
+
+| | |
+|---|---|
+| net at the 13:05 manual exit | **+₹1,641.73** (real fills) |
+| composition at that moment | 85% vega, durable theta only ~₹269 |
+| best available by holding | +₹2,038 at 13:38 (3-minute window) |
+| hold to 15:01 | +₹783 |
+| worst point after the exit | **−₹473 at 13:45** — a ₹2,511 swing in 7 minutes |
+| breach band touched? | **No** (high 24,402 vs trigger 24,484) — the strategy's own stop would NOT have helped |
+
+The 13:38→13:45 collapse came on a 45-point index move, far too small to explain 24 points of
+straddle repricing through delta — it was an IV spike. So the risk that materialised was
+precisely the one the composition metric flags.
+
+Why this differs from the **already-rejected** time-based profit bank (hardening scan 2026-07-16,
+negative over 40 days): that rule conditioned on *time*, this conditions on *composition*, which
+we did not measure then. Also note my own base-rate analysis argued for holding — mean +₹259,
+median +₹418 over the 14 captured days that were >+₹1,200 at 13:00 — and was wrong here, because
+a P&L threshold cannot distinguish a gain built on theta from one built on rented vega.
+
+**Before implementing:** needs ≥15–20 observations pairing composition-at-decision against
+hold-to-close outcome. Until then it is one good call, not an edge. Risk of acting early is
+classic overfitting to a vivid single day.
 
 ### Security audit 2026-08-04 — does OpenAlgo leak our trade/strategy data?
 

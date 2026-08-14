@@ -33,6 +33,7 @@ Env:
 """
 import csv
 import glob
+import json
 import os
 import re
 import sys
@@ -111,15 +112,62 @@ def _rd(path):
     return list(csv.DictReader(open(path))) if os.path.exists(path) else []
 
 
-def charges_per_order(fills, n_orders):
-    """Zerodha options charges, delegated to the shared rate card in charges.py.
+TRADEBOOK_DIR = os.path.join(REPO_ROOT, "log", "tradebook")
 
-    We pass one fill per order (no 'orderid' key), which charges_from_fills treats as
-    one order each — so brokerage lands on n_orders. Kept as a named wrapper because
-    the caller reasons in orders, and to assert that assumption rather than imply it.
+
+def _exit_from_tradebook(date, short_syms):
+    """Exit prices from an archived broker tradebook, for days our log never recorded them.
+
+    A MANUAL exit (closed by hand in the Zerodha terminal) writes no [EXIT] lines, so the
+    log-parsing path yields nothing — that is why 2026-08-06 is stuck at `low` confidence.
+    The broker tradebook has the real fills, but it is CURRENT-DAY ONLY, so it must be
+    archived on the day (see archive_tradebook.py) or the day is lost forever.
+
+    Closing side is inferred from the leg's role: we SELL the ATM shorts at entry, so their
+    exit fills are the BUYs; the wings are bought at entry, so their exit fills are the SELLs.
+    Multiple fills per leg are volume-weighted — and `n_orders` counts distinct order ids,
+    never fills, because Zerodha bills brokerage per order (2026-08-14: 11 fills, 8 orders).
+
+    Returns (exit_prices, n_orders, n_fills) or (None, 0, 0).
     """
-    assert len(fills) == n_orders, f"expected {n_orders} per-order fills, got {len(fills)}"
-    return chg.charges_from_fills(fills, True)
+    p = os.path.join(TRADEBOOK_DIR, f"{date}.json")
+    if not os.path.exists(p):
+        return None, 0, 0
+    tb = json.load(open(p)).get("trades") or []
+    if not tb:
+        return None, 0, 0
+    per = {}
+    oids = set()
+    for t in tb:
+        sym = t.get("symbol") or ""
+        act = (t.get("action") or "").upper()
+        qty = abs(int(float(t.get("quantity") or 0)))
+        px = float(t.get("average_price") or t.get("price") or 0)
+        if t.get("orderid"):
+            oids.add(str(t["orderid"]))
+        closing = "BUY" if sym in short_syms else "SELL"
+        if act != closing:
+            continue                          # this is the opening fill, not the exit
+        d = per.setdefault(sym, [0, 0.0])
+        d[0] += qty
+        d[1] += qty * px
+    ex = {s: round(v / q, 2) for s, (q, v) in per.items() if q}
+    return (ex or None), len(oids), len(tb)
+
+
+def charges_per_order(fills, n_orders):
+    """Zerodha options charges for a position expressed as one net fill per leg-side.
+
+    Delegates the rate card to charges.py so there is a single home for it. Brokerage is
+    the only component that depends on how fills group into orders (Rs20 each); STT, txn,
+    stamp, SEBI and GST depend purely on turnover, which grouping cannot change. So we
+    stamp synthetic order ids to make the distinct-id count exactly `n_orders` — which
+    keeps this correct when a leg partial-filled and the real order count differs from
+    the number of rows we hold (2026-08-14: 11 broker fills, 8 orders, 8 net leg-sides).
+    """
+    n = max(1, int(n_orders))
+    tagged = [dict(f, orderid=f"o{i % n}") for i, f in enumerate(fills)]
+    return chg.charges_from_fills(tagged, True)
 
 
 def _f(m, i=1, cast=float):
@@ -237,6 +285,20 @@ def build(date):
 
     pairs = [("ce", leg("atm", "CE")), ("pe", leg("atm", "PE")),
              ("hce", leg("wing", "CE")), ("hpe", leg("wing", "PE"))]
+
+    # No [EXIT] lines in the log => closed outside our code (manual Zerodha exit). Fall back
+    # to the archived broker tradebook, which carries the real fills. Keeps such a day at
+    # `high` confidence instead of the guesswork that left 2026-08-06 at `low`.
+    tb_orders = tb_fills = 0
+    if not ex:
+        shorts = {s for k, s in pairs[:2] if s}
+        tb_ex, tb_orders, tb_fills = _exit_from_tradebook(date, shorts)
+        if tb_ex:
+            ex = tb_ex
+            r["exit_reason"] = r["exit_reason"] or "MANUAL_ZERODHA"
+            r["notes"] = ("exit fills recovered from the archived broker tradebook "
+                          "(no [EXIT] lines — closed manually); "
+                          f"{tb_orders} orders / {tb_fills} fills")
     for key, sym in pairs:
         if sym:
             r[f"{key}_entry"] = ent.get(sym, "")
@@ -272,8 +334,11 @@ def build(date):
         fills.append({"action": "BUY" if short else "SELL", "quantity": q, "price": x})
     if len(fills) == 8:
         gross = sum((1 if f["action"] == "SELL" else -1) * f["quantity"] * f["price"] for f in fills)
-        ch = charges_per_order(fills, 8)
-        r["n_orders"], r["n_fills"] = 8, 8
+        ch = charges_per_order(fills, r["n_orders"] if isinstance(r["n_orders"], int) else 8)
+        # 8 legs => 8 orders, unless the archived tradebook shows real fill counts
+        # (a leg can partial-fill; brokerage still follows ORDERS).
+        r["n_orders"] = tb_orders or 8
+        r["n_fills"] = tb_fills or 8
         r["gross_pnl"] = round(gross, 2)
         r["charges"] = round(ch, 2)
         r["net_pnl"] = round(gross - ch, 2)
