@@ -20,9 +20,10 @@ Tracked here so nothing slips (most recent context first).
 | 5 | **Populate `market_holidays[]` in `event_calendar.json`** | LOW | Deliberately left EMPTY — the dates were not verified against the NSE circular, and a wrong one would move a skip onto the wrong session. Only matters when a `next_session` roll lands beside a holiday; weekends are handled in code, and the `[EVENT]` log always prints the release date it resolved from, so a bad roll is visible. |
 | 6 | **Reconcile the 2026-08-10 ₹50.45 charge gap** | LOW | Fill-derived net +₹1,981.26 vs the broker reading of +₹1,930.81 recorded that day. Not a clean ₹20 multiple, so not just fill-counting. Needs that day's contract note. |
 | ~~7~~ | ~~**Schedule the EOD jobs**~~ | **DONE 2026-08-14** | `openalgo-trade-journal.timer` created (15:22 IST Mon-Fri: archive_tradebook then trade_journal), and `exit_timing_eval.py` appended to `openalgo-backtest-eval.service` (15:45, after the 15:35 capture). Test-fired: `Result: success`. Units now checked in at `deploy/systemd/` with a README — they were previously server-only, so a rebuild would have lost the whole pipeline. |
-| 7c | **Move `OPENALGO_API_KEY` out of `openalgo-capture-trade-data.service`** | **HIGH (security)** | Found 2026-08-14 while checking in the units: a **real API key** sat in a **world-readable (0644)** unit, also exposed via `systemctl show` to any local user, and it can place real orders — SEBI static-IP whitelisting is no defence since the whitelisted IP *is* this box. Tightened to 0640 immediately (closes file-read, NOT `systemctl show`). Real fix: `EnvironmentFile=` at 0600, or better delete the var and read the key from the DB via `get_api_key_for_tradingview('admin')` as eod_summary / trade_journal / archive_tradebook already do — none of them needs a key in a unit. |
+| 7c | **Move `OPENALGO_API_KEY` out of `openalgo-capture-trade-data.service`** | **HIGH (security)** | Found 2026-08-14 while checking in the units: a **real API key** sat in a **world-readable (0644)** unit, also exposed via `systemctl show` to any local user, and it can place real orders — SEBI static-IP whitelisting is no defence since the whitelisted IP *is* this box. Tightened to 0640 immediately (closes file-read, NOT `systemctl show`). **Root cause: `setup_systemd_timers.sh` itself** — it requires `OPENALGO_API_KEY` (line 42) and writes it into the unit, so tightening the unit alone is NOT a fix: the next run of that script re-introduces the leak. Real fix: drop the var entirely and read the key from the DB via `get_api_key_for_tradingview('admin')` as eod_summary / trade_journal / archive_tradebook already do — none of them needs a key in a unit — and remove the requirement from the setup script. Interim: `EnvironmentFile=` at 0600. |
 | 7b | **Collect composition-at-decision data for the theta-vs-vega exit hypothesis** | MEDIUM | See "Hypothesis: composition-aware exit" below. Needs ≥15–20 paired observations before any rule change. Cheap to gather — log the durable/vega split at a fixed checkpoint each day. |
 | 8 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
+| 10 | **Growth model — revisit the net-monthly-return assumption** | MEDIUM | `log/straddle-income-growth-analysis.xlsx` (generator `strategies/scripts/growth_model_xlsx.py`) hangs entirely on one input: the NET monthly return. Live data is 5 days / +₹2,702 — far too little to annualise. Revisit once ~30 live days exist, and sanity-check the 5%/yr lot-value growth against actual NIFTY margin drift. See "Investment Growth / Compounding Model" below. |
 | 9 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
 
 ### ⚠️ Manual-exit unwind order — buy back the SHORTS first, then sell the wings
@@ -383,6 +384,131 @@ Worst single day: 2026-06-25 (−7,008): entry at intraday top (BUY 58,670, MFE 
 
 ---
 
+## Investment Growth / Compounding Model (capital planning)
+
+**📄 Spreadsheet:** `log/straddle-income-growth-analysis.xlsx`
+**Full path (local):** `/home/mandar/data/programs/marketcalls/openalgo/log/straddle-income-growth-analysis.xlsx`
+**Generator:** `strategies/scripts/growth_model_xlsx.py` — re-run it to rebuild the file from scratch
+(`python3 strategies/scripts/growth_model_xlsx.py`; env overrides `XLSX_OUT`, `XLSX_MAXY`, `XLSX_YEARS`).
+**Built:** 2026-08-14. Not a forecast — a planning envelope. Read the limitations before quoting any number from it.
+
+### What it answers
+
+Given ₹5,00,000 deployed as whole straddle lots, how does the corpus compound over N years if a sustained
+net monthly return is reinvested into additional lots — and how differently do modest differences in that
+monthly return end up? Every output cell is a **live Excel formula** reading named input cells, so any input
+change recomputes the whole workbook. Nothing is precomputed.
+
+**Sheets:** `Inputs` (all yellow cells editable) · `Summary` (headline + one row per year per scenario) ·
+`Engine A–D` (monthly workings, 360 rows each) · `Assumptions`.
+
+### The deduction waterfall — this is the part people get wrong
+
+```
+deployed capital × monthly return     ← the % you enter is ALREADY NET of brokerage/STT/slippage
+  − govt tax          (quarterly)
+  − annual withdrawal (once a year)
+  = retained, compounds into next month's deployed capital
+```
+
+Nothing else is subtracted anywhere. The Summary column is deliberately named
+**"TRADING PROFIT (net of charges, pre-tax)"** rather than "gross", because "gross" would wrongly imply
+transaction costs are still to come.
+
+**⚠️ The single most abusable input.** Live experience at 2 lots has charges running **28–43% of gross**
+trading profit (see the trade journal). So a raw strategy gross of 8%/month is roughly a **5%** entry here.
+Typing 8% is an assertion that costs are already cleared — and the whole workbook hangs on that one number.
+
+### Model mechanics
+
+| Rule | Why it matters |
+|---|---|
+| **Returns accrue on DEPLOYED capital only** — `profit = lots × lot_value × monthly_return` | Cash insufficient for a whole extra lot sits **idle earning nothing**. This is why the corpus grows in steps, not smoothly. |
+| **Reinvestment is lumpy** — `lots = INT(corpus / lot_value)`, recomputed monthly | Matches how the straddle actually scales: a lot is added only when its whole margin is available. |
+| **Lot value rises yearly** — `lot_value₀ × (1+g)^(year−1)`, default **5%/yr** | Margin per lot grows with NIFTY and premium levels, so the bar for adding a lot keeps rising. Set `g=0%` to isolate this drag — it is larger than most people expect. |
+| **Starting lots derived**, not entered — `INT(5,00,000 / 83,333) = 6` | Keeps the brief's ₹83,333/lot consistent with the ₹5L corpus. |
+
+### Government tax
+
+New regime only, **quarterly deduction** (confirmed with Mandar 2026-08-14). The supplied effective rates
+already contain the 30% base slab plus surcharge and cess:
+
+| Annual income | Surcharge | Effective (NEW) — **used** | Effective (OLD) — reference |
+|---|---|---|---|
+| Up to ₹50 L | 0% | **31.20%** | 31.20% |
+| ₹50 L – ₹1 Cr | 10% | **34.32%** | 34.32% |
+| ₹1 Cr – ₹2 Cr | 15% | **35.88%** | 35.88% |
+| ₹2 Cr – ₹5 Cr | 25% | **39.00%** | 39.00% |
+| Above ₹5 Cr | 25% / 37% | **39.00%** | 42.744% |
+
+The slab is picked from **annualised** year-to-date profit (`YTD × 12 / month-in-year`), the way advance tax
+is estimated in practice — so a growing book climbs into higher surcharge bands over time. Verified live:
+Scenario C sits at 31.20% through month 36 and reaches 39.00% by month 72.
+
+**Quarterly vs Annually is not cosmetic** — a toggle exists on `Inputs`. Quarterly removes money from the
+corpus four times a year instead of once, so it compounds *less*. Switching to Annually flatters the result;
+Quarterly is the realistic default and what ships.
+
+### Annual withdrawal — `MIN(10% of profit, ₹1 crore)`
+
+Actual formula (Engine column Q, month 12 of each year):
+
+```excel
+=IF($A16>NYears*12,"",
+   IF($D16=12, MIN(WdrPct*IF(WdrBase="Post-tax profit",$K16-$P16,$K16), WdrCap), 0))
+```
+
+`WdrPct`=10%, `WdrCap`=₹1,00,00,000, `WdrBase` defaults to **Post-tax profit** (`$K−$P` = profit YTD minus
+tax YTD) — you withdraw from what is actually yours. Both arms verified to bind: in Scenario C the 10% arm
+governs years 1–8, and the **₹1 Cr cap takes over at year 9** once post-tax profit passes ₹10 Cr. In
+Scenario A the cap never binds within 10 years.
+
+**⚠️ Consequence worth understanding:** the cap is a *compounding accelerator* at the top end. In Scenario C
+years 9–10 it leaves ₹6.2 Cr and ₹22.7 Cr respectively **inside** the corpus that a pure 10% rule would have
+withdrawn. Much of why the high-return scenarios balloon is the cap preventing proportional drawdown exactly
+when the numbers get large.
+
+Note `MIN` vs `MAX`: "10% or ₹1 crore, whichever is less" is a **ceiling**. Had it meant a withdrawal *floor*
+(`MAX`), it would pull ₹1 Cr out of a ₹5 L corpus in year 1 and destroy it. `MIN` is intended.
+
+### Headline at defaults (Sep-2026 → 10 years, ₹5 L, lot ₹83,333 growing 5%/yr)
+
+| Scenario | Monthly (net) | Year-10 corpus | Lots |
+|---|---|---|---|
+| D (custom) | 4.25% | ₹1.12 Cr | 86 |
+| A | 5.00% | ₹1.91 Cr | 147 |
+| B | 8.00% | ₹14.60 Cr | 1,129 |
+| C | 10.00% | ₹61.73 Cr | 4,774 |
+
+**The point of the exercise:** doubling the monthly return 5% → 10% multiplies the 10-year outcome **~32×**.
+Even 4.25% → 5.00% — just 0.75 pp a month — is a **1.7×** difference over a decade.
+
+### What this model does NOT do (read before believing the top rows)
+
+- **No losing months.** A constant positive monthly return is a planning tool. The live straddle already has
+  a losing day (13-Aug-2026, −₹686) and a worst backtested day of **−₹17,522**. Treat every figure as an
+  upper envelope.
+- **No liquidity or position-limit ceiling.** Scenario C's 4,774 lots is ~₹6 Cr of margin and ~3.1 lakh
+  contracts — far beyond what the NIFTY chain absorbs, and slippage grows with size. The top scenarios are
+  arithmetic, not plans.
+- **No margin-spike buffer, no drawdown path.** Corpus is assumed fully deployable into whole lots.
+- **Returns are on capital, not risk-adjusted.** Nothing here says the strategy *can* sustain the rate typed in.
+
+### Verification (and the bug it caught)
+
+The workbook was validated by **recalculating it** with a pure-Python Excel engine (`formulas`, in a throwaway
+venv) and comparing every Summary cell against an independent Python re-implementation of the same model:
+**200 value checks matched to the paisa** across all four scenarios, plus the Years guard blanking unused rows,
+the headline tracking the `NYears` input, tax-slab escalation, and the withdrawal cap crossover.
+
+**This is not ceremony — it caught a fatal defect.** The guarded formulas were initially written without a
+leading `=`, so every computed cell would have opened in Excel as **literal text**: a completely dead
+workbook that looked fine to static inspection. Lesson: an openpyxl-generated workbook is unverified until
+something actually evaluates the formulas. openpyxl writes no cached values, so Excel/LibreOffice compute on
+open — but a tool that merely *reads* the file (pandas, openpyxl itself) sees formula strings, not numbers.
+
+---
+
 ## Deployment Workflow
 
 1. Edit strategy files locally at `/home/mandar/data/programs/marketcalls/openalgo/strategies/scripts/`
@@ -481,16 +607,21 @@ Logging is best-effort and fully guarded, and runs only *after* orders complete,
 
 ## Operational Timers (systemd)
 
-Four systemd timers keep the trading server hands-off (all `Mon..Fri`, `Asia/Kolkata`):
+**Five** systemd timers keep the trading server hands-off (all `Mon..Fri`, `Asia/Kolkata`). Reference copies of every unit are checked in at **`deploy/systemd/`** with a README — they used to exist *only* on the server, so a rebuild would have silently lost the entire schedule.
 
 | Timer | Schedule (IST) | Purpose |
 |-------|----------------|---------|
-| `openalgo-restart.timer` | 09:05 | Restart openalgo pre-market (fresh scheduler + broker session) |
+| `openalgo-restart.timer` | 09:05 | Restart openalgo pre-market (fresh scheduler + broker session). **This is what loads new strategy code.** |
+| `openalgo-trade-journal.timer` | **15:22** | `archive_tradebook.py` **then** `trade_journal.py`, in ONE unit so the order cannot race (added 2026-08-14) |
 | `openalgo-eod-summary.timer` | 15:31 | TradeBhau EOD per-strategy P&L digest → Telegram (`eod_summary.py`) |
 | `openalgo-capture-trade-data.timer` | 15:35 | Archive the day's intraday option-chain data (`~/data/zerodha/trade-data`) for backtesting |
-| `openalgo-backtest-eval.timer` | 15:45 | Append day's EMA-option rows + rebuild cross-strategy comparison CSVs |
+| `openalgo-backtest-eval.timer` | 15:45 | EMA-option rows + comparison CSVs + **`exit_timing_eval.py`** |
 
-Post-close ordering is deliberate: **15:31** digest reads the day's trades → **15:35** capture archives the chain data → **15:45** eval backtests on it.
+Post-close ordering is **load-bearing, not cosmetic** — each constraint was learned by breaking it:
+
+1. **15:22 archive must run ON the trading day.** The Zerodha tradebook API returns the **current day only**; once the date rolls, fill-level truth is gone permanently. A day closed by hand writes no `[EXIT]` lines to our log, so without this archive it can never be fill-verified — which is why `2026-08-06` sits at `low` confidence in the ledger forever.
+2. **15:22 is after the strategy's 15:20 `schedule_stop`**, so the log `trade_journal.py` parses for MFE/MAE and exit fills is final.
+3. **`exit_timing_eval` must run after the 15:35 capture** it replays. Running it at 15:30 on 2026-08-14 found no files and **skipped silently** — a quiet failure, which is the dangerous kind.
 
 **Why the 09:05 restart?** A fresh pre-market restart avoids APScheduler's `ThreadPoolExecutor` "shutdown-after-~2-days" death (scheduler logs `"all checks passed, starting"` at 09:15 IST but never spawns the subprocess; observed May 26 & 29 2026) and clears overnight drift.
 
@@ -498,7 +629,7 @@ Post-close ordering is deliberate: **15:31** digest reads the day's trades → *
 
 **Decision (2026-07-20): keep the 09:05 restart.** Retiming it *after* login was rejected — it would land at/after the 09:15 strategy start and could interrupt an active EMA entry. Since "before strategies" (09:15) and "after login" (~09:15) collide, retiming can't solve it. Mitigation options (one still to be chosen): (a) **log in before 09:05** — zero-code, makes the restart boot authenticated; (b) **broker-adapter reconnect-on-auth** code fix — keeps current login time, more work, deferred; (c) status-quo — the strategies' own WS auto-reconnect self-recovers, do a manual `systemctl restart openalgo` on a bad day. Regime candle-persistence (2026-07-20) now makes such a manual restart safe — warmup/ER-window survive it.
 
-**Setup:** run `setup_systemd_timers.sh` on the server with `OPENALGO_API_KEY` set (idempotent — safe to re-run). Note: `openalgo-eod-summary.timer` was added manually on 2026-07-11 and may not yet be in the script — fold it in when convenient.
+**Setup:** `setup_systemd_timers.sh` provisions the older timers. ⚠️ **It requires `OPENALGO_API_KEY` and bakes it into a unit file — see backlog 7c; re-running it will re-leak the key** until that is fixed. `openalgo-eod-summary.timer` (2026-07-11) and `openalgo-trade-journal.timer` (2026-08-14) were added manually and are not in the script; the checked-in copies under `deploy/systemd/` are the reference.
 
 ```bash
 OPENALGO_API_KEY=<key> ./strategies/scripts/setup_systemd_timers.sh
