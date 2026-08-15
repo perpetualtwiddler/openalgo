@@ -465,6 +465,10 @@ four legs the moment it crosses.
 /stradexit 2000     arm take-profit at NET +₹2,000
 /stradexit -3000    arm stop at NET −₹3,000
 /stradexit 0        clear BOTH
+/stradexit          (no argument) REPORT current state — what is armed, when it was
+                    armed, and whether a position is open to watch. Reporting via the
+                    bare command matters because the only other way to check would be
+                    to send a value, which changes the thing you are inspecting.
 ```
 
 The two slots are **independent** — `+2000` then `−3000` leaves both armed; re-arming one side

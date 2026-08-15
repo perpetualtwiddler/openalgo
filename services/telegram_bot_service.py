@@ -97,16 +97,48 @@ class TelegramBotService:
             await update.message.reply_text("❌ Please link your account first using /link")
             return
 
+        path = _Path(os.getenv("STRADEXIT_FILE", "/root/data/openalgo/log/straddle_command.json"))
+        today = _dt.now().strftime("%Y-%m-%d")
+
         if not context.args or len(context.args) != 1:
-            await update.message.reply_text(
-                "*Usage:* `/stradexit <net INR>`\n\n"
-                "`/stradexit 2000`  → exit when NET P&L reaches +₹2,000\n"
-                "`/stradexit -3000` → exit when NET P&L falls to −₹3,000\n"
-                "`/stradexit 0`     → cancel BOTH, back to breach / PT / SL / EOD\n\n"
-                "_Slots are independent — arm one side, the other, or both._\n"
-                "_Applies to today only. NET = after Zerodha charges._",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            # Bare /stradexit REPORTS current state rather than only printing usage — the
+            # only other way to check would be to send a value, which changes what you are
+            # trying to inspect.
+            t = s = armed_at = None
+            try:
+                if path.exists():
+                    cur = _json.loads(path.read_text())
+                    if cur.get("date") == today:      # stale days are not "armed"
+                        t, s = cur.get("target_net"), cur.get("stop_net")
+                        armed_at = (cur.get("updated_at") or "")[11:19]
+            except Exception:
+                pass
+
+            lines = ["🎯 *Straddle exit — current state*", ""]
+            if t is None and s is None:
+                lines.append("Nothing armed. Running on breach / PT / SL / EOD only.")
+            else:
+                lines.append(f"Take-profit: {'NET +₹%s' % format(t, ',.0f') if t else '— not set'}")
+                lines.append(f"Stop:        {'NET −₹%s' % format(abs(s), ',.0f') if s else '— not set'}")
+                if armed_at:
+                    lines.append(f"Armed at:    {armed_at} IST · applies to {today} only")
+            # Whether it is actually being watched depends on there being a position; the
+            # monitor loop idles while flat, so say which of the two situations you are in.
+            try:
+                client = self._get_sdk_client(user.id)
+                pb = (client.positionbook().get("data") or []) if client else []
+                legs = [p for p in pb if int(float(p.get("quantity") or 0)) != 0
+                        and (p.get("symbol") or "").startswith("NIFTY")]
+                lines.append("")
+                if legs:
+                    lines.append(f"Position:    {len(legs)} leg(s) open — actively watched every 5s")
+                else:
+                    lines.append("Position:    flat — a target applies from the next entry")
+            except Exception:
+                pass
+            lines += ["", "_Usage:_ `/stradexit 2000` · `/stradexit -3000` · `/stradexit 0` to cancel",
+                      "_Slots are independent. NET = after Zerodha charges._"]
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
             return
 
         raw = context.args[0].replace(",", "").replace("₹", "")
@@ -117,8 +149,6 @@ class TelegramBotService:
                                             parse_mode=ParseMode.MARKDOWN)
             return
 
-        path = _Path(os.getenv("STRADEXIT_FILE", "/root/data/openalgo/log/straddle_command.json"))
-        today = _dt.now().strftime("%Y-%m-%d")
 
         # Preserve the other slot: read the existing payload, but only if it is still today's.
         cur = {}
