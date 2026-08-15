@@ -24,6 +24,7 @@ Tracked here so nothing slips (most recent context first).
 | 7b | **Collect composition-at-decision data for the theta-vs-vega exit hypothesis** | MEDIUM | See "Hypothesis: composition-aware exit" below. Needs ≥15–20 paired observations before any rule change. Cheap to gather — log the durable/vega split at a fixed checkpoint each day. |
 | 8 | **Opt1: log history-fetch failures** | LOW | Zerodha `/history` "Server disconnected" flakiness is silently skipped; add a logged warning (+ optional retry). |
 | 10 | **Growth model — revisit the net-monthly-return assumption** | MEDIUM | `log/straddle-income-growth-analysis.xlsx` (generator `strategies/scripts/growth_model_xlsx.py`) hangs entirely on one input: the NET monthly return. Live data is 5 days / +₹2,702 — far too little to annualise. Revisit once ~30 live days exist, and sanity-check the 5%/yr lot-value growth against actual NIFTY margin drift. See "Investment Growth / Compounding Model" below. |
+| 11 | **Ingress allowlist on `/api/v1` (Caddy)** | **HIGH (security)** | `algo.oftenuncertain.net` reverse-proxies to gunicorn with **no IP allowlist and no auth matcher**, so `/api/v1` is reachable from anywhere on the internet and the OpenAlgo API key alone authorises **real order placement**. SEBI static-IP whitelisting is NO defence — the order originates from this server, which IS the whitelisted IP (see CLAUDE.md: "attacks routed THROUGH the OpenAlgo server are still viable"). Our strategies all call `127.0.0.1` locally and Chartink has 0 configured strategies, so nothing appears to need remote access — **verify that before restricting**. Distinct from #3, which is egress. |
 | 9 | **Go-strategies port decision** (openalgo-go vs manja vs keep-Python) | LOW | Draft in "Go-Based Strategies (PROPOSED)" below; no decision needed yet. |
 
 ### ⚠️ Manual-exit unwind order — buy back the SHORTS first, then sell the wings
@@ -381,6 +382,77 @@ Worst single day: 2026-06-25 (−7,008): entry at intraday top (BUY 58,670, MFE 
 | BANKNIFTY EMA Crossover | ~3.0 lakh | Futures, higher margin |
 | Reserve | ~1.0 lakh | Buffer for margin spikes |
 | **Total** | **5.0 lakh** | Virtual (analyzer mode) |
+
+---
+
+## Telegram Control Channel (TradeBhau)
+
+**Bot:** `@TradeBhau_bot` · **Linked account:** Mandar, telegram_id `8695581038` (from @userinfobot)
+Commands available: `/status /positions /holdings /funds /pnl /orderbook /tradebook /quote /chart /menu`
+and the **action** ones — `/closeall` (2-step inline confirm, incl. "Close all + Stop strategies"),
+`/stoppython`, `/mode`.
+
+### How a command actually travels (e.g. `/holdings`)
+
+```
+① phone ──► Telegram servers            "/holdings"        ✗ no OpenAlgo key
+② Telegram ──► our server               delivered down the long-poll getUpdates
+                                        connection WE opened outbound;
+                                        authenticated by the BOT TOKEN     ✗ no OpenAlgo key
+③ inside gunicorn                       allowlist gate → auth gate → Fernet-decrypt key (RAM only)
+④ gunicorn ──► 127.0.0.1:5000           POST /api/v1/holdings {"apikey": …}
+                                        ★ the ONLY hop the API key travels — loopback,
+                                          never leaves the kernel
+⑤ OpenAlgo ──► Zerodha                  broker session token, not our API key
+⑥ reply back up                         rendered text → Telegram → phone   ✗ no OpenAlgo key
+```
+
+**The OpenAlgo API key is never sent to Telegram.** It exists in exactly three places: Fernet-encrypted
+at rest in `telegram_users` (PBKDF2-HMAC-SHA256, 100k iterations, keyed off `API_KEY_PEPPER`), decrypted
+in gunicorn RAM, and on the loopback wire at ④.
+
+**⚠️ Do NOT use `/link <api_key> <host_url>`.** That is the upstream flow, and it puts the key in a chat
+message — transiting Telegram's servers and persisting in **cloud** chat history (bot chats cannot be
+Secret Chats, so no E2E; Telegram holds the keys). The handler has no `delete_message`, so it stays there.
+Link **server-side** instead — `/link` merely ends by calling `create_or_update_telegram_user(...)`, so a
+direct call produces an identical row without the exposure. Replicate its validation: build a client, call
+`funds()`, and require `status == "success"` — do NOT require non-empty data, or a valid key gets rejected
+on a non-trading day.
+
+Why `/link` exists at all: `host_url` and `encrypted_api_key` are stored **per user**, i.e. the bot is
+written so different Telegram users could each point at their own OpenAlgo server. Our deployment is the
+degenerate case — bot and instance in the same process, one user, host always `127.0.0.1:5000` — so the
+step is redundant for us.
+
+### Access control — `TELEGRAM_ALLOWED_IDS` (added 2026-08-15)
+
+Upstream's only gate is *"is this telegram_id present in `telegram_users`?"* — **not** *"is it MINE?"*.
+There is no allowlist and no cap on linked users, so **anyone holding a valid OpenAlgo API key could
+`/link` their own Telegram account and drive this live account, including `/closeall`.** Access was
+possession-of-a-secret, not identity — and that key was readable via `systemctl show` (backlog 7c).
+
+`TELEGRAM_ALLOWED_IDS` (in `.env`, documented in `.sample.env`) pins the bot to specific numeric IDs.
+Implemented as a **single global `TypeHandler` at `group=-1`**, so it runs before every handler and covers
+all commands *and* inline-button callbacks from one place rather than 18 edits that could drift.
+Unauthorized senders are dropped **silently** — replying would confirm to a stranger that the bot is live —
+with a WARNING logged so attempts are visible. Parsing fails **OPEN** on unset/garbage input, so an `.env`
+typo cannot lock the owner out.
+
+**⚠️ `.env` is gitignored — `TELEGRAM_ALLOWED_IDS` must be re-set on any rebuild**, same class of
+server-only state as the `EVENTLET_NO_GREENDNS` drop-in. Verify after restart with:
+`grep -a "allowlist ACTIVE" log/openalgo_$(date +%F).log`
+
+### What this does and does not protect
+
+| Threat | Covered? |
+|---|---|
+| Someone steals the API key and links **their own** Telegram | ✅ refused by the allowlist |
+| Someone controls **your** Telegram account | ❌ same identity — rely on Telegram 2FA |
+| Someone uses the API key **directly** against the public API | ❌ different door — see backlog #11 |
+
+**Trade data does reach Telegram either way.** Replies — positions, P&L, funds, orderbook, holdings — transit
+and persist in Telegram cloud history. That is the deliberate exception recorded in the 04-Aug security audit;
+commands widen it beyond the alert/EOD-digest baseline. The *key* is what we keep off Telegram entirely.
 
 ---
 

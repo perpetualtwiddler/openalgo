@@ -42,6 +42,24 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+def _allowed_telegram_ids() -> set[int]:
+    """Telegram account ids permitted to drive this bot, from TELEGRAM_ALLOWED_IDS.
+
+    Comma/semicolon separated numeric ids, e.g. "8695581038". Empty or unset means no
+    allowlist is enforced (upstream behaviour) — deliberately fail-OPEN on absence so a
+    missing env var cannot lock the owner out; the enforcement value is in setting it.
+    Non-numeric entries are ignored rather than raising, so one typo cannot break startup
+    of the whole bot.
+    """
+    raw = os.getenv("TELEGRAM_ALLOWED_IDS", "").strip()
+    out: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out
+
+
 
 class TelegramBotService:
     """Service class for managing Telegram bot operations with OpenAlgo SDK integration"""
@@ -674,8 +692,10 @@ class TelegramBotService:
         from telegram import Update
         from telegram.ext import (
             Application,
+            ApplicationHandlerStop,
             CallbackQueryHandler,
             CommandHandler,
+            TypeHandler,
         )
 
         retry_count = 0
@@ -686,6 +706,40 @@ class TelegramBotService:
             try:
                 # Create application
                 self.application = Application.builder().token(self.bot_token).build()
+
+                # ── Global access gate ────────────────────────────────────────────────
+                # Registered at group=-1 so it runs BEFORE every other handler, covering
+                # commands AND inline-button callbacks from one place instead of 18 edits.
+                #
+                # Why this exists: without it the only check is "is this telegram_id present
+                # in telegram_users" — NOT "is it MY id". There is no allowlist and no cap on
+                # linked users, so anyone holding a valid OpenAlgo API key could /link their
+                # own Telegram account and drive this live trading account, including
+                # /closeall. Pinning to numeric ids makes the control IDENTITY rather than
+                # possession of a secret: Telegram supplies effective_user.id and a sender
+                # cannot spoof it.
+                #
+                # Unset/empty => allow any linked user (upstream behaviour), so a missing env
+                # var cannot silently lock the owner out of their own bot.
+                allowed_ids = _allowed_telegram_ids()
+                if allowed_ids:
+
+                    async def _access_gate(update, context):
+                        uid = update.effective_user.id if update.effective_user else None
+                        if uid not in allowed_ids:
+                            logger.warning(
+                                "Telegram access DENIED for id=%s — not in TELEGRAM_ALLOWED_IDS", uid
+                            )
+                            # Drop silently: replying would confirm the bot is live to a stranger.
+                            raise ApplicationHandlerStop
+
+                    self.application.add_handler(TypeHandler(Update, _access_gate), group=-1)
+                    logger.info("Telegram allowlist ACTIVE for ids: %s", sorted(allowed_ids))
+                else:
+                    logger.warning(
+                        "TELEGRAM_ALLOWED_IDS not set — ANY linked telegram user may issue "
+                        "commands. Set it to pin the bot to your own account id."
+                    )
 
                 # Add command handlers
                 self.application.add_handler(CommandHandler("start", self.cmd_start))
