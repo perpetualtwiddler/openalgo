@@ -75,6 +75,94 @@ class TelegramBotService:
         self.sdk_clients = {}  # Cache for OpenAlgo SDK clients per user
         self._stop_event = original_threading.Event()  # Thread-safe stop signal
 
+    async def cmd_stradexit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/stradexit <net INR> — arm a NET P&L exit trigger on the running straddle.
+
+        Positive arms the take-profit slot, negative arms the stop slot, 0 clears BOTH. The
+        two slots are independent: sending +2000 then -3000 leaves both armed, so the reply
+        always echoes the resulting state rather than just the value received.
+
+        Writes a day-stamped JSON file that the straddle subprocess re-reads on its 5s monitor
+        pass — the bot runs inside gunicorn and cannot reach that process's memory directly.
+        Thresholds are NET of Zerodha charges so they match the growth model and the journal.
+        """
+        import json as _json
+        from datetime import datetime as _dt
+        from pathlib import Path as _Path
+
+        from telegram.constants import ParseMode
+
+        user = update.effective_user
+        if not get_telegram_user(user.id):
+            await update.message.reply_text("❌ Please link your account first using /link")
+            return
+
+        if not context.args or len(context.args) != 1:
+            await update.message.reply_text(
+                "*Usage:* `/stradexit <net INR>`\n\n"
+                "`/stradexit 2000`  → exit when NET P&L reaches +₹2,000\n"
+                "`/stradexit -3000` → exit when NET P&L falls to −₹3,000\n"
+                "`/stradexit 0`     → cancel BOTH, back to breach / PT / SL / EOD\n\n"
+                "_Slots are independent — arm one side, the other, or both._\n"
+                "_Applies to today only. NET = after Zerodha charges._",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        raw = context.args[0].replace(",", "").replace("₹", "")
+        try:
+            val = float(raw)
+        except ValueError:
+            await update.message.reply_text(f"❌ `{context.args[0]}` is not a number.",
+                                            parse_mode=ParseMode.MARKDOWN)
+            return
+
+        path = _Path(os.getenv("STRADEXIT_FILE", "/root/data/openalgo/log/straddle_command.json"))
+        today = _dt.now().strftime("%Y-%m-%d")
+
+        # Preserve the other slot: read the existing payload, but only if it is still today's.
+        cur = {}
+        try:
+            if path.exists():
+                prev = _json.loads(path.read_text())
+                if prev.get("date") == today:
+                    cur = prev
+        except Exception:
+            cur = {}
+
+        if val == 0:
+            cur["target_net"] = None
+            cur["stop_net"] = None
+        elif val > 0:
+            cur["target_net"] = val
+        else:
+            cur["stop_net"] = val
+
+        cur.update({"date": today, "updated_at": _dt.now().isoformat(),
+                    "source": f"telegram:{user.id}"})
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_json.dumps(cur, indent=2))
+        except Exception as e:
+            logger.exception(f"/stradexit write failed: {e}")
+            await update.message.reply_text(f"❌ Could not write the command file: {e}")
+            return
+
+        t, s = cur.get("target_net"), cur.get("stop_net")
+        if t is None and s is None:
+            body = "⚪ *Straddle exit CANCELLED*\nBack to breach / PT / SL / EOD square-off only."
+        else:
+            lines = ["🎯 *Straddle exit armed*"]
+            lines.append(f"Take-profit: {'NET +₹%s' % format(t, ',.0f') if t else '— not set'}")
+            lines.append(f"Stop:        {'NET −₹%s' % format(abs(s), ',.0f') if s else '— not set'}")
+            lines.append("")
+            lines.append("_Checked every 5s against NET P&L (after charges)._")
+            lines.append(f"_Applies to {today} only._")
+            body = "\n".join(lines)
+
+        logger.info("/stradexit by %s -> target=%s stop=%s", user.id, t, s)
+        await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
+
     def _get_sdk_client(self, telegram_id: int) -> openalgo_api | None:
         """Get or create OpenAlgo SDK client for a user"""
         from openalgo import api as openalgo_api
@@ -758,6 +846,7 @@ class TelegramBotService:
                 self.application.add_handler(CommandHandler("closeall", self.cmd_closeall))
                 self.application.add_handler(CommandHandler("stoppython", self.cmd_stoppython))
                 self.application.add_handler(CommandHandler("mode", self.cmd_mode))
+                self.application.add_handler(CommandHandler("stradexit", self.cmd_stradexit))
                 self.application.add_handler(CommandHandler("menu", self.cmd_menu))
 
                 # Add callback query handler for inline buttons
@@ -975,6 +1064,7 @@ class TelegramBotService:
 /closeall - Close all open positions (with confirmation)
 /stoppython - Stop running Python strategies (with confirmation)
 /mode - View or toggle trading mode (Live / Analyze)
+/stradexit - Arm a NET P&L exit on the straddle (e.g. `/stradexit 2000`, `/stradexit -3000`, `/stradexit 0` to cancel)
 
 *Navigation:*
 /menu - Show interactive menu

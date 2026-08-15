@@ -190,6 +190,32 @@ SLIPPAGE_LOG = Path(os.getenv("SLIPPAGE_LOG", "/root/data/openalgo/log/slippage.
 # formula said 22,392 while the broker actually blocked 1,48,271.
 MARGIN_LOG = Path(os.getenv("MARGIN_LOG", "/root/data/openalgo/log/margin.csv"))
 
+# ---------------------------------------------------------------------------
+# /stradexit — manually armed NET P&L exit triggers, sent from Telegram
+# ---------------------------------------------------------------------------
+# The bot lives in the gunicorn process; this strategy is a separate subprocess, so the
+# command crosses a process boundary via a small JSON file that the monitor loop re-reads.
+# Chosen over a DB row or ZeroMQ because it needs no new dependency, survives an openalgo
+# restart mid-session (an armed target is not lost), and leaves an auditable artefact.
+#
+#   {"date": "2026-08-18", "target_net": 2000, "stop_net": -3000, "updated_at": "...",
+#    "source": "telegram:8695581038"}
+#
+# DAY-SCOPED BY DESIGN: a payload whose `date` is not today is ignored, so a forgotten
+# target cannot silently arm itself tomorrow. Extending to multi-day later means relaxing
+# this one check.
+#
+# Thresholds are NET (after Zerodha charges) so the number matches the growth model, which
+# is denominated in net returns. Gross would have read ~Rs250 higher on a 2-lot round trip.
+#
+# ⚠️ Evidence note (48-day sweep, 2026-08-15): applied as an ALWAYS-ON fixed number these
+# triggers LOSE money — a +750 target lifts the win rate 71%->87.5% while destroying 42% of
+# total profit (classic right-tail truncation), and tight loss caps cut positions that would
+# have recovered. Only a WIDE loss cap (~-4,000, fired once in 48 days) improved the total.
+# This is a discretionary tool for a day you have formed a view on, NOT a default rule.
+STRADEXIT_FILE = Path(os.getenv("STRADEXIT_FILE",
+                                "/root/data/openalgo/log/straddle_command.json"))
+
 
 # =============================================================================
 # BOT
@@ -218,6 +244,11 @@ class ShortStraddleBot:
         self.traded_expiry = None       # 'DD-MMM-YY' of the series we actually sold
         self.traded_dte = None          # calendar days from today to that expiry
         self.expiry_rolled = False      # True = expiry day, sold NEXT week's series instead
+        # /stradexit — manually armed NET thresholds (None = that side disarmed)
+        self.tg_target_net = None       # exit when net P&L >= this (profit side)
+        self.tg_stop_net = None         # exit when net P&L <= this (loss side)
+        self.tg_cmd_mtime = None        # mtime of the last command file we parsed
+        self.tg_armed_log = []          # every arm/disarm this session, for the journal
 
         # Hedge leg state (iron butterfly)
         self.hedge_ce_symbol = None
@@ -1098,6 +1129,114 @@ class ShortStraddleBot:
             return None
         return w * QUANTITY - self.total_premium
 
+    def _read_stradexit(self):
+        """Re-read the /stradexit command file; update armed thresholds if it changed.
+
+        Called every monitor pass, so it must be cheap and must NEVER raise — a malformed
+        file has to leave the existing exit rules untouched rather than kill the loop that
+        enforces PT/SL/breach. Re-parses only when mtime moves.
+
+        Day-scoped: a payload dated anything but today is ignored outright, so yesterday's
+        target cannot arm itself on a fresh session.
+        """
+        try:
+            if not STRADEXIT_FILE.exists():
+                if self.tg_target_net is not None or self.tg_stop_net is not None:
+                    log("[STRADEXIT] command file removed — disarming both sides")
+                    self.tg_target_net = self.tg_stop_net = None
+                # Clear the cache unconditionally: if the file is deleted and later recreated,
+                # a stale mtime here could make us skip parsing the new payload entirely.
+                self.tg_cmd_mtime = None
+                return
+            mtime = STRADEXIT_FILE.stat().st_mtime
+            if mtime == self.tg_cmd_mtime:
+                return                       # unchanged since last parse — nothing to do
+            self.tg_cmd_mtime = mtime
+            d = json.loads(STRADEXIT_FILE.read_text())
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            if d.get("date") != today:
+                if self.tg_target_net is not None or self.tg_stop_net is not None:
+                    log(f"[STRADEXIT] command is dated {d.get('date')} not {today} — disarming")
+                self.tg_target_net = self.tg_stop_net = None
+                return
+
+            def _num(v):
+                # 0 / absent / unparsable => that side disarmed
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    return None
+                return None if f == 0 else f
+
+            tgt, stp = _num(d.get("target_net")), _num(d.get("stop_net"))
+            # Sanity: a positive value on the stop side (or negative on the target side) is
+            # almost certainly a sign slip and would fire instantly. Refuse rather than obey.
+            if tgt is not None and tgt < 0:
+                log(f"[STRADEXIT] ignoring negative target_net {tgt:+.0f} (use stop_net)")
+                tgt = None
+            if stp is not None and stp > 0:
+                log(f"[STRADEXIT] ignoring positive stop_net {stp:+.0f} (use target_net)")
+                stp = None
+
+            if (tgt, stp) != (self.tg_target_net, self.tg_stop_net):
+                self.tg_target_net, self.tg_stop_net = tgt, stp
+                parts = []
+                if tgt is not None:
+                    parts.append(f"take-profit at NET +Rs{tgt:,.0f}")
+                if stp is not None:
+                    parts.append(f"stop at NET {stp:+,.0f}")
+                desc = " · ".join(parts) if parts else "DISARMED (both sides cleared)"
+                log(f"[STRADEXIT] {desc}  (source={d.get('source', '?')})")
+                self.tg_armed_log.append(
+                    {"at": datetime.now().strftime("%H:%M:%S"), "target": tgt, "stop": stp}
+                )
+                self._tg_notify(
+                    f"🎯 *Straddle exit armed* — {self._md(desc)}\n"
+                    f"Applies to {today} only. Send `/stradexit 0` to cancel."
+                    if parts else
+                    f"⚪ *Straddle exit DISARMED* — {self._md('back to breach / PT / SL / EOD only')}"
+                )
+        except Exception as e:
+            log(f"[STRADEXIT] could not read command file (non-fatal, rules unchanged): {e}")
+
+    def _stradexit_trigger(self, total_pnl):
+        """Has an armed /stradexit threshold been crossed? -> (reason, detail, charges) or None.
+
+        Extracted from the monitor loop so it can be unit-tested without a broker, and so the
+        charge estimate cannot be referenced out of the scope that computes it.
+
+        Thresholds are NET, converted with the SAME charge model the EOD digest and journal
+        use — otherwise "exit at +2000" would mean three different numbers in three places.
+        """
+        if self.exit_in_progress:
+            return None
+        if self.tg_target_net is None and self.tg_stop_net is None:
+            return None
+        exits = [
+            {"action": "BUY", "quantity": QUANTITY, "price": self.ce_ltp},
+            {"action": "BUY", "quantity": QUANTITY, "price": self.pe_ltp},
+        ]
+        if ENABLE_HEDGE:
+            exits += [
+                {"action": "SELL", "quantity": QUANTITY, "price": self.hedge_ce_ltp},
+                {"action": "SELL", "quantity": QUANTITY, "price": self.hedge_pe_ltp},
+            ]
+        chg_est = self._roundtrip_charges(exits)
+        # If charges cannot be computed, fall back to GROSS rather than skipping the check —
+        # an armed stop must never be silently disabled by a helper failure. Gross is the
+        # conservative side for a stop and merely the late side for a target; both beat no
+        # trigger at all.
+        chg_est = 0.0 if chg_est is None else chg_est
+        net_pnl = total_pnl - chg_est
+        if self.tg_target_net is not None and net_pnl >= self.tg_target_net:
+            return ("TG_TARGET",
+                    f"net {net_pnl:+,.0f} >= armed target {self.tg_target_net:+,.0f}", chg_est)
+        if self.tg_stop_net is not None and net_pnl <= self.tg_stop_net:
+            return ("TG_STOP",
+                    f"net {net_pnl:+,.0f} <= armed stop {self.tg_stop_net:+,.0f}", chg_est)
+        return None
+
     def _roundtrip_charges(self, exits):
         """Zerodha charges for the full 8-leg round trip, from actual entry+exit prices."""
         try:
@@ -1330,8 +1469,25 @@ class ShortStraddleBot:
                 end="",
             )
 
+            # ── /stradexit — manually armed NET thresholds, checked FIRST ────────────
+            # Deliberately ahead of PT/breach/SL: it is the tighter, hand-armed rule, and
+            # evaluating it first makes the exit reason unambiguous in log and journal.
+            self._read_stradexit()
+            tg = self._stradexit_trigger(total_pnl)
+
+            if tg and not self.exit_in_progress:
+                reason, detail, chg_est = tg
+                self.exit_in_progress = True
+                log(f"\n[STRADEXIT] {detail} — closing straddle "
+                    f"(gross {total_pnl:+,.0f}, charges ~{chg_est:,.0f})")
+                self._tg_notify(
+                    f"🎯 *Straddle exit TRIGGERED* — {self._md(detail)}\n"
+                    f"gross {total_pnl:+,.0f} · charges ~{chg_est:,.0f} · closing all legs now"
+                )
+                threading.Thread(target=self.close_straddle, args=(reason,), daemon=True).start()
+
             # Profit target hit
-            if pnl_pct >= PROFIT_TARGET_PCT and not self.exit_in_progress:
+            elif pnl_pct >= PROFIT_TARGET_PCT and not self.exit_in_progress:
                 self.exit_in_progress = True
                 log(f"\n[TARGET] Profit {pnl_pct:.1f}% >= {PROFIT_TARGET_PCT}% — closing straddle")
                 threading.Thread(target=self.close_straddle, args=("PROFIT_TARGET",), daemon=True).start()

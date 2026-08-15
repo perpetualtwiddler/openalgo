@@ -456,6 +456,77 @@ commands widen it beyond the alert/EOD-digest baseline. The *key* is what we kee
 
 ---
 
+### `/stradexit` — manually armed NET P&L exit (live 2026-08-15)
+
+Arm a take-profit and/or a stop on the running straddle from Telegram; the strategy exits all
+four legs the moment it crosses.
+
+```
+/stradexit 2000     arm take-profit at NET +₹2,000
+/stradexit -3000    arm stop at NET −₹3,000
+/stradexit 0        clear BOTH
+```
+
+The two slots are **independent** — `+2000` then `−3000` leaves both armed; re-arming one side
+leaves the other untouched. **NET**, not gross: thresholds are converted with the same
+`charges.py` model the EOD digest and journal use, so "exit at +2000" means the same number
+everywhere and matches the growth model, which is denominated in net.
+
+**Day-scoped by design.** The payload carries a date; anything not today is ignored, so a
+forgotten target cannot arm itself tomorrow. Extending to multi-day later is one check.
+
+**How it crosses the process boundary.** The bot runs inside gunicorn; the straddle is a
+separate subprocess. The command is a small JSON file (`log/straddle_command.json`) that the
+monitor loop re-reads on its existing 5s pass — chosen over a DB row or ZeroMQ because it needs
+no new dependency, survives an openalgo restart mid-session (an armed target is not lost), and
+leaves an auditable artefact. Re-parsed only when mtime moves.
+
+**Ordering.** Checked FIRST, ahead of PT / breach / SL, so it fires earliest and the exit reason
+is unambiguous (`TG_TARGET` / `TG_STOP`). All existing rules remain as backstops.
+
+**Armed before entry?** The monitor loop idles while unpositioned, so a target sent at 09:20 is
+picked up on the first pass after the 09:35 fill. You get the bot's ack immediately and the
+strategy's confirmation at entry.
+
+**Fails safe.** A malformed file leaves existing rules untouched; a wrong-signed value is refused
+rather than obeyed (a negative "target" would fire instantly); if charges cannot be computed the
+check falls back to gross rather than silently disarming an armed stop.
+
+Journal columns `tg_target_net`, `tg_stop_net`, `tg_armed_at`, `tg_fired` record every arming and
+whether it fired — blank on days nothing was armed, which is itself meaningful (no discretionary
+call made).
+
+#### ⚠️ Evidence: do NOT use this as a standing rule
+
+48-day sweep, modelling today's rules as the baseline (total **+34,106**, 34/48 wins, worst −5,972):
+
+| profit target | total net | vs base | wins | | loss cap | total net | vs base | worst |
+|---|---|---|---|---|---|---|---|---|
+| +750 | +19,840 | **−14,266** | 42/48 | | −1,000 | +15,111 | **−18,995** | −1,890 |
+| +1,500 | +24,067 | −10,038 | 36/48 | | −2,000 | +27,924 | −6,181 | −2,759 |
+| +2,000 | +30,420 | −3,685 | 35/48 | | −3,000 | +27,956 | −6,150 | −3,382 |
+| +2,500 | +34,176 | +71 | 35/48 | | **−4,000** | **+35,875** | **+1,769** | −4,203 |
+
+**Profit targets buy win rate and pay for it in money.** A +₹750 trigger lifts the win rate from
+71% to 87.5% while destroying 42% of total profit — textbook right-tail truncation, and the exact
+trap that *feels* better while making less. **Tight loss caps are worse than they look** — −₹1,000
+halves the worst day but costs ₹18,995 by cutting positions that would have recovered.
+
+**The one evidence-supported always-on setting is a WIDE loss cap** (~−4,000): fired once in 48
+days, improved the total, capped the worst day. Everything else belongs on discretion.
+
+This also sharpens the 14-Aug lesson: that exit worked because **85% of the gain was vega**, not
+because a number was hit. No fixed rupee threshold reproduces that judgement — which is precisely
+why blind application loses money. See "Hypothesis: composition-aware exit" above.
+
+*Caveat on the sweep: 1-minute bar closes (absolute levels optimistic, comparisons valid), 44 of
+48 days are pre-03-Aug old-session, and it tests always-on rules — NOT the discretionary arming
+this feature is built for. A re-read on a **geometric/compounded** basis is still owed: arithmetic
+totals ignore volatility drag and the sequence risk that the growth model's annual withdrawals
+introduce, both of which favour variance reduction.*
+
+---
+
 ## Investment Growth / Compounding Model (capital planning)
 
 **📄 Spreadsheet:** `log/straddle-income-growth-analysis.xlsx`

@@ -65,6 +65,7 @@ COLS = [
     "breach_lo", "breach_hi", "spot_exit", "breached",
     "entry_time", "exit_time", "exit_reason",
     "n_orders", "n_fills", "slip_entry", "slip_exit",
+    "tg_target_net", "tg_stop_net", "tg_armed_at", "tg_fired",
     "mfe", "mae",
     "gross_pnl", "charges", "net_pnl",
     "roi_on_margin_pct", "net_pct_of_premium",
@@ -270,6 +271,21 @@ def build(date):
     m = re.search(r"\[EXIT\] Closing iron butterfly — reason: ([A-Z_]+)", raw)
     if m:
         r["exit_reason"] = m.group(1)
+
+    # ---- /stradexit: what was armed from Telegram, and did it fire?
+    # Blank on days before the feature existed, and on days nothing was armed — that is
+    # meaningful (no discretionary call made), not missing data.
+    arms = re.findall(r"([\d:]{8})\s+\[STRADEXIT\] (take-profit at NET \+Rs[\d,]+|stop at NET "
+                      r"[-+][\d,]+|take-profit at NET \+Rs[\d,]+ · stop at NET [-+][\d,]+|DISARMED[^\n]*)", raw)
+    if arms:
+        r["tg_armed_at"] = arms[0][0]
+        last = arms[-1][1]
+        mt = re.search(r"take-profit at NET \+Rs([\d,]+)", last)
+        ms = re.search(r"stop at NET ([-+][\d,]+)", last)
+        r["tg_target_net"] = mt.group(1).replace(",", "") if mt else ""
+        r["tg_stop_net"] = ms.group(1).replace(",", "") if ms else ""
+    r["tg_fired"] = "Y" if re.search(r"\[STRADEXIT\] net [-+][\d,]+ [<>]= armed", raw) else (
+        "N" if arms else "")
     ts = re.findall(r"([\d:]{8})\s+\[EXIT\] \S+ closed", raw)
     if ts:
         r["exit_time"] = ts[-1]
