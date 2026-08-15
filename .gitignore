@@ -91,3 +91,7 @@ yarn-error.log*
 
 # Windows NUL file
 nul
+
+# /stradexit command channel — transient intra-day state (armed thresholds), rewritten
+# several times a session. The durable per-date record is trade_journal.csv.
+log/straddle_command.json
