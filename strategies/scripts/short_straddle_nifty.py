@@ -249,6 +249,7 @@ class ShortStraddleBot:
         self.tg_stop_net = None         # exit when net P&L <= this (loss side)
         self.tg_cmd_mtime = None        # mtime of the last command file we parsed
         self.tg_armed_log = []          # every arm/disarm this session, for the journal
+        self.margin_blocked = None      # broker-actual margin, snapshotted at entry
 
         # Hedge leg state (iron butterfly)
         self.hedge_ce_symbol = None
@@ -784,6 +785,11 @@ class ShortStraddleBot:
                     log(f"    → EXIT the fly if {UNDERLYING} < {_lo:.0f}  or  > {_hi:.0f}   (PT +{PROFIT_TARGET_PCT:.0f}% / SL -{STOPLOSS_PCT:.0f}% = backstops)")
                 log("=" * 65)
                 self.save_state()
+                # Snapshot the broker margin BEFORE alerting: _notify_entry reports it, and
+                # utiliseddebits is already updated by the time the fills confirm. (It used to
+                # run after the slippage block, so the entry alert had nothing to quote and
+                # fell back to the defined-risk figure under a "utilised margin" label.)
+                self._record_margin()
                 self._notify_entry()
                 # Slippage: snapshot the legs right AFTER the fills (we can't do it before —
                 # the API resolves ATM/OTM8 into symbols only when the order returns). Taken
@@ -799,7 +805,6 @@ class ShortStraddleBot:
                     (self.hedge_ce_symbol, "BUY", self.hedge_ce_price, _ref.get(self.hedge_ce_symbol), "post-fill-quote"),
                     (self.hedge_pe_symbol, "BUY", self.hedge_pe_price, _ref.get(self.hedge_pe_symbol), "post-fill-quote"),
                 ] if ENABLE_HEDGE else []))
-                self._record_margin()
                 return True
             else:
                 log_error("ENTRY fill prices not confirmed — flattening any live legs instead of monitoring with invalid P&L thresholds")
@@ -1072,8 +1077,9 @@ class ShortStraddleBot:
                     w.writerow(["date", "strategy", "margin_blocked", "premium", "qty"])
                 w.writerow([datetime.now().strftime("%Y-%m-%d"), STRATEGY_NAME,
                             f"{used:.2f}", f"{self.total_premium:.2f}", QUANTITY])
+            self.margin_blocked = used      # so the alerts can report the REAL figure
             log(f"[MARGIN] broker blocked ~Rs{used:,.0f} "
-                f"(vs defined max-loss Rs{self._utilised_margin() or 0:,.0f})")
+                f"(vs defined max-loss Rs{self._max_risk() or 0:,.0f})")
         except Exception as e:
             log(f"[MARGIN] snapshot skipped (non-fatal): {e}")
 
@@ -1121,13 +1127,29 @@ class ShortStraddleBot:
         except TypeError:
             return None
 
-    def _utilised_margin(self):
-        """Defined-risk margin for the fly = wing width x qty - net credit. Same basis as
-        eod_summary / the fill-alert block, so every report agrees."""
+    def _max_risk(self):
+        """Defined MAX LOSS of the fly = wing width x qty - net credit.
+
+        This is the worst case if the index runs past a wing — NOT the capital the broker
+        blocks. Was previously mislabelled "utilised margin" in both alerts, which understated
+        the capital employed by ~4.6x (2026-08-17: 36,023 defined vs 164,287 actually blocked)
+        and so overstated return-on-margin by the same factor. Exchange margin is SPAN+exposure,
+        and exposure is ~2% of the SHORT legs' notional — it does NOT shrink with the wings.
+        """
         w = self._wing_width()
         if not w or self.total_premium is None:
             return None
         return w * QUANTITY - self.total_premium
+
+    def _utilised_margin(self):
+        """Capital the broker ACTUALLY blocked, as snapshotted at entry by _record_margin.
+
+        Returns None until that snapshot has run, so callers must handle it — better a missing
+        line than a number that is wrong by 4.6x. Return-on-margin must be computed on THIS,
+        not on _max_risk(): the growth model consumes those percentages, and a 5x inflated
+        return would corrupt it (2026-08-14: +5.59% on defined risk vs the true +1.07%).
+        """
+        return self.margin_blocked
 
     def _read_stradexit(self):
         """Re-read the /stradexit command file; update armed thresholds if it changed.
@@ -1259,7 +1281,8 @@ class ShortStraddleBot:
     def _notify_entry(self):
         """Consolidated ENTRY alert — one message covering all legs."""
         try:
-            margin = self._utilised_margin()
+            margin = self._utilised_margin()      # broker-actual
+            max_risk = self._max_risk()               # defined worst case
             lines = [
                 f"🟢 *{self._md(STRATEGY_NAME)}* — POSITIONED",
                 f"{'Iron butterfly' if ENABLE_HEDGE else 'Short straddle'} · {UNDERLYING} · "
@@ -1279,7 +1302,9 @@ class ShortStraddleBot:
                              f"{self._md(_roll)}")
             lines.append(f"Premium collected: ₹{self.total_premium:,.0f}")
             if margin:
-                lines.append(f"Utilised margin: ~₹{margin:,.0f}")
+                lines.append(f"Margin blocked: ~₹{margin:,.0f}")
+            if max_risk:
+                lines.append(f"Max risk (defined): ₹{max_risk:,.0f}")
             if BREACH_PCT and self.atm_strike:
                 b = self.atm_strike * BREACH_PCT / 100
                 lines.append(
@@ -1308,7 +1333,8 @@ class ShortStraddleBot:
                 ]
             charges = self._roundtrip_charges(exits)
             net = total_pnl - charges if charges is not None else None
-            margin = self._utilised_margin()
+            margin = self._utilised_margin()      # broker-actual — the ROM denominator
+            max_risk = self._max_risk()               # defined worst case, reported separately
             emoji = "🔴" if total_pnl < 0 else "🟢"
             n_legs = 4 if ENABLE_HEDGE else 2
             lines = [
@@ -1319,7 +1345,9 @@ class ShortStraddleBot:
                 f"PE: sold ₹{self.pe_entry_price:,.2f} → bought ₹{pe_exit:,.2f}",
             ]
             if margin:
-                lines.append(f"Utilised margin: ~₹{margin:,.0f}")
+                lines.append(f"Margin blocked: ~₹{margin:,.0f}")
+            if max_risk:
+                lines.append(f"Max risk (defined): ₹{max_risk:,.0f}")
             lines.append(f"Gross: {'+' if total_pnl >= 0 else '−'}₹{abs(total_pnl):,.0f}")
             if charges is not None:
                 lines.append(f"Charges: −₹{charges:,.0f}  (Zerodha)")
