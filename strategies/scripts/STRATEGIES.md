@@ -385,6 +385,189 @@ Worst single day: 2026-06-25 (−7,008): entry at intraday top (BUY 58,670, MFE 
 
 ---
 
+## Trade Journal — `log/trade_journal.csv` field reference
+
+**The durable per-day record of live trading.** One row per trading day, 52 columns, written
+automatically by `openalgo-trade-journal.timer` at **15:22 IST** (archive tradebook → build row).
+Generator: `strategies/scripts/trade_journal.py`.
+
+- `--report` prints the human table · `--backfill` rebuilds every day · `--print <date>` dumps one row
+- **The server copy is authoritative** — the strategy, the timer and the capture all run there.
+  Pull it down with `strategies/scripts/sync_from_server.sh` (which also fetches `exit_timing.csv`,
+  `margin.csv`, `slippage.csv` and the `tradebook/` archives). Nothing syncs automatically:
+  a server cron cannot push into WSL, and a local timer would miss any day the laptop is off.
+  Found 2026-08-17 — the local copy had drifted to 5 rows/48 cols while the server had 6/52.
+
+Values in the examples below are the **real 2026-08-17 row**, so the caveats are concrete.
+
+### Identity & context
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 1 | `date` | trading date, `YYYY-MM-DD` | filename | IST |
+| 2 | `weekday` | `Mon`…`Fri` | derived | |
+| 3 | `series_code` | option series actually sold, e.g. `NIFTY18AUG26` | **traded symbols** | Authoritative. Not the log's "next expiry" line, which disagrees on an expiry-day roll |
+| 4 | `expiry` | `18-AUG-26` | derived from `series_code` | |
+| 5 | `dte` | calendar days to expiry **at entry** | derived from `series_code` | `1` on 08-17. Drives gamma/vega character — see the DTE note below |
+| 6 | `lots` | lots per leg | `[INIT]` log | `2` while live-constrained |
+| 7 | `qty` | contracts per leg = lots × 65 | `[INIT]` log | `130` |
+
+### Entry conditions (why we traded, and where)
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 8–10 | `orb_low` `orb_high` `orb_range` | 15-min opening range and its width | `[TREND]` log | The trend gate: entry is blocked on a >0.5% breakout |
+| 11 | `spot_entry` | NIFTY at the entry decision | `[ENTRY]` log | `24289.75` |
+| 12 | `atm_strike` | strike sold | entry symbols | `24300` |
+| 13 | `wing_width` | points from ATM to each wing | entry symbols | `400` (OTM8) |
+
+### Leg prices — all eight fills
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 14–17 | `ce_entry` `ce_exit` `pe_entry` `pe_exit` | the two SHORT legs | slippage.csv (entry) + `[EXIT]` log, or the **tradebook archive** | |
+| 18–21 | `hce_entry` `hce_exit` `hpe_entry` `hpe_exit` | the two LONG wings | same | |
+| 22 | `straddle_entry` | `ce_entry + pe_entry` | computed | `128.95` — the number to watch intraday; each point ≈ ₹130 at 2 lots |
+| 23 | `straddle_exit` | `ce_exit + pe_exit` | computed | `133.40` — rose, i.e. the shorts got *more* expensive |
+
+On a **manual Zerodha exit** no `[EXIT]` lines exist, so exit prices are recovered from
+`log/tradebook/<date>.json` — closing side inferred per leg (shorts close on BUY, wings on SELL),
+partial fills volume-weighted. That is what keeps 08-14 at `high` confidence.
+
+### Premium & capital — the two margin numbers are NOT interchangeable
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 24 | `gross_premium` | premium taken on the short legs | log | `16,764` |
+| 25 | `hedge_cost` | paid for both wings | log | `787` |
+| 26 | `premium_collected` | `gross_premium − hedge_cost` | log | `15,977` — the denominator for `net_pct_of_premium` |
+| 27 | `margin_blocked` | **capital the broker actually blocked**, snapshotted at entry | `margin.csv` (broker `utiliseddebits`) | `164,287.20`. Cannot be recovered later — by 15:31 the position is flat and it is back to 0 |
+| 28 | `max_risk_defined` | `wing_width × qty − premium` = worst case if the index runs past a wing | computed | `36,023` |
+
+**⚠️ These differ by ~4.6× and confusing them corrupts every return calculation.** Exchange margin
+is SPAN + exposure, and exposure is ~2% of the SHORT legs' notional — it does **not** shrink with
+the wings. `roi_on_margin_pct` therefore uses `margin_blocked`. The Telegram alerts got this wrong
+until commit `abee981c` (2026-08-17), labelling defined risk as "utilised margin" and inflating
+return-on-margin ~5× on winning days. **The journal was never affected.**
+
+### Risk band & outcome
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 29–30 | `breach_lo` `breach_hi` | `atm_strike ± 0.55%` — the directional stop | computed | `24,166 / 24,434` |
+| 31 | `spot_exit` | last NIFTY seen in the log | log samples | `24,333` |
+| 32 | `breached` | `Y`/`N` — did spot ever leave the band? | min/max of logged samples | `N`. From ~5s samples, so a brief intra-sample spike could be missed |
+
+### Execution quality
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 33–34 | `entry_time` `exit_time` | IST | log | `09:35:01` → `15:01:08` |
+| 35 | `exit_reason` | `EOD_SQUAREOFF` · `BREACH` · `PROFIT_TARGET` · `STOPLOSS` · `TG_TARGET` · `TG_STOP` · `MANUAL_ZERODHA` · `ENTRY_PARTIAL_FAILURE` | log | |
+| 36 | `n_orders` | **executed** orders — the brokerage basis | tradebook order ids | `8`. Zerodha bills ₹20 per ORDER |
+| 37 | `n_fills` | fills, which can exceed orders | tradebook rows | `8` today; **11 on 08-14** (three legs partial-filled 65+65) |
+| 38 | `slip_entry` | ₹ vs a **post-fill** quote | slippage.csv | `−13.0` (favourable). Reference is taken *after* the fill so it already contains our own market impact → treat as a **conservative lower bound** |
+| 39 | `slip_exit` | ₹ vs the **exact decision LTP** | slippage.csv | `+97.5`. This one is exact |
+
+`n_orders` vs `n_fills` is not cosmetic: billing fills instead of orders overstated charges by
+₹23.60 on 08-13 and ₹70.80 on 08-14.
+
+### `/stradexit` — the discretionary layer
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 40 | `tg_target_net` | **last** armed take-profit (NET ₹) | `[STRADEXIT]` log | `1200`. Intermediate values (08-17: 2,000 → 1,660 → 1,300 → 1,200) live only in the strategy log |
+| 41 | `tg_stop_net` | last armed stop (NET ₹) | same | blank = never armed |
+| 42 | `tg_armed_at` | **first** arm of the day | same | `11:15:44` |
+| 43 | `tg_fired` | `Y` fired · `N` armed but never hit · **blank = nothing armed** | same | `N`. Blank is meaningful — no discretionary call was made |
+
+### Intraday path
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 44 | `mfe` | max favourable excursion, **GROSS** | strategy's ~5s samples | `+1,268` |
+| 45 | `mae` | max adverse excursion, **GROSS** | same | `−2,899` |
+
+**⚠️ `mfe`/`mae` are gross and sample-based — do not compare them directly to `net_pnl`.** They come
+from the strategy's own mark-to-market loop, not from fills, so they carry no charges and no spread.
+Their value is showing what the day *offered*: 08-13 peaked at **+1,443** and closed **−416**, which
+is the single strongest argument for `/stradexit` existing at all.
+
+### P&L
+
+| # | Column | Meaning | Source | Notes |
+|---|---|---|---|---|
+| 46 | `gross_pnl` | realised P&L before charges | fills | `−734.50`. **Reconciles exactly to the broker's `m2mrealized`** — verified 08-13, 08-14, 08-17 |
+| 47 | `charges` | Zerodha round-trip | `charges.py`, per ORDER | `230.73`. Brokerage ₹20/order + STT 0.15% sell-side + txn 0.03553% + SEBI + stamp + 18% GST; STT and stamp round to the rupee |
+| 48 | `net_pnl` | `gross_pnl − charges` | computed | `−965.23` ← **the number that matters** |
+| 49 | `roi_on_margin_pct` | `net_pnl / margin_blocked × 100` | computed | `−0.588`. **The correct input for the growth model** |
+| 50 | `net_pct_of_premium` | `net_pnl / premium_collected × 100` | computed | `−6.04` |
+
+### Provenance — read this before trusting a row
+
+| # | Column | Meaning |
+|---|---|---|
+| 51 | `confidence` | `high` = every fill price recovered and gross reconciles to the broker · `medium` = gross from a broker reading taken that day, fills unrecoverable · `low` = reconstructed from a screen value, treat as an estimate |
+| 52 | `notes` | why a row is not `high`, and where its numbers came from |
+
+Currently **2 of 6 rows are not fill-verified**: `2026-08-06` (`low` — manual exit before
+`archive_tradebook.py` existed, so the tradebook had rolled) and `2026-08-07` (`medium` — kt-quotes
+outage killed both PE legs; the log's own "Total P&L −15,840" is a 0.00-entry-price artefact and
+must be ignored). Every day from 08-17 onward should be `high`, because the archiver now runs daily.
+
+### Reading the ledger — what the columns say together
+
+**DTE changes the whole character of a day.** Compare 08-14 (4 DTE) with 08-17 (1 DTE): premium fell
+22,626 → 15,977 because there is less time value to sell, while `max_risk_defined` *rose* 29,374 →
+36,023 (the wings stay 400 points out). Risk-to-premium went 1.30 → 2.25. At 1 DTE theta is fastest
+but gamma is vicious — 08-17 closed just **34 points** off the strike and still lost.
+
+**Charge drag is dominated by a fixed cost.** `charges` barely moves with premium (₹231 vs ₹250),
+because ₹160 of it is 8 × ₹20 brokerage regardless of size. So drag as a share of premium worsens on
+thin days: 0.99% (08-13) → 1.11% (08-14) → 1.44% (08-17). This is the strongest argument for
+eventually sizing up, and it is measured rather than assumed.
+
+**`mfe` vs `net_pnl` is the discretionary-exit scoreboard.** Where `mfe` is large and `net_pnl` small
+or negative, the day *offered* money we did not take.
+
+### Validating the data — `validate_journal.py`
+
+Analytics built on a wrong column produce confidently wrong conclusions, so every derivable
+field is re-derived from its INDEPENDENT source and compared:
+
+```
+python strategies/scripts/validate_journal.py            # all rows
+python strategies/scripts/validate_journal.py 2026-08-17 # one date
+```
+
+Run it **on the server** — the strategy logs live only there, so a local run cannot check
+`mfe`/`mae` and reports them as skipped. Result 2026-08-17: **105 passed · 1 mismatch · 9 skipped.**
+
+The one mismatch is benign and expected: `2026-08-06 premium = gross − hedge` reads 29,608 in the
+CSV against 29,607 recomputed. The strategy logs `Gross premium`, `Hedge cost` and
+`Net premium collected` each rounded **independently** from unrounded floats, so
+35,581 − 5,974 = 29,607 while the true subtraction rounds to 29,608. Both are individually
+correct; a **₹1 rounding artefact**, not a data error.
+
+Skips are honest rather than passes: no tradebook archive before 2026-08-14 (the archiver did not
+exist), no monitor samples on 2026-08-07 (position closed in 3 seconds), and rotated logs on
+2026-08-06/07. An unverifiable field must never look verified.
+
+### ⚠️ Strategy logs rotate — the journal becomes the sole record
+
+Only ~6 straddle logs survive at any time (verified 2026-08-17: 08-10 onward; 08-06 and 08-07 were
+already gone). So for older days the journal is the **only** surviving source, and its log-derived
+fields (`mfe`, `mae`, `orb_*`, `spot_exit`, `entry_time`, the `tg_*` set) can no longer be
+re-derived or re-validated. This is a durability fact, not a bug — and it is exactly why
+`archive_tradebook.py` exists for the fill-level data.
+
+`--backfill` is safe against this: `upsert()` reads the existing CSV and merges, so a day whose log
+has aged out is **preserved, not dropped**. Verified empirically — a full backfill leaves all rows
+present and 08-06/08-07 byte-identical. (Do not confuse this with `exit_timing_eval.py`, whose
+`append_rows(..., rebuild=True)` genuinely does rewrite from scratch.)
+
+---
+
 ## Telegram Control Channel (TradeBhau)
 
 **Bot:** `@TradeBhau_bot` · **Linked account:** Mandar, telegram_id `8695581038` (from @userinfobot)
