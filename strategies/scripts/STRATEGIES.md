@@ -392,6 +392,12 @@ automatically by `openalgo-trade-journal.timer` at **15:22 IST** (archive tradeb
 Generator: `strategies/scripts/trade_journal.py`.
 
 - `--report` prints the human table · `--backfill` rebuilds every day · `--print <date>` dumps one row
+- **`--stats`** is the post-market read-out (standing daily task, agreed 2026-08-17 — deliberately
+  NOT scheduled; it is shared conversationally after market hours). It prints average margin
+  blocked, total net, period and mean daily return on margin, best/worst day, win rate and charge
+  drag — and pairs them with the **t-statistic, 95% bands and profit concentration**, because a few
+  days of a short-vol strategy can look like edge purely from a short tail. A mean under ~2 standard
+  errors from zero has not been measured, however good it looks.
 - **The server copy is authoritative** — the strategy, the timer and the capture all run there.
   Pull it down with `strategies/scripts/sync_from_server.sh` (which also fetches `exit_timing.csv`,
   `margin.csv`, `slippage.csv` and the `tradebook/` archives). Nothing syncs automatically:

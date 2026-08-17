@@ -27,6 +27,7 @@ Usage:
     python trade_journal.py --backfill         # rebuild all known live days
     python trade_journal.py --print 2026-08-13 # one row to stdout, no write
     python trade_journal.py --report           # human-readable summary + totals
+    python trade_journal.py --stats            # post-market performance read-out
 
 Env:
     TRADE_JOURNAL_CSV   output path (default <repo>/log/trade_journal.csv)
@@ -409,7 +410,61 @@ def report():
         print(f"  NOTE: {len(lows)} row(s) not fill-verified: {', '.join(lows)}")
 
 
+def stats():
+    """Post-market performance read-out — the daily summary Mandar asked for (2026-08-17).
+
+    Deliberately prints the headline return TOGETHER WITH its own uncertainty. A few days of a
+    short-vol strategy can look like edge purely from a short tail, so the t-statistic and the
+    profit-concentration line sit right next to the return rather than being buried: a mean
+    under ~2 standard errors from zero has not been measured yet, however pleasant it looks.
+
+    Return is on margin_blocked (broker-actual), never max_risk_defined — they differ ~4.6x.
+    """
+    import statistics as st
+
+    rows = _rd(OUT_CSV)
+    if not rows:
+        print("  no journal yet")
+        return
+    nets = [float(r["net_pnl"] or 0) for r in rows]
+    mgs = [float(r["margin_blocked"]) for r in rows if float(r["margin_blocked"] or 0)]
+    roms = [100 * float(r["net_pnl"] or 0) / float(r["margin_blocked"])
+            for r in rows if float(r["margin_blocked"] or 0)]
+    if not mgs:
+        print("  no margin figures yet")
+        return
+    tot, avg = sum(nets), st.mean(mgs)
+    print(f"  === STRADDLE LIVE PERFORMANCE — {len(rows)} traded days, through {rows[-1]['date']} ===\n")
+    print(f"  average margin blocked, per traded day : Rs{avg:,.2f}   "
+          f"(range Rs{min(mgs):,.0f} - Rs{max(mgs):,.0f})")
+    print(f"  total net over the live era            : Rs{tot:+,.2f}")
+    print(f"  period return on avg margin           : {100 * tot / avg:+.2f}%  over {len(rows)} traded days")
+    print(f"  mean DAILY return on margin           : {st.mean(roms):+.3f}%   (median {st.median(roms):+.3f}%)")
+    print(f"  best day {max(roms):+.3f}%  ·  worst day {min(roms):+.3f}%")
+    tgr = sum(float(r["gross_pnl"] or 0) for r in rows)
+    tc = sum(float(r["charges"] or 0) for r in rows)
+    print(f"  win rate {sum(1 for n in nets if n > 0)}/{len(nets)}  ·  charges Rs{tc:,.2f}"
+          + (f" ({100 * tc / tgr:.1f}% of gross)" if tgr > 0 else ""))
+    if len(roms) >= 2:
+        sd = st.stdev(roms); se = sd / len(roms) ** 0.5
+        t = st.mean(roms) / se if se else 0.0
+        print(f"\n  --- is it measured yet? ---")
+        print(f"  stdev {sd:.3f}%  std-error {se:.3f}%  t = {t:.2f}  "
+              f"({'NOT yet distinguishable from zero' if abs(t) < 2 else 'clears the usual t~2 bar'})")
+        print(f"  95% band, daily   : {st.mean(roms) - 2 * se:+.3f}%  to  {st.mean(roms) + 2 * se:+.3f}%")
+        print(f"  95% band, monthly : {(st.mean(roms) - 2 * se) * 20:+.1f}%  to  "
+              f"{(st.mean(roms) + 2 * se) * 20:+.1f}%   (x20 trading days)")
+    if len(nets) > 2 and tot:
+        top2 = sorted(nets)[-2:]
+        print(f"  profit concentration: top 2 days = Rs{sum(top2):+,.0f} of Rs{tot:+,.0f} "
+              f"({100 * sum(top2) / tot:.0f}%) · without them Rs{tot - sum(top2):+,.0f}")
+    print(f"\n  naive monthly run-rate: {100 * tot / avg / len(rows) * 20:+.2f}% — the growth model's "
+          f"scenarios start at 4.25%. Arithmetic, not a forecast.")
+
+
 def main(argv):
+    if "--stats" in argv:
+        return stats()
     if "--report" in argv:
         return report()
     if "--backfill" in argv:
