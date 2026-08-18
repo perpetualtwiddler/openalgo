@@ -1222,19 +1222,8 @@ class ShortStraddleBot:
         except Exception as e:
             log(f"[STRADEXIT] could not read command file (non-fatal, rules unchanged): {e}")
 
-    def _stradexit_trigger(self, total_pnl):
-        """Has an armed /stradexit threshold been crossed? -> (reason, detail, charges) or None.
-
-        Extracted from the monitor loop so it can be unit-tested without a broker, and so the
-        charge estimate cannot be referenced out of the scope that computes it.
-
-        Thresholds are NET, converted with the SAME charge model the EOD digest and journal
-        use — otherwise "exit at +2000" would mean three different numbers in three places.
-        """
-        if self.exit_in_progress:
-            return None
-        if self.tg_target_net is None and self.tg_stop_net is None:
-            return None
+    def _exit_legs_at_ltp(self):
+        """The four closing fills priced at current LTPs — the basis for a live charge estimate."""
         exits = [
             {"action": "BUY", "quantity": QUANTITY, "price": self.ce_ltp},
             {"action": "BUY", "quantity": QUANTITY, "price": self.pe_ltp},
@@ -1244,13 +1233,31 @@ class ShortStraddleBot:
                 {"action": "SELL", "quantity": QUANTITY, "price": self.hedge_ce_ltp},
                 {"action": "SELL", "quantity": QUANTITY, "price": self.hedge_pe_ltp},
             ]
-        chg_est = self._roundtrip_charges(exits)
-        # If charges cannot be computed, fall back to GROSS rather than skipping the check —
-        # an armed stop must never be silently disabled by a helper failure. Gross is the
-        # conservative side for a stop and merely the late side for a target; both beat no
-        # trigger at all.
+        return exits
+
+    def _stradexit_trigger(self, total_pnl, net_pnl=None, chg_est=None):
+        """Has an armed /stradexit threshold been crossed? -> (reason, detail, charges) or None.
+
+        `net_pnl` and `chg_est` are passed in by the monitor loop, which already computed them
+        for the heartbeat — so the number displayed and the number that fires are the SAME
+        value and cannot diverge. They are optional so the method stays unit-testable standalone.
+
+        Thresholds are NET, converted with the SAME charge model the EOD digest and journal
+        use — otherwise "exit at +2000" would mean three different numbers in three places.
+        """
+        if self.exit_in_progress:
+            return None
+        if self.tg_target_net is None and self.tg_stop_net is None:
+            return None
+        if net_pnl is None:
+            chg_est = self._roundtrip_charges(self._exit_legs_at_ltp())
+            # If charges cannot be computed, fall back to GROSS rather than skipping the check —
+            # an armed stop must never be silently disabled by a helper failure. Gross is the
+            # conservative side for a stop and merely the late side for a target; both beat no
+            # trigger at all.
+            chg_est = 0.0 if chg_est is None else chg_est
+            net_pnl = total_pnl - chg_est
         chg_est = 0.0 if chg_est is None else chg_est
-        net_pnl = total_pnl - chg_est
         if self.tg_target_net is not None and net_pnl >= self.tg_target_net:
             return ("TG_TARGET",
                     f"net {net_pnl:+,.0f} >= armed target {self.tg_target_net:+,.0f}", chg_est)
@@ -1470,6 +1477,19 @@ class ShortStraddleBot:
             pnl_pct = (total_pnl / self.total_premium * 100) if self.total_premium > 0 else 0
             sign = "+" if total_pnl > 0 else ""
 
+            # Net = gross MINUS the Zerodha round-trip. Computed ONCE here and reused for both
+            # the heartbeat and the /stradexit trigger, so the number on screen is exactly the
+            # number that fires — they cannot drift apart.
+            #
+            # Why this matters: until 2026-08-18 the heartbeat printed gross under the label
+            # "Net P&L", while /stradexit compares against NET. On 18-Aug gross touched +1,248
+            # at 15:00:52 against an armed +1,000 target and correctly did NOT fire, because
+            # net was +965 — Rs35 short. The log looked like a missed trigger; it wasn't. The
+            # label was the bug.
+            _chg_now = self._roundtrip_charges(self._exit_legs_at_ltp())
+            net_pnl = total_pnl - (_chg_now if _chg_now is not None else 0.0)
+            net_sign = "+" if net_pnl > 0 else ""
+
             # Short-strike breach — cut if the underlying moved beyond the band (directional-move stop).
             # Computed BEFORE the heartbeat so the line can show live spot vs breach levels.
             breach_spot, breached = 0.0, False
@@ -1491,7 +1511,8 @@ class ShortStraddleBot:
             log(
                 f"\r[{now.strftime('%H:%M:%S')}] "
                 f"CE: {self.ce_ltp:.2f} | PE: {self.pe_ltp:.2f} | "
-                f"Net P&L: {sign}{total_pnl:.0f} ({sign}{pnl_pct:.1f}%)"
+                f"Gross P&L: {sign}{total_pnl:.0f} ({sign}{pnl_pct:.1f}%)"
+                f" | net {net_sign}{net_pnl:.0f}"
                 f"{f' [short:{short_pnl:+.0f} hedge:{hedge_pnl:+.0f}]' if ENABLE_HEDGE else ''}"
                 f"{breach_str}    ",
                 end="",
@@ -1501,7 +1522,7 @@ class ShortStraddleBot:
             # Deliberately ahead of PT/breach/SL: it is the tighter, hand-armed rule, and
             # evaluating it first makes the exit reason unambiguous in log and journal.
             self._read_stradexit()
-            tg = self._stradexit_trigger(total_pnl)
+            tg = self._stradexit_trigger(total_pnl, net_pnl, _chg_now)
 
             if tg and not self.exit_in_progress:
                 reason, detail, chg_est = tg

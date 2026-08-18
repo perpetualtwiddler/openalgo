@@ -117,6 +117,43 @@ def _rd(path):
 TRADEBOOK_DIR = os.path.join(REPO_ROOT, "log", "tradebook")
 
 
+def _legs_from_tradebook(date, short_syms):
+    """Volume-weighted entry AND exit prices per leg from the archived broker tradebook.
+
+    PREFERRED over log-parsed prices whenever an archive exists. The strategy log records ONE
+    price per leg, but a leg can fill in several tranches at DIFFERENT prices — on 2026-08-18
+    the 24250 PE bought back as 65 @ 127.35 + 65 @ 127.40 (VWAP 127.375) while the log said
+    127.35, understating charges-inclusive gross by Rs3.25. The broker fills are the truth.
+
+    Opening side is inferred from the leg's role: ATM shorts open on SELL and close on BUY;
+    the wings open on BUY and close on SELL.
+
+    Returns (entry_prices, exit_prices, n_orders, n_fills) — empty dicts if no archive.
+    """
+    p = os.path.join(TRADEBOOK_DIR, f"{date}.json")
+    if not os.path.exists(p):
+        return {}, {}, 0, 0
+    tb = json.load(open(p)).get("trades") or []
+    if not tb:
+        return {}, {}, 0, 0
+    acc = {}
+    oids = set()
+    for t in tb:
+        sym = t.get("symbol") or ""
+        act = (t.get("action") or "").upper()
+        qty = abs(int(float(t.get("quantity") or 0)))
+        px = float(t.get("average_price") or t.get("price") or 0)
+        if t.get("orderid"):
+            oids.add(str(t["orderid"]))
+        opening = (act == "SELL") if sym in short_syms else (act == "BUY")
+        d = acc.setdefault((sym, "in" if opening else "out"), [0, 0.0])
+        d[0] += qty
+        d[1] += qty * px
+    ent = {s: round(v / q, 3) for (s, side), (q, v) in acc.items() if side == "in" and q}
+    ex = {s: round(v / q, 3) for (s, side), (q, v) in acc.items() if side == "out" and q}
+    return ent, ex, len(oids), len(tb)
+
+
 def _exit_from_tradebook(date, short_syms):
     """Exit prices from an archived broker tradebook, for days our log never recorded them.
 
@@ -262,8 +299,13 @@ def build(date):
     # ---- fills: entry from slippage.csv (records real fill_price), exit from log
     slip = [s for s in _rd(SLIPPAGE_CSV) if s["date"] == date]
     ent = {s["symbol"]: float(s["fill_price"]) for s in slip if s["phase"] == "ENTRY"}
-    r["slip_entry"] = round(sum(float(s["slip_rupees"]) for s in slip if s["phase"] == "ENTRY"), 2) or ""
-    r["slip_exit"] = round(sum(float(s["slip_rupees"]) for s in slip if s["phase"] == "EXIT"), 2) or ""
+    # `or ""` would turn a genuinely ZERO slippage into a blank, and blank means "unknown"
+    # in this CSV, not "zero". 2026-08-18 filled with exactly Rs0 entry slippage — that is a
+    # result worth recording, not a gap. Only write blank when there are no rows at all.
+    _se = [s for s in slip if s["phase"] == "ENTRY"]
+    _sx = [s for s in slip if s["phase"] == "EXIT"]
+    r["slip_entry"] = round(sum(float(s["slip_rupees"]) for s in _se), 2) if _se else ""
+    r["slip_exit"] = round(sum(float(s["slip_rupees"]) for s in _sx), 2) if _sx else ""
 
     ex = {}
     for lbl, sym, px in re.findall(
@@ -303,19 +345,25 @@ def build(date):
     pairs = [("ce", leg("atm", "CE")), ("pe", leg("atm", "PE")),
              ("hce", leg("wing", "CE")), ("hpe", leg("wing", "PE"))]
 
-    # No [EXIT] lines in the log => closed outside our code (manual Zerodha exit). Fall back
-    # to the archived broker tradebook, which carries the real fills. Keeps such a day at
-    # `high` confidence instead of the guesswork that left 2026-08-06 at `low`.
+    # PREFER the archived broker tradebook for leg prices: it is volume-weighted across
+    # partial fills, whereas the log records a single price per leg. Only fall back to the
+    # log/slippage values when no archive exists (days before archive_tradebook.py).
     tb_orders = tb_fills = 0
-    if not ex:
-        shorts = {s for k, s in pairs[:2] if s}
-        tb_ex, tb_orders, tb_fills = _exit_from_tradebook(date, shorts)
-        if tb_ex:
-            ex = tb_ex
+    shorts = {s for k, s in pairs[:2] if s}
+    tb_ent, tb_ex, tb_orders, tb_fills = _legs_from_tradebook(date, shorts)
+    if tb_ex:
+        manual = not ex                       # no [EXIT] lines => closed outside our code
+        if tb_ent:
+            ent = {**ent, **tb_ent}
+        ex = {**ex, **tb_ex}
+        if manual:
             r["exit_reason"] = r["exit_reason"] or "MANUAL_ZERODHA"
             r["notes"] = ("exit fills recovered from the archived broker tradebook "
                           "(no [EXIT] lines — closed manually); "
                           f"{tb_orders} orders / {tb_fills} fills")
+        elif tb_fills != tb_orders:
+            r["notes"] = (f"leg prices volume-weighted from the tradebook "
+                          f"({tb_fills} fills / {tb_orders} orders — a leg partial-filled)")
     for key, sym in pairs:
         if sym:
             r[f"{key}_entry"] = ent.get(sym, "")
@@ -329,7 +377,10 @@ def build(date):
     spots = re.findall(r"NIFTY (\d{5})(?:\s|$)", raw)
     if spots:
         r["spot_exit"] = int(spots[-1])
-    pnls = [int(x) for x in re.findall(r"Net P&L: ([-+]?\d+)", raw)]
+    # Accept BOTH labels: the heartbeat was relabelled "Gross P&L" on 2026-08-18
+    # (it always WAS gross; the old "Net P&L" label caused a misread of a
+    # /stradexit near-miss), but logs written before that still say "Net P&L".
+    pnls = [int(x) for x in re.findall(r"(?:Gross|Net) P&L: ([-+]?\d+)", raw)]
     if pnls:
         r["mfe"], r["mae"] = max(pnls), min(pnls)
     if r["breach_lo"] and r["spot_exit"]:

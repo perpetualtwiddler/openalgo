@@ -180,7 +180,7 @@ for i in range(start_pos, len(ce_data)):
     # Print at key moments: every 30 min, or at extremes
     if time_str.endswith(":00") or time_str.endswith(":30") or time_str == ENTRY_TIME:
         sign = "+" if total_pnl >= 0 else ""
-        print(f"    {time_str} | CE:{ce_now:.2f} PE:{pe_now:.2f} | Net P&L: {sign}{total_pnl:,.0f} ({sign}{pnl_pct:.1f}%)")
+        print(f"    {time_str} | CE:{ce_now:.2f} PE:{pe_now:.2f} | Gross P&L: {sign}{total_pnl:,.0f} ({sign}{pnl_pct:.1f}%)")
 
     # Check profit target
     if pnl_pct >= PROFIT_TARGET_PCT and exit_reason is None:

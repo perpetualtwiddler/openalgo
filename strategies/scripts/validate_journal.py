@@ -210,7 +210,7 @@ def main(argv):
 
         # ---- path vs the strategy's own samples
         raw = log_text(d)
-        pn = [int(x) for x in re.findall(r"Net P&L: ([-+]?\d+)", raw)] if raw else []
+        pn = [int(x) for x in re.findall(r"(?:Gross|Net) P&L: ([-+]?\d+)", raw)] if raw else []
         if pn:
             R.check(d, "mfe vs log samples", num(r["mfe"]), max(pn))
             R.check(d, "mae vs log samples", num(r["mae"]), min(pn))
