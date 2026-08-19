@@ -89,6 +89,20 @@ a P&L threshold cannot distinguish a gain built on theta from one built on rente
 hold-to-close outcome. Until then it is one good call, not an edge. Risk of acting early is
 classic overfitting to a vivid single day.
 
+### 🔒 Where the trade data lives — a separate LOCAL-ONLY repo (set up 2026-08-19)
+
+**`mkds-openalgo` is a PUBLIC fork of `marketcalls/openalgo`** (verified 2026-08-19: `isPrivate:false`). The branch name `mock/strategies` reads private; the repository is not. So the live trading record is version-controlled **outside** this repo, at `../trading-ledger` — a git repo with **no remote, by design**. `ledger_snapshot.sh` refuses to run if a remote ever appears, because the point is that this data has no publication path.
+
+What is in it, and why: `trade_journal.csv` · `exit_timing.csv` · `margin.csv` · `slippage.csv` · `trade_analytics.xlsx` · `opening_cash.txt` · `tradebook/*.json` · `strategies/*straddle*.log`.
+
+**Two of those are irreplaceable, and one is on a clock:**
+- `tradebook/*.json` — the broker tradebook API is **current-day only**. A day not archived on its own trading date is gone. (This is why 2026-08-06 is permanently `low` confidence.)
+- `strategies/*straddle*.log` — **rotate off the server after ~7–10 days**, and are the only source for `mfe`/`mae` and the `[ENTRY] NIFTY spot` line. When the ledger was first created the oldest surviving log was **08-10**: the 08-06 and 08-07 logs had already aged out and are permanently lost. Do not let this go long between snapshots.
+
+Everything else is derivable from those two given the scripts here. Refresh with `sync_from_server.sh` (server → `openalgo/log`) then `ledger_snapshot.sh` (→ ledger, and commit). Monthly is fine for the CSVs; the rotating logs are the reason not to stretch it much further.
+
+**What stays out of this (public) repo:** `log/*.csv` is gitignored repo-wide, and `trade_analytics.xlsx` is deliberately never added — its Data sheet carries 53 columns of per-leg fills, broker margins and slippage, and its Projection corpus formula embeds the account's opening balance. `opening_cash.txt` is gitignored here for the same reason. Per-day *net* P&L already appears throughout this document, which is a pre-existing exposure Mandar is aware of. The ledger is history on one disk, **not** a backup — an off-box copy is still an open decision.
+
 ### Security audit 2026-08-04 — does OpenAlgo leak our trade/strategy data?
 
 Asked before trusting the platform with real money. **Finding: no evidence of any data going anywhere except Zerodha (broker) and Telegram (our own TradeBhau bot, which we configured).**
