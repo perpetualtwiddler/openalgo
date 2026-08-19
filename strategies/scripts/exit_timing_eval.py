@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """exit_timing_eval.py — was exiting early right? Measure it daily instead of assuming.
 
-We moved the straddle's square-off 15:14 -> 15:01 on 2026-08-10 after NSE shortened the
+We moved the straddle's square-off 15:14 -> 15:01 on 2026-08-10, then 15:01 -> 15:00 on
+2026-08-19, after NSE shortened the
 session (regular stock/F&O trading now ends 15:15, was 15:30). The safety case is clear-cut,
 but the P&L case is not: the earlier exit forfeits some theta while dodging the closing
 turbulence. So each day we replay the SAME position out to several candidate exit times off
@@ -12,7 +13,7 @@ the scramble sat in 15:15-15:30. With a 15:15 close that turbulence shifts ~15 m
 so the old timing conclusions do not transfer. This rebuilds the evidence on the NEW session.
 
 Entry is always 09:35 (the strategy's entry) at the 1m bar close, and each row is one day:
-    date, atm, premium, net@15:01, net@15:05, net@15:10, net@15:14, best_time, best_net
+    date, atm, premium, net@15:00, net@15:01, net@15:05, net@15:10, net@15:14, best_time, best_net
 Bar closes are NOT real fills, so absolute levels run optimistic (no spread crossed) — the
 numbers are for COMPARING exit times on the same day, not for reconciling to broker P&L.
 
@@ -40,7 +41,10 @@ OUT_CSV = os.getenv("EXIT_TIMING_CSV", os.path.join(REPO_ROOT, "log", "exit_timi
 
 QTY = int(os.getenv("QUANTITY_EVAL", "130"))      # live size
 ENTRY_HHMM = "09:35"
-CANDIDATES = ["15:01", "15:05", "15:10", "15:14"]
+# CANDIDATES[0] is the LIVE square-off — the report and chosen_vs_best both key off it.
+# 15:01 stays in the list on purpose: nine days were traded at 15:01 before the 2026-08-19
+# move to 15:00, and keeping the column lets us measure the change instead of assuming it.
+CANDIDATES = ["15:00", "15:01", "15:05", "15:10", "15:14"]
 HEDGE_PTS = 400
 COLS = ["date", "atm", "premium"] + [f"net_{t.replace(':', '')}" for t in CANDIDATES] + \
        ["best_time", "best_net", "chosen_vs_best"]

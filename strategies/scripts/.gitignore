@@ -24,6 +24,21 @@
 !ema_crossover_banknifty_opt4_20260618.py
 !backtest_ema_dev.py
 
+# EOD / analysis tooling. These were previously force-added one at a time, which left this
+# allowlist lying about what is tracked -- `git status` showed nothing for a modified tool and
+# a new one needed `add -f` to be noticed at all. Listed properly so the ignore file matches
+# reality. NOTE: only CODE is tracked. Live trading artefacts stay out of git -- log/*.csv is
+# ignored repo-wide and log/trade_analytics.xlsx embeds per-day fills and P&L, and the
+# mkds-openalgo remote is a PUBLIC fork of marketcalls/openalgo.
+!archive_tradebook.py
+!eod_summary.py
+!exit_timing_eval.py
+!growth_model_xlsx.py
+!trade_journal.py
+!validate_journal.py
+!status_check.py
+!trade_analytics_xlsx.py
+
 # Keep docs
 !STRATEGIES.md
 

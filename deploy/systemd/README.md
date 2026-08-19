@@ -32,7 +32,7 @@ and have `capture_trade_data.py` read the key from the DB via
 | Time | Unit | What it does |
 |---|---|---|
 | 09:05 | `openalgo-restart` | Pre-market restart. **This is what loads new strategy code.** Deliberately before the ~09:15 broker login so the WS adapter comes up authenticated. |
-| 09:15 | *(APScheduler, not systemd)* | Strategy subprocesses spawn; straddle enters 09:35, exits 15:01. |
+| 09:15 | *(APScheduler, not systemd)* | Strategy subprocesses spawn; straddle enters 09:35, exits 15:00. |
 | 15:22 | `openalgo-trade-journal` | **archive_tradebook.py, then trade_journal.py.** |
 | 15:31 | `openalgo-eod-summary` | TradeBhau per-strategy P&L digest → Telegram. |
 | 15:35 | `openalgo-capture-trade-data` | Archives the day's option chains / index / VIX. |

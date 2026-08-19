@@ -19,6 +19,7 @@ Run via OpenAlgo /python strategy runner:
 """
 
 import json
+import math
 import os
 import threading
 import time
@@ -120,8 +121,14 @@ CONSECUTIVE_SL_LIMIT = int(os.getenv("CONSECUTIVE_SL_LIMIT", "2"))
 # ~15:00 would have netted ~Rs260 MORE than 15:14. Note the earlier 55-day tail study that
 # favoured 15:05 was fitted to the OLD 15:30-close session, so its timing no longer transfers —
 # the closing turbulence has shifted ~15 min earlier.
+# THEN 15:01 -> 15:00 on 2026-08-19: the extra minute buys no theta worth measuring but sits one
+# minute deeper into the most volatile window of the session, and a round 15:00 removes a whole
+# class of hour-boundary bugs from minute arithmetic (see _squareoff_at below, which also fixes
+# a pre-existing one: the 2-minute warning window never covered 14:59).
+# exit_timing_eval.py keeps 15:01 as a candidate so the
+# nine days already traded at 15:01 stay comparable and the change can be measured, not assumed.
 SQUAREOFF_HOUR = int(os.getenv("SQUAREOFF_HOUR", "15"))
-SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "1"))
+SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "0"))
 
 # P&L check interval (seconds)
 PNL_CHECK_INTERVAL = int(os.getenv("PNL_CHECK_INTERVAL", "5"))
@@ -161,6 +168,22 @@ _PERMANENT_PAT = ("margin", "insufficient", "not allowed", "disabled", "blocked"
 # linked OpenAlgo account; TG_ALERT_INTERVAL throttles re-alerts during a long stale window.
 ALERT_TG_USER = os.getenv("ALERT_TG_USER", "admin")
 TG_ALERT_INTERVAL = float(os.getenv("TG_ALERT_INTERVAL", "120"))
+
+
+def _squareoff_at(now, offset_min=0):
+    """The square-off instant on `now`'s own date, shifted by offset_min minutes.
+
+    ALWAYS use this rather than the old `now.hour == SQUAREOFF_HOUR and now.minute >=
+    SQUAREOFF_MINUTE +/- N` form, which cannot express a window that crosses an hour boundary.
+    Concretely: at 15:01 the intended 2-minute "near square-off" warning should have covered
+    14:59-15:01, but the hour guard truncated it to 15:00, so 14:59 never qualified. The same
+    form also degenerates inside the hour — at minute 0 the offset collapses to `>= -2`, true
+    for every minute of hour 15 (harmless only because hour 15 is already past square-off) —
+    and `>= SQUAREOFF_MINUTE + 5` becomes unsatisfiable for any minute above 54. Real datetime
+    arithmetic has none of these edges.
+    """
+    base = now.replace(hour=SQUAREOFF_HOUR, minute=SQUAREOFF_MINUTE, second=0, microsecond=0)
+    return base + timedelta(minutes=offset_min)
 
 
 def log_error(msg):
@@ -250,6 +273,8 @@ class ShortStraddleBot:
         self.tg_cmd_mtime = None        # mtime of the last command file we parsed
         self.tg_armed_log = []          # every arm/disarm this session, for the journal
         self.margin_blocked = None      # broker-actual margin, snapshotted at entry
+        self.entry_spot = None          # underlying at entry — basis for the payoff projection
+        self.entry_ts = None
 
         # Hedge leg state (iron butterfly)
         self.hedge_ce_symbol = None
@@ -636,6 +661,8 @@ class ShortStraddleBot:
             quote = self.client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
             if quote.get("status") == "success":
                 spot = float(quote["data"].get("ltp", 0))
+                self.entry_spot = spot                    # kept for the payoff projection in the entry alert
+                self.entry_ts = datetime.now()
                 self.atm_strike = round(spot / 50) * 50   # provisional; overwritten with the ACTUAL sold strike after fill
                 log(f"[ENTRY] {UNDERLYING} spot: {spot:.2f} | breach guard ±{BREACH_PCT}% (map drawn after fill)")
             else:
@@ -944,8 +971,7 @@ class ShortStraddleBot:
 
             if not open_legs:
                 now = datetime.now()
-                near_squareoff = (now.hour > SQUAREOFF_HOUR or
-                                  (now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE - 2))
+                near_squareoff = now >= _squareoff_at(now, -2)
                 reason = "EOD auto square-off" if near_squareoff else "manual exit?"
                 log(f"\n[SYNC] All tracked legs flat ({reason}) — resetting")
                 self._clear_position_state()
@@ -1285,6 +1311,82 @@ class ShortStraddleBot:
             log(f"[NOTIFY] charge calc skipped (non-fatal): {e}")
             return None
 
+    @staticmethod
+    def _bs(S, K, T, r, sigma, cp):
+        """Black-Scholes price. Used only for the entry-alert payoff projection."""
+        if T <= 0 or sigma <= 0:
+            return max(0.0, (S - K) if cp == "C" else (K - S))
+        d1 = (math.log(S / K) + (r + sigma * sigma / 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        nd = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+        if cp == "C":
+            return S * nd(d1) - K * math.exp(-r * T) * nd(d2)
+        return K * math.exp(-r * T) * nd(-d2) - S * nd(-d1)
+
+    def _implied_vol(self, price, S, K, T, cp):
+        """Bisect for the vol that reproduces `price`. Wide bracket, fixed iterations."""
+        lo, hi = 1e-4, 5.0
+        for _ in range(80):
+            mid = (lo + hi) / 2
+            if self._bs(S, K, T, 0.065, mid, cp) > price:
+                hi = mid
+            else:
+                lo = mid
+        return (lo + hi) / 2
+
+    def _payoff_projection(self):
+        """Golden point, ceiling and profit band for TODAY -> dict, or None.
+
+        Prices every leg at the square-off time using the volatility implied by its OWN entry
+        fill, held flat. That last assumption is the whole caveat: on multi-day DTE vega
+        dominates the session, so a vol move invalidates this well before the index does. It
+        is a map of where today PAYS, not a forecast.
+
+        Charges are recomputed at each candidate spot rather than assumed, so the band is a
+        NET band — the same basis as /stradexit and the journal.
+
+        Returns None on any failure; the alert simply omits the lines rather than guessing.
+        """
+        try:
+            if not (self.atm_strike and self.traded_expiry and self.entry_spot):
+                return None
+            exp = datetime.strptime(self.traded_expiry, "%d-%b-%y").replace(hour=15, minute=15)
+            t0 = self.entry_ts or datetime.now()
+            t1 = _squareoff_at(t0)
+            T0 = (exp - t0).total_seconds() / (365 * 24 * 3600)
+            T1 = (exp - t1).total_seconds() / (365 * 24 * 3600)
+            if T0 <= 0 or T1 <= 0:
+                return None
+
+            legs = [(self.ce_symbol, self.ce_entry_price, self.atm_strike, "C", -1),
+                    (self.pe_symbol, self.pe_entry_price, self.atm_strike, "P", -1)]
+            if ENABLE_HEDGE:
+                w = self._wing_width() or 0
+                legs += [(self.hedge_ce_symbol, self.hedge_ce_price, self.atm_strike + w, "C", +1),
+                         (self.hedge_pe_symbol, self.hedge_pe_price, self.atm_strike - w, "P", +1)]
+            vols = [self._implied_vol(px, self.entry_spot, K, T0, cp) for _, px, K, cp, _ in legs]
+
+            def net_at(S):
+                exits = []
+                gross = 0.0
+                for (_, entry_px, K, cp, sgn), sigma in zip(legs, vols):
+                    x = self._bs(S, K, T1, 0.065, sigma, cp)
+                    gross += ((entry_px - x) if sgn < 0 else (x - entry_px)) * QUANTITY
+                    exits.append({"action": "BUY" if sgn < 0 else "SELL",
+                                  "quantity": QUANTITY, "price": x})
+                chg = self._roundtrip_charges(exits)
+                return gross - (chg if chg is not None else 0.0)
+
+            grid = [(S, net_at(S)) for S in range(int(self.atm_strike) - 400,
+                                                  int(self.atm_strike) + 401, 5)]
+            best = max(grid, key=lambda kv: kv[1])
+            pos = [S for S, v in grid if v > 0]
+            return {"golden": best[0], "ceiling": best[1],
+                    "lo": min(pos) if pos else None, "hi": max(pos) if pos else None}
+        except Exception as e:
+            log(f"[NOTIFY] payoff projection skipped (non-fatal): {e}")
+            return None
+
     def _notify_entry(self):
         """Consolidated ENTRY alert — one message covering all legs."""
         try:
@@ -1318,6 +1420,22 @@ class ShortStraddleBot:
                     f"Breach band: {self.atm_strike - b:,.0f} / {self.atm_strike + b:,.0f}"
                     f"  (ATM {self.atm_strike:,.0f} ±{BREACH_PCT}%)"
                 )
+            # Where today actually PAYS, projected to the square-off with entry-implied vol
+            # held flat. Sits next to the breach band deliberately: the two are usually very
+            # different widths, and seeing them together is the point — the breach is a
+            # disaster stop, not the edge of profitability.
+            pj = self._payoff_projection()
+            if pj:
+                lines.append(
+                    f"Golden point: {pj['golden']:,.0f} → NET ~{'+' if pj['ceiling'] >= 0 else '−'}"
+                    f"₹{abs(pj['ceiling']):,.0f} (today's ceiling)"
+                )
+                if pj["lo"] and pj["hi"]:
+                    lines.append(
+                        f"Profit band: {pj['lo']:,.0f} – {pj['hi']:,.0f}  "
+                        f"({pj['hi'] - pj['lo']:,.0f} pts, NET>0)"
+                    )
+                lines.append(self._md("_projection assumes IV holds — vega moves it_"))
             lines.append(
                 f"Targets: PT +{PROFIT_TARGET_PCT:.0f}% / SL −{STOPLOSS_PCT:.0f}% · "
                 f"EOD {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}"
@@ -1382,7 +1500,7 @@ class ShortStraddleBot:
             now = datetime.now()
 
             # Time-based square-off
-            if now.hour > SQUAREOFF_HOUR or (now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE):
+            if now >= _squareoff_at(now):
                 if self.is_positioned and not self.exit_in_progress:
                     self.exit_in_progress = True
                     log(f"\n[EOD] {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d} — closing straddle")
@@ -1740,8 +1858,7 @@ class ShortStraddleBot:
                 if now.hour >= 16:
                     self.entry_done_today = False
 
-                if (now.hour > SQUAREOFF_HOUR or
-                        (now.hour == SQUAREOFF_HOUR and now.minute >= SQUAREOFF_MINUTE + 5)):
+                if now >= _squareoff_at(now, 5):
                     if not self.is_positioned:
                         log("\n[EOD] Post-squareoff — strategy finished for the day.")
                         self.running = False

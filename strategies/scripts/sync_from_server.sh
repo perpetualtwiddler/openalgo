@@ -25,7 +25,7 @@ echo "  pulling from ${SERVER}:${REMOTE}  ->  ${HERE}"
 # local --backfill can reproduce it.
 FILES=(
   "log/trade_journal.csv"      # durable per-day record, one row per trading day
-  "log/exit_timing.csv"        # 15:01/15:05/15:10/15:14 replay comparison
+  "log/exit_timing.csv"        # 15:00/15:01/15:05/15:10/15:14 replay comparison
   "log/margin.csv"             # broker-actual margin snapshotted at entry
   "log/slippage.csv"           # fill vs reference, per leg per phase
 )
