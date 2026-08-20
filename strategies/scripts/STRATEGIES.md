@@ -89,6 +89,20 @@ a P&L threshold cannot distinguish a gain built on theta from one built on rente
 hold-to-close outcome. Until then it is one good call, not an edge. Risk of acting early is
 classic overfitting to a vivid single day.
 
+### 📊 Live status notifications — periodic + `/stradstatus` (added 2026-08-20)
+
+Every 30 min while positioned, plus on demand. Content: NET (with gross and charges), spot vs strike and breach room, ATM IV now vs entry, the **composition split**, the projection to the square-off, and how far an armed target is *in vol terms*.
+
+**Suppress-if-unchanged.** A push is skipped unless NET moved ≥₹400 or IV ≥0.15pp since the *last sent* one (compared against last-sent, not last-checked, so a slow drift still eventually reports). The reason is not politeness: a half-hourly heartbeat that says nothing trains you to ignore the channel, and a real breach alert then arrives into a channel you have learned to mute. `STATUS_NOTIFY_MIN=0` disables the periodic push; on-demand keeps working. **Silent on a no-trade day** — it only fires while positioned.
+
+**On-demand is a file handshake, not a second implementation.** The bot lives in gunicorn and cannot reach the strategy subprocess's memory (same constraint as `/stradexit`). `/stradstatus` writes `log/straddle_status_request.json`; the strategy notices within one monitor pass (≤5s) and sends the message itself, so on-demand and periodic are byte-identical from one code path. Requests older than 120s are ignored, so one written while flat cannot fire against a later session. Named `/stradstatus` because `/status` and `/pnl` are already taken.
+
+**The `← DRIVING` marker is load-bearing.** Listing theta beside vega without saying which owns the day teaches the wrong intuition: measured at 5–7 DTE, theta is ~₹67–116 per *hour* while 0.10pp of IV is ~₹195. A bare theta figure invites waiting for a clock that is nearly irrelevant. The message marks whichever leg moved more of the day's gross.
+
+**`straddle_analytics.py` — one implementation of the greeks.** Black-Scholes and the IV bisection had already drifted (strategy 80 iterations, `status_check.py` 90) and the composition split existed *only* in `status_check`, not the strategy. A third copy for this feature was not acceptable: if an alert's greeks diverge from the exit logic's, the notification confidently reports a position the strategy does not believe it holds. The strategy's `_bs`/`_implied_vol` now delegate, signatures unchanged. `test_analytics_equiv.py` pins the refactor against a golden reference captured *before* it — projection golden point, ceiling, band and both primitives reproduce **exactly**.
+
+Suites: `test_analytics_equiv.py` (13), `test_status_push.py` (17 — suppression, handshake replay-once, stale-request, on-demand overriding suppression, and four failure-isolation cases proving a formatting slip cannot stop the loop that enforces PT/SL/breach), `test_stradexit_time.py` (38). All green.
+
 ### ⏰ `/stradexit time HH:MM` — move today's square-off (added 2026-08-20)
 
 `/stradexit time 15:10` · `/stradexit time default` · `/stradexit time` (report). Stored as `squareoff_time` in the same day-stamped command file, so like every other field it evaporates at midnight and **cannot leak into a later session**.

@@ -21,6 +21,9 @@
 !sim_ema_today.py
 !test_straddle_filters.py
 !test_stradexit_time.py
+!test_status_push.py
+!test_analytics_equiv.py
+!straddle_analytics.py
 !ema_crossover_banknifty_3m_20260617.py
 !ema_crossover_banknifty_opt4_20260618.py
 !backtest_ema_dev.py
@@ -59,3 +62,6 @@ __pycache__/
 
 # Keep the directory but ignore contents
 # This ensures the scripts folder exists in git but user strategies are not tracked
+# Stray outputs that git add -A would otherwise sweep into a commit
+nohup.out
+backtest_data/

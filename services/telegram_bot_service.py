@@ -217,6 +217,59 @@ class TelegramBotService:
         logger.info("/stradexit by %s -> target=%s stop=%s", user.id, t, s)
         await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
 
+    async def cmd_stradstatus(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/stradstatus — ask the running straddle for a live status push.
+
+        This does NOT compute anything. The bot lives inside gunicorn and cannot reach the
+        strategy subprocess's memory, and re-deriving the greeks here would be a second
+        implementation that could disagree with the one the exit logic uses. So we write a
+        request file, the strategy notices it on its next monitor pass (<=5s) and sends the
+        message itself -- meaning the on-demand and the periodic push are byte-identical,
+        from one code path.
+
+        Named /stradstatus because /status and /pnl are already taken by this bot.
+        """
+        import json as _json
+        from datetime import datetime as _dt
+        from pathlib import Path as _Path
+
+        from telegram.constants import ParseMode
+
+        user = update.effective_user
+        if not get_telegram_user(user.id):
+            await update.message.reply_text("❌ Please link your account first using /link")
+            return
+
+        req = _Path(os.getenv("STATUS_REQUEST_FILE",
+                              "/root/data/openalgo/log/straddle_status_request.json"))
+        try:
+            req.parent.mkdir(parents=True, exist_ok=True)
+            req.write_text(_json.dumps({"requested_at": _dt.now().isoformat(),
+                                        "source": f"telegram:{user.id}"}, indent=2))
+        except Exception as e:
+            logger.exception(f"/stradstatus write failed: {e}")
+            await update.message.reply_text(f"❌ Could not write the request file: {e}")
+            return
+
+        # Say what happens next, including the case where nothing will arrive, so silence is
+        # never ambiguous. The strategy only answers while it holds a position.
+        flat_note = ""
+        try:
+            client = self._get_sdk_client(user.id)
+            pb = (client.positionbook().get("data") or []) if client else []
+            legs = [p for p in pb if int(float(p.get("quantity") or 0)) != 0
+                    and (p.get("symbol") or "").startswith("NIFTY")]
+            if not legs:
+                flat_note = ("\n\n⚠ No position is open right now, so the strategy will not "
+                             "answer. Nothing is scheduled outside 09:15–15:20 either.")
+        except Exception:
+            pass
+
+        logger.info("/stradstatus requested by %s", user.id)
+        await update.message.reply_text(
+            "📡 Asked the straddle for a status update — it should arrive within ~5s."
+            + flat_note, parse_mode=ParseMode.MARKDOWN)
+
     async def _stradexit_time(self, update, args, path, today, user) -> None:
         """`/stradexit time [HH:MM | default]` — move TODAY's square-off, or report it.
 
@@ -1025,6 +1078,7 @@ class TelegramBotService:
                 self.application.add_handler(CommandHandler("stoppython", self.cmd_stoppython))
                 self.application.add_handler(CommandHandler("mode", self.cmd_mode))
                 self.application.add_handler(CommandHandler("stradexit", self.cmd_stradexit))
+                self.application.add_handler(CommandHandler("stradstatus", self.cmd_stradstatus))
                 self.application.add_handler(CommandHandler("menu", self.cmd_menu))
 
                 # Add callback query handler for inline buttons

@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""straddle_analytics.py — ONE implementation of the iron-butterfly maths.
+
+WHY THIS EXISTS. Black-Scholes and the implied-vol bisection were living in two places
+(short_straddle_nifty.py and status_check.py) and had already drifted: the strategy bisected
+80 times, status_check 90. Harmless at double precision, but it is the same class of defect
+as a gate and an order path disagreeing about the expiry — and the composition split, the
+single most useful diagnostic we have, existed ONLY in status_check and not in the strategy
+at all. Adding a Telegram status push would have made it a third copy of the greeks.
+
+The danger is specific, not aesthetic: if an alert's greeks drift from the exit logic's
+greeks, the notification confidently reports a position the strategy does not believe it has.
+So everything that prices a leg lives here, and the strategy, status_check.py and the
+Telegram bot all import it.
+
+Canonical choices, matched to what the strategy ALREADY did so the refactor is a no-op:
+  * 80 bisection iterations, bracket [1e-4, 5.0]  (status_check used 90 — standardised down)
+  * r = 6.5% flat
+  * P&L on a signed position is qty * (mark - entry): a short (qty<0) gains when the mark falls
+
+A LEG is a plain dict so no caller needs a class:
+    {"symbol": str, "qty": int (SIGNED), "entry": float, "mark": float,
+     "strike": float, "cp": "C" | "P"}
+"""
+import math
+
+RISK_FREE = 0.065
+IV_ITERATIONS = 80          # matches short_straddle_nifty._implied_vol exactly
+IV_BRACKET = (1e-4, 5.0)
+YEAR_SECONDS = 365 * 24 * 3600
+
+
+# ──────────────────────────────────────────────────────────── pricing primitives
+def _nd(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs(S, K, T, sigma, cp, r=RISK_FREE):
+    """Black-Scholes price. Below expiry or zero vol, falls back to intrinsic."""
+    if T <= 0 or sigma <= 0:
+        return max(0.0, (S - K) if cp == "C" else (K - S))
+    d1 = (math.log(S / K) + (r + sigma * sigma / 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if cp == "C":
+        return S * _nd(d1) - K * math.exp(-r * T) * _nd(d2)
+    return K * math.exp(-r * T) * _nd(-d2) - S * _nd(-d1)
+
+
+def implied_vol(price, S, K, T, cp, r=RISK_FREE):
+    """Bisect for the vol reproducing `price`. Fixed iterations — no convergence branch,
+    so the result is deterministic and identical across callers."""
+    lo, hi = IV_BRACKET
+    for _ in range(IV_ITERATIONS):
+        mid = (lo + hi) / 2
+        if bs(S, K, T, mid, cp, r) > price:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def years_to(exp, when):
+    return (exp - when).total_seconds() / YEAR_SECONDS
+
+
+# ──────────────────────────────────────────────────────────── position maths
+def leg_ivs(legs, spot, T, price_key="mark", r=RISK_FREE):
+    """Back-solve each leg's own IV from `price_key` at (spot, T)."""
+    return {lg["symbol"]: implied_vol(lg[price_key], spot, lg["strike"], T, lg["cp"], r)
+            for lg in legs}
+
+
+def atm_iv(legs, ivs):
+    """Mean IV of the two SHORT legs — the conventional 'ATM IV' for a butterfly."""
+    sh = [lg for lg in legs if lg["qty"] < 0]
+    return sum(ivs[lg["symbol"]] for lg in sh) / len(sh) if sh else None
+
+
+def gross_at(legs, marks):
+    """Signed-position P&L: qty * (mark - entry), so a short gains as the mark falls."""
+    return sum(lg["qty"] * (marks[lg["symbol"]] - lg["entry"]) for lg in legs)
+
+
+def _roundtrip_fills(legs, marks):
+    """Entry+exit fills, one synthetic order id per leg-side, for the charge model.
+    charges.py bills per ORDER, and one order per leg-side is how we actually trade."""
+    out = []
+    for lg in legs:
+        q, short = abs(lg["qty"]), lg["qty"] < 0
+        out += [{"action": "SELL" if short else "BUY", "quantity": q,
+                 "price": lg["entry"], "orderid": f"i{lg['symbol']}"},
+                {"action": "BUY" if short else "SELL", "quantity": q,
+                 "price": marks[lg["symbol"]], "orderid": f"o{lg['symbol']}"}]
+    return out
+
+
+def net_at(legs, marks, charges_fn):
+    """Gross minus the full round-trip charge, recomputed AT these marks.
+
+    Recomputed rather than held constant because STT is levied on sell-side premium and
+    therefore moves with the exit price. Comparing a projected gross against a realised net
+    would flatter every projection.
+    """
+    return gross_at(legs, marks) - charges_fn(_roundtrip_fills(legs, marks))
+
+
+def price_all(legs, S, T, ivs, r=RISK_FREE):
+    return {lg["symbol"]: bs(S, lg["strike"], T, ivs[lg["symbol"]], lg["cp"], r)
+            for lg in legs}
+
+
+def composition(legs, spot, T_now, entry_spot, T_entry, marks=None):
+    """Split the CURRENT gross into durable (theta+delta) and reversible (vega).
+
+    Durable = what today's spot and remaining time would be worth if IV had never moved,
+    priced at each leg's OWN entry-implied vol. Whatever is left is the vol move, which can
+    hand itself straight back. On multi-day DTE this is usually most of the P&L, which is why
+    a big unrealised gain at 6 DTE is not the same thing as a banked one.
+    """
+    marks = marks or {lg["symbol"]: lg["mark"] for lg in legs}
+    iv_e = leg_ivs(legs, entry_spot, T_entry, price_key="entry")
+    durable = sum(lg["qty"] * (bs(spot, lg["strike"], T_now, iv_e[lg["symbol"]], lg["cp"])
+                               - lg["entry"]) for lg in legs)
+    total = gross_at(legs, marks)
+    return {"durable": durable, "reversible": total - durable, "gross": total, "entry_ivs": iv_e}
+
+
+def ladder(legs, centre, T_exit, ivs, charges_fn, offsets=(150, 100, 50, 0, -50, -100, -150)):
+    """[(spot, net)] at T_exit for each offset from `centre`, IV held flat."""
+    return [(centre + o, net_at(legs, price_all(legs, centre + o, T_exit, ivs), charges_fn))
+            for o in offsets]
+
+
+def projection(legs, atm, T_exit, ivs, charges_fn, span=400, step=5):
+    """Golden point, ceiling and the NET>0 band at T_exit, IV held flat.
+
+    A map of where the day PAYS, not a forecast — vega moves it well before the index does.
+    """
+    grid = [(S, net_at(legs, price_all(legs, S, T_exit, ivs), charges_fn))
+            for S in range(int(atm) - span, int(atm) + span + 1, step)]
+    if not grid:
+        return None
+    best = max(grid, key=lambda kv: kv[1])
+    pos = [S for S, v in grid if v > 0]
+    return {"golden": best[0], "ceiling": best[1],
+            "lo": min(pos) if pos else None, "hi": max(pos) if pos else None}
+
+
+def vega_per_pp(legs, spot, T, ivs, charges_fn, bump=0.01):
+    """Rupees of NET per 1 percentage point of IV (positive = we gain when IV FALLS)."""
+    down = {s: max(v - bump, 1e-6) for s, v in ivs.items()}
+    return (net_at(legs, price_all(legs, spot, T, down), charges_fn)
+            - net_at(legs, price_all(legs, spot, T, ivs), charges_fn))
+
+
+def theta_per_hour(legs, spot, T, ivs, charges_fn):
+    """Rupees of NET per hour of pure time decay at this spot and IV."""
+    T2 = max(T - 1.0 / (365 * 24), 1e-9)
+    return (net_at(legs, price_all(legs, spot, T2, ivs), charges_fn)
+            - net_at(legs, price_all(legs, spot, T, ivs), charges_fn))
+
+
+# ──────────────────────────────────────────────────────────── Telegram formatting
+def format_status(*, now, spot, atm, dte, breach_lo, breach_hi, legs, charges_fn,
+                  exp, exit_at, entry_spot, entry_ts, armed_target=None, armed_stop=None,
+                  mfe_net=None, mae_net=None, md=lambda s: s):
+    """The periodic / on-demand status message. Compact by design — it is read on a phone.
+
+    The `DRIVING` marker is load-bearing. Listing theta next to vega without saying which one
+    owns the day teaches the wrong intuition: measured at 5-7 DTE, theta is ~Rs67-116/HOUR
+    while 0.10pp of IV is ~Rs195. Someone reading a bare theta figure would naturally wait for
+    the clock, when the clock is nearly irrelevant.
+    """
+    T_now = years_to(exp, now)
+    T_exit = years_to(exp, exit_at)
+    T_entry = years_to(exp, entry_ts)
+    marks = {lg["symbol"]: lg["mark"] for lg in legs}
+    ivs = leg_ivs(legs, spot, T_now)
+    g = gross_at(legs, marks)
+    ch = charges_fn(_roundtrip_fills(legs, marks))
+    n = g - ch
+    comp = composition(legs, spot, T_now, entry_spot, T_entry, marks)
+    iv_now, iv_ent = atm_iv(legs, ivs), atm_iv(legs, comp["entry_ivs"])
+    vpp = vega_per_pp(legs, spot, T_now, ivs, charges_fn)
+    tph = theta_per_hour(legs, spot, T_now, ivs, charges_fn)
+
+    room = min(abs(spot - breach_lo), abs(spot - breach_hi))
+    L = [f"📊 *Straddle* · {now:%H:%M} · {dte} DTE",
+         f"NIFTY {spot:,.2f}  ({spot - atm:+.0f} from {atm:,.0f} · {room:.0f} pts to breach)",
+         "",
+         f"*NET {n:+,.0f}*   (gross {g:+,.0f} · charges −{ch:,.0f})",
+         ""]
+    if iv_now is not None and iv_ent is not None:
+        L.append(f"IV {iv_now * 100:.2f}%  (entry {iv_ent * 100:.2f}%, "
+                 f"{(iv_now - iv_ent) * 100:+.2f}pp)")
+    # whichever lever moved more of today's gross gets the marker
+    drive_vega = abs(comp["reversible"]) >= abs(comp["durable"])
+    L.append(f"├ vega    {comp['reversible']:+,.0f}   ≈₹{abs(vpp):,.0f} per 1pp"
+             + ("   ← DRIVING" if drive_vega else ""))
+    L.append(f"└ theta+Δ {comp['durable']:+,.0f}   ≈₹{tph:,.0f}/hr"
+             + ("" if drive_vega else "   ← DRIVING"))
+
+    pj = projection(legs, atm, T_exit, ivs, charges_fn)
+    if pj:
+        L += ["", f"To the {exit_at:%H:%M} exit, IV flat:",
+              f"  golden {pj['golden']:,.0f} → ceiling {pj['ceiling']:+,.0f}"]
+        if pj["lo"] and pj["hi"]:
+            L.append(f"  profit band {pj['lo']:,.0f}–{pj['hi']:,.0f} "
+                     f"({pj['hi'] - pj['lo']:,.0f} pts)")
+        else:
+            L.append("  ⚠ no profitable spot at this IV")
+    if armed_target or armed_stop:
+        bits = []
+        if armed_target:
+            gap = armed_target - n
+            need = f" — needs {gap:+,.0f}" if gap > 0 else " — reached"
+            if gap > 0 and vpp:
+                need += f" (≈{gap / abs(vpp):.2f}pp of IV)"
+            bits.append(f"TP net {armed_target:+,.0f}{need}")
+        if armed_stop:
+            bits.append(f"SL net {armed_stop:+,.0f}")
+        L += [""] + [f"Armed: {b}" for b in bits]
+    if mfe_net is not None and mae_net is not None:
+        L.append(f"Today: MFE {mfe_net:+,.0f} net · MAE {mae_net:+,.0f} net")
+    L.append(md("_projection assumes IV holds — vega moves it_"))
+    return "\n".join(L)
+
+
+def material_change(prev, cur, net_delta=400.0, iv_delta_pp=0.15):
+    """Suppress-if-unchanged gate for the periodic push.
+
+    Returns True when the position has moved enough to be worth a message. Thresholds are on
+    NET rupees and IV, not on time, because a half-hourly heartbeat that says nothing trains
+    you to ignore the channel — and a real breach alert then arrives into a muted channel.
+    `prev` is None on the first push of the day, which always sends.
+    """
+    if prev is None:
+        return True
+    if abs(cur["net"] - prev["net"]) >= net_delta:
+        return True
+    if (cur.get("iv") is not None and prev.get("iv") is not None
+            and abs(cur["iv"] - prev["iv"]) * 100 >= iv_delta_pp):
+        return True
+    return False

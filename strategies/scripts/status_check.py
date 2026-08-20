@@ -48,12 +48,12 @@ for pth in (REPO_ROOT, SCRIPT_DIR):
         sys.path.insert(0, pth)
 
 import charges as chg                                    # noqa: E402
+import straddle_analytics as sa                          # noqa: E402
 import short_straddle_nifty as ss                        # noqa: E402  (import-safe: __main__ guarded)
 from openalgo import api                                 # noqa: E402
 from database.auth_db import get_api_key_for_tradingview  # noqa: E402
 
 IST = ZoneInfo("Asia/Kolkata")
-RISK_FREE = float(os.getenv("RISK_FREE", "0.065"))
 LOG_GLOB = os.path.join(REPO_ROOT, "log", "strategies", "*straddle*_{ymd}_*")
 MONTHS = {m: i for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
@@ -65,29 +65,12 @@ def now_ist():
 
 
 # ---------------------------------------------------------------- Black-Scholes / IV
-def _n(x):
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def bs(S, K, T, sigma, cp):
-    if T <= 0 or sigma <= 0:
-        return max(0.0, (S - K) if cp == "C" else (K - S))
-    d1 = (math.log(S / K) + (RISK_FREE + sigma * sigma / 2) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    if cp == "C":
-        return S * _n(d1) - K * math.exp(-RISK_FREE * T) * _n(d2)
-    return K * math.exp(-RISK_FREE * T) * _n(-d2) - S * _n(-d1)
-
-
-def implied_vol(price, S, K, T, cp):
-    lo, hi = 1e-4, 5.0
-    for _ in range(90):
-        mid = (lo + hi) / 2
-        if bs(S, K, T, mid, cp) > price:
-            hi = mid
-        else:
-            lo = mid
-    return (lo + hi) / 2
+# Delegated to straddle_analytics so this tool, the strategy's entry projection and the
+# Telegram status push cannot price a leg differently. This file previously carried its own
+# copy that bisected 90 times where the strategy used 80 -- immaterial at double precision,
+# but the same class of divergence as a gate and an order path disagreeing.
+bs = sa.bs
+implied_vol = sa.implied_vol
 
 
 # ---------------------------------------------------------------- symbol parsing

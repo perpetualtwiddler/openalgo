@@ -132,6 +132,18 @@ CONSECUTIVE_SL_LIMIT = int(os.getenv("CONSECUTIVE_SL_LIMIT", "2"))
 # 4-leg exit measured ~7s and a transient failure needs a full retry cycle (8s x2), so 15:12
 # leaves ~3 min of real buffer. Also note PRODUCT defaults to MIS: the broker runs its own
 # auto-square-off, and holding to the bell hands our exit to it at market prices.
+# Periodic Telegram status push. Suppressed when nothing material moved, because a
+# half-hourly heartbeat that says nothing trains you to ignore the channel -- and a real
+# breach alert then lands in a channel you have learned to mute. 0 disables the push
+# entirely; /stradstatus on-demand still works.
+STATUS_NOTIFY_MIN = int(os.getenv("STATUS_NOTIFY_MIN", "30"))
+STATUS_NET_DELTA = float(os.getenv("STATUS_NET_DELTA", "400"))
+STATUS_IV_DELTA_PP = float(os.getenv("STATUS_IV_DELTA_PP", "0.15"))
+STATUS_REQUEST_FILE = Path(os.getenv("STATUS_REQUEST_FILE",
+                                     str(Path(__file__).resolve().parents[2]
+                                         / "log" / "straddle_status_request.json")))
+STATUS_REQUEST_MAX_AGE = int(os.getenv("STATUS_REQUEST_MAX_AGE", "120"))
+
 SQUAREOFF_LATEST = os.getenv("SQUAREOFF_LATEST", "15:12")
 SQUAREOFF_EARLIEST = os.getenv("SQUAREOFF_EARLIEST", "09:40")
 SQUAREOFF_HOUR = int(os.getenv("SQUAREOFF_HOUR", "15"))
@@ -280,6 +292,9 @@ class ShortStraddleBot:
         self.tg_cmd_mtime = None        # mtime of the last command file we parsed
         self.tg_armed_log = []          # every arm/disarm this session, for the journal
         self.tg_squareoff = None        # (h, m) from /stradexit time, today only
+        self._status_next = None        # when the next periodic status is due
+        self._status_prev = None        # last SENT snapshot, for suppress-if-unchanged
+        self._status_req_mtime = None   # last on-demand request we served
         self.margin_blocked = None      # broker-actual margin, snapshotted at entry
         self.entry_spot = None          # underlying at entry — basis for the payoff projection
         self.entry_ts = None
@@ -1328,6 +1343,103 @@ class ShortStraddleBot:
             ]
         return exits
 
+    def _status_legs(self):
+        """Current legs in straddle_analytics' shape, or None if we cannot build them."""
+        if not (self.atm_strike and self.ce_symbol and self.pe_symbol):
+            return None
+        w = self._wing_width() or 0
+        legs = [{"symbol": self.ce_symbol, "qty": -QUANTITY, "entry": self.ce_entry_price,
+                 "mark": self.ce_ltp, "strike": self.atm_strike, "cp": "C"},
+                {"symbol": self.pe_symbol, "qty": -QUANTITY, "entry": self.pe_entry_price,
+                 "mark": self.pe_ltp, "strike": self.atm_strike, "cp": "P"}]
+        if ENABLE_HEDGE:
+            legs += [{"symbol": self.hedge_ce_symbol, "qty": QUANTITY,
+                      "entry": self.hedge_ce_price, "mark": self.hedge_ce_ltp,
+                      "strike": self.atm_strike + w, "cp": "C"},
+                     {"symbol": self.hedge_pe_symbol, "qty": QUANTITY,
+                      "entry": self.hedge_pe_price, "mark": self.hedge_pe_ltp,
+                      "strike": self.atm_strike - w, "cp": "P"}]
+        if any(l["mark"] is None or l["entry"] is None or not l["strike"] for l in legs):
+            return None
+        return legs
+
+    def _status_message(self, now, spot, net_pnl):
+        """Build the status text via the SHARED analytics module — never a local copy."""
+        import straddle_analytics as sa
+
+        legs = self._status_legs()
+        if not legs or not self.traded_expiry:
+            return None, None
+        exp = datetime.strptime(self.traded_expiry, "%d-%b-%y").replace(hour=15, minute=15)
+        if not spot:
+            spot = self.entry_spot
+        b = (self.atm_strike * BREACH_PCT / 100) if BREACH_PCT else 0
+        T_now = sa.years_to(exp, now)
+        ivs = sa.leg_ivs(legs, spot, T_now) if T_now > 0 else {}
+        snap = {"net": net_pnl, "iv": sa.atm_iv(legs, ivs) if ivs else None}
+        text = sa.format_status(
+            now=now, spot=spot, atm=self.atm_strike, dte=self.traded_dte,
+            breach_lo=self.atm_strike - b, breach_hi=self.atm_strike + b,
+            legs=legs, charges_fn=lambda f: __import__("charges").charges_from_fills(f, True),
+            exp=exp, exit_at=self._squareoff_at(now),
+            entry_spot=self.entry_spot, entry_ts=self.entry_ts or now,
+            armed_target=self.tg_target_net, armed_stop=self.tg_stop_net,
+            mfe_net=None, mae_net=None, md=self._md)
+        return text, snap
+
+    def _status_requested(self):
+        """True once per new on-demand request file.
+
+        The bot lives in gunicorn and cannot reach this process, so /stradstatus writes a
+        file and we notice it within one monitor pass (<=5s). Requests older than
+        STATUS_REQUEST_MAX_AGE are ignored: one written while we were flat must not fire
+        against a later session's position.
+        """
+        try:
+            if not STATUS_REQUEST_FILE.exists():
+                return False
+            mtime = STATUS_REQUEST_FILE.stat().st_mtime
+            if mtime == self._status_req_mtime:
+                return False
+            self._status_req_mtime = mtime
+            if (time.time() - mtime) > STATUS_REQUEST_MAX_AGE:
+                log(f"[STATUS] ignoring a stale request ({time.time() - mtime:.0f}s old)")
+                return False
+            return True
+        except Exception as e:
+            log(f"[STATUS] request check skipped (non-fatal): {e}")
+            return False
+
+    def _maybe_status(self, now, spot, net_pnl):
+        """Periodic (suppress-if-unchanged) + on-demand status push. NEVER raises.
+
+        Wrapped whole: this is cosmetic reporting sharing a loop with the code that enforces
+        PT/SL/breach, and a formatting slip must not be able to stop that loop.
+        """
+        try:
+            import straddle_analytics as sa
+
+            on_demand = self._status_requested()
+            due = STATUS_NOTIFY_MIN > 0 and (self._status_next is None or now >= self._status_next)
+            if not (on_demand or due):
+                return
+            if due:
+                self._status_next = now + timedelta(minutes=STATUS_NOTIFY_MIN)
+            text, snap = self._status_message(now, spot, net_pnl)
+            if not text:
+                return
+            # On-demand always answers. The periodic push is gated on material movement, and
+            # compares against the last SENT snapshot so a slow drift still eventually reports.
+            if on_demand or sa.material_change(self._status_prev, snap,
+                                               STATUS_NET_DELTA, STATUS_IV_DELTA_PP):
+                self._tg_notify(text)
+                self._status_prev = snap
+            else:
+                log(f"[STATUS] suppressed — net {snap['net']:+,.0f} and IV unchanged "
+                    f"since the last push")
+        except Exception as e:
+            log(f"[STATUS] status push skipped (non-fatal): {e}")
+
     def _stradexit_trigger(self, total_pnl, net_pnl=None, chg_est=None):
         """Has an armed /stradexit threshold been crossed? -> (reason, detail, charges) or None.
 
@@ -1378,28 +1490,18 @@ class ShortStraddleBot:
             log(f"[NOTIFY] charge calc skipped (non-fatal): {e}")
             return None
 
+    # These two now DELEGATE to straddle_analytics so the alert, the projection and
+    # status_check.py cannot price a leg differently. Signatures are unchanged (note r is the
+    # 4th positional arg here, historically), so no call site moved. Proven byte-identical to
+    # the previous inline implementations against a golden reference — see test_equiv.py.
     @staticmethod
     def _bs(S, K, T, r, sigma, cp):
-        """Black-Scholes price. Used only for the entry-alert payoff projection."""
-        if T <= 0 or sigma <= 0:
-            return max(0.0, (S - K) if cp == "C" else (K - S))
-        d1 = (math.log(S / K) + (r + sigma * sigma / 2) * T) / (sigma * math.sqrt(T))
-        d2 = d1 - sigma * math.sqrt(T)
-        nd = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-        if cp == "C":
-            return S * nd(d1) - K * math.exp(-r * T) * nd(d2)
-        return K * math.exp(-r * T) * nd(-d2) - S * nd(-d1)
+        import straddle_analytics as sa
+        return sa.bs(S, K, T, sigma, cp, r)
 
     def _implied_vol(self, price, S, K, T, cp):
-        """Bisect for the vol that reproduces `price`. Wide bracket, fixed iterations."""
-        lo, hi = 1e-4, 5.0
-        for _ in range(80):
-            mid = (lo + hi) / 2
-            if self._bs(S, K, T, 0.065, mid, cp) > price:
-                hi = mid
-            else:
-                lo = mid
-        return (lo + hi) / 2
+        import straddle_analytics as sa
+        return sa.implied_vol(price, S, K, T, cp)
 
     def _payoff_projection(self):
         """Golden point, ceiling and profit band for TODAY -> dict, or None.
@@ -1707,6 +1809,13 @@ class ShortStraddleBot:
             # Deliberately ahead of PT/breach/SL: it is the tighter, hand-armed rule, and
             # evaluating it first makes the exit reason unambiguous in log and journal.
             self._read_stradexit()
+
+            # Status reporting sits here so it sees freshly-read armed thresholds and the
+            # spot already fetched for the breach check -- no extra broker calls. Only ever
+            # while positioned, so a no-trade day stays silent.
+            if not self.exit_in_progress:
+                self._maybe_status(now, breach_spot, net_pnl)
+
             tg = self._stradexit_trigger(total_pnl, net_pnl, _chg_now)
 
             if tg and not self.exit_in_progress:
