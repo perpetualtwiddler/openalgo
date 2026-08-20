@@ -89,6 +89,18 @@ a P&L threshold cannot distinguish a gain built on theta from one built on rente
 hold-to-close outcome. Until then it is one good call, not an edge. Risk of acting early is
 classic overfitting to a vivid single day.
 
+### ⏰ `/stradexit time HH:MM` — move today's square-off (added 2026-08-20)
+
+`/stradexit time 15:10` · `/stradexit time default` · `/stradexit time` (report). Stored as `squareoff_time` in the same day-stamped command file, so like every other field it evaporates at midnight and **cannot leak into a later session**.
+
+**Capped at 15:12, and the strategy re-validates independently of Telegram.** The session ends **15:15**, so an exit initiated at 15:15:00 has no market; a clean 4-leg exit measured ~7s and a transient failure needs a full retry cycle (8s × 2). We also run `PRODUCT=MIS`, so the broker has its own auto-square-off — holding to the bell hands our exit to it at market prices, and **Zerodha's current F&O MIS cut-off is still unconfirmed** (open item). The cap is enforced in BOTH places because the command file is hand-editable JSON: the process that actually places the exit has to be the one that refuses an unexecutable time.
+
+Every exit-timing decision now routes through `self._squareoff_at()` rather than the module-level function, so the EOD exit, the 2-minute "near square-off" window and the payoff projection can never disagree about when we intend to be flat. The heartbeat/entry-alert label renders `15:10*` — the trailing asterisk means overridden for today.
+
+**Do not read this as evidence that exiting later is better.** Paired same-day differences over the 50 replayed days: 15:05 vs 15:00 **−₹55/day** (t=−0.71), 15:10 vs 15:00 **+₹55/day** (t=+0.61), 15:14 vs 15:00 **+₹51/day** (t=+0.56) — all CIs straddle zero, better on only 28–29 of 50 days, and the worst days for holding later run **−₹1,287 to −₹1,924**. (Those are old-session days, so they don't transfer cleanly either way.) On 2026-08-20, the day that motivated the command, holding to the best post-15:00 minute (15:07) would have recovered **₹829 of an ₹1,881 loss** — real, but it would still have been a loss, not a break-even. This is a **discretionary tool for days you are reading actively**, not a default to drift toward.
+
+Regression suite: `test_stradexit_time.py` — 38 assertions, the first block re-asserting every pre-existing `/stradexit` behaviour (numeric slots independent, `0` clears both, comma-formatted values, bare report writes nothing, non-numeric rejected) because this added new surface to a command that closes real-money positions. It also asserts the bot's and the strategy's caps agree, since they read env separately rather than importing each other.
+
 ### 🔒 Where the trade data lives — a separate LOCAL-ONLY repo (set up 2026-08-19)
 
 **`mkds-openalgo` is a PUBLIC fork of `marketcalls/openalgo`** (verified 2026-08-19: `isPrivate:false`). The branch name `mock/strategies` reads private; the repository is not. So the live trading record is version-controlled **outside** this repo, at `../trading-ledger` — a git repo with **no remote, by design**. `ledger_snapshot.sh` refuses to run if a remote ever appears, because the point is that this data has no publication path.

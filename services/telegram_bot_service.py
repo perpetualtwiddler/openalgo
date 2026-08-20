@@ -42,6 +42,16 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Square-off window for /stradexit time. These MUST match short_straddle_nifty.py -- the bot
+# and the strategy read the same env vars with the same defaults rather than importing each
+# other (the strategy runs as a subprocess; the bot lives inside gunicorn). The strategy
+# re-validates independently, so a drift here can only ever be more restrictive at the
+# Telegram layer, never permissive. test_stradexit_time.py asserts the two agree.
+SQUAREOFF_LATEST = os.getenv("SQUAREOFF_LATEST", "15:12")
+SQUAREOFF_EARLIEST = os.getenv("SQUAREOFF_EARLIEST", "09:40")
+DEFAULT_SQUAREOFF = (f'{int(os.getenv("SQUAREOFF_HOUR", "15")):02d}:'
+                     f'{int(os.getenv("SQUAREOFF_MINUTE", "0")):02d}')
+
 def _allowed_telegram_ids() -> set[int]:
     """Telegram account ids permitted to drive this bot, from TELEGRAM_ALLOWED_IDS.
 
@@ -100,17 +110,28 @@ class TelegramBotService:
         path = _Path(os.getenv("STRADEXIT_FILE", "/root/data/openalgo/log/straddle_command.json"))
         today = _dt.now().strftime("%Y-%m-%d")
 
+        # ---- `time` sub-command ---------------------------------------------------------
+        # Dispatched on args[0], NOT on the argument count. `/stradexit time` on its own is a
+        # single arg and would otherwise fall through to float() and be rejected as "not a
+        # number"; `/stradexit time 15:10` is two args and would have hit the bare-report
+        # branch. Everything below this point -- the numeric slots, 0-to-clear, and the bare
+        # report -- is reached exactly as before.
+        if context.args and context.args[0].lower() == "time":
+            await self._stradexit_time(update, context.args[1:], path, today, user)
+            return
+
         if not context.args or len(context.args) != 1:
             # Bare /stradexit REPORTS current state rather than only printing usage — the
             # only other way to check would be to send a value, which changes what you are
             # trying to inspect.
-            t = s = armed_at = None
+            t = s = armed_at = sq_time = None
             try:
                 if path.exists():
                     cur = _json.loads(path.read_text())
                     if cur.get("date") == today:      # stale days are not "armed"
                         t, s = cur.get("target_net"), cur.get("stop_net")
                         armed_at = (cur.get("updated_at") or "")[11:19]
+                        sq_time = cur.get("squareoff_time")
             except Exception:
                 pass
 
@@ -122,6 +143,8 @@ class TelegramBotService:
                 lines.append(f"Stop:        {'NET −₹%s' % format(abs(s), ',.0f') if s else '— not set'}")
                 if armed_at:
                     lines.append(f"Armed at:    {armed_at} IST · applies to {today} only")
+            if sq_time:
+                lines.append(f"Square-off:  *{sq_time}* today (default {DEFAULT_SQUAREOFF})")
             # Whether it is actually being watched depends on there being a position; the
             # monitor loop idles while flat, so say which of the two situations you are in.
             try:
@@ -137,6 +160,7 @@ class TelegramBotService:
             except Exception:
                 pass
             lines += ["", "_Usage:_ `/stradexit 2000` · `/stradexit -3000` · `/stradexit 0` to cancel",
+                      "_Also:_ `/stradexit time 15:10` · `/stradexit time default`",
                       "_Slots are independent. NET = after Zerodha charges._"]
             await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
             return
@@ -192,6 +216,130 @@ class TelegramBotService:
 
         logger.info("/stradexit by %s -> target=%s stop=%s", user.id, t, s)
         await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
+
+    async def _stradexit_time(self, update, args, path, today, user) -> None:
+        """`/stradexit time [HH:MM | default]` — move TODAY's square-off, or report it.
+
+        Deliberately a separate slot from target_net/stop_net: it changes WHEN we go flat, not
+        at what P&L, and the two must be independently settable. Written into the same
+        day-stamped file, so like every other field it evaporates at midnight and cannot leak
+        into a later session.
+
+        The cap is the point of this method. The session ends 15:15, so an exit initiated at
+        15:15:00 has no market; a clean 4-leg exit measured ~7s and a transient failure needs
+        a full retry cycle (8s x2). We also run PRODUCT=MIS, so the broker has its own
+        auto-square-off -- holding to the bell hands our exit to it at market prices. The
+        strategy re-validates this independently, because the file is hand-editable JSON.
+        """
+        import json as _json
+        from datetime import datetime as _dt
+
+        from telegram.constants import ParseMode
+
+        LATEST, EARLIEST = SQUAREOFF_LATEST, SQUAREOFF_EARLIEST
+
+        def _read_today():
+            try:
+                if path.exists():
+                    prev = _json.loads(path.read_text())
+                    if prev.get("date") == today:
+                        return prev
+            except Exception:
+                pass
+            return {}
+
+        # --- report ------------------------------------------------------------------
+        if not args:
+            cur = _read_today()
+            sq = cur.get("squareoff_time")
+            body = ["⏰ *Straddle square-off time*", ""]
+            if sq:
+                body.append(f"Today: *{sq}*  (default {DEFAULT_SQUAREOFF})")
+            else:
+                body.append(f"Today: default *{DEFAULT_SQUAREOFF}* — no override set")
+            body += ["", f"_Usage:_ `/stradexit time 15:10` · `/stradexit time default`",
+                     f"_Allowed {EARLIEST}–{LATEST}. The session ends 15:15, so a later exit "
+                     f"may not fill; we also run MIS, which the broker squares off itself._"]
+            await update.message.reply_text("\n".join(body), parse_mode=ParseMode.MARKDOWN)
+            return
+
+        arg = args[0].strip().lower()
+
+        # --- clear -------------------------------------------------------------------
+        if arg in ("default", "off", "none", "clear", "reset"):
+            cur = _read_today()
+            had = cur.pop("squareoff_time", None)
+            cur.update({"date": today, "updated_at": _dt.now().isoformat(),
+                        "source": f"telegram:{user.id}"})
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(_json.dumps(cur, indent=2))
+            except Exception as e:
+                logger.exception(f"/stradexit time write failed: {e}")
+                await update.message.reply_text(f"❌ Could not write the command file: {e}")
+                return
+            logger.info("/stradexit time default by %s (was %s)", user.id, had)
+            await update.message.reply_text(
+                f"⏰ Square-off back to *default {DEFAULT_SQUAREOFF}*."
+                + (f"\n_(was {had})_" if had else ""),
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        # --- set ---------------------------------------------------------------------
+        try:
+            hh, mm = (int(x) for x in arg.split(":"))
+            if not (0 <= hh < 24 and 0 <= mm < 60):
+                raise ValueError
+        except (ValueError, TypeError):
+            await update.message.reply_text(
+                f"❌ `{args[0]}` is not a time. Use 24-hour `HH:MM`, e.g. "
+                f"`/stradexit time 15:10`, or `/stradexit time default`.",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        hi = tuple(int(x) for x in LATEST.split(":"))
+        lo = tuple(int(x) for x in EARLIEST.split(":"))
+        if (hh, mm) > hi:
+            await update.message.reply_text(
+                f"❌ *{hh:02d}:{mm:02d} refused* — later than the {LATEST} cap.\n\n"
+                f"The session ends *15:15*, so an exit started at 15:15:00 has no market. A "
+                f"clean 4-leg exit takes ~7s and a retry cycle needs 8s×2. We also run *MIS*, "
+                f"so the broker runs its own auto-square-off — holding to the bell hands the "
+                f"exit to it at market prices.\n\nTry `/stradexit time {LATEST}`.",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+        if (hh, mm) < lo:
+            await update.message.reply_text(
+                f"❌ *{hh:02d}:{mm:02d} refused* — earlier than {EARLIEST}, before the "
+                f"position is reliably established.", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        cur = _read_today()
+        cur["squareoff_time"] = f"{hh:02d}:{mm:02d}"
+        cur.update({"date": today, "updated_at": _dt.now().isoformat(),
+                    "source": f"telegram:{user.id}"})
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_json.dumps(cur, indent=2))
+        except Exception as e:
+            logger.exception(f"/stradexit time write failed: {e}")
+            await update.message.reply_text(f"❌ Could not write the command file: {e}")
+            return
+
+        t, st = cur.get("target_net"), cur.get("stop_net")
+        extra = []
+        if t:
+            extra.append(f"take-profit NET +₹{t:,.0f}")
+        if st:
+            extra.append(f"stop NET −₹{abs(st):,.0f}")
+        logger.info("/stradexit time %s by %s", f"{hh:02d}:{mm:02d}", user.id)
+        await update.message.reply_text(
+            f"⏰ *Square-off moved to {hh:02d}:{mm:02d}* for {today}.\n"
+            f"_Default is {DEFAULT_SQUAREOFF}; this applies to today only._"
+            + (f"\n\nStill armed: {' · '.join(extra)}." if extra else "")
+            + f"\n\n_Note: 15:00–15:15 is the most volatile window of the session "
+              f"(measured avg 1m range 9.6 vs 5.8 midday), so expect worse exit slippage._",
+            parse_mode=ParseMode.MARKDOWN)
 
     def _get_sdk_client(self, telegram_id: int) -> openalgo_api | None:
         """Get or create OpenAlgo SDK client for a user"""

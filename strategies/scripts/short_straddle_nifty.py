@@ -127,6 +127,13 @@ CONSECUTIVE_SL_LIMIT = int(os.getenv("CONSECUTIVE_SL_LIMIT", "2"))
 # a pre-existing one: the 2-minute warning window never covered 14:59).
 # exit_timing_eval.py keeps 15:01 as a candidate so the
 # nine days already traded at 15:01 stay comparable and the change can be measured, not assumed.
+# Latest square-off a /stradexit time override may request. The SESSION ENDS 15:15, so the
+# last tradeable moment is ~15:14:59 -- an exit *initiated* at 15:15:00 has no market. A clean
+# 4-leg exit measured ~7s and a transient failure needs a full retry cycle (8s x2), so 15:12
+# leaves ~3 min of real buffer. Also note PRODUCT defaults to MIS: the broker runs its own
+# auto-square-off, and holding to the bell hands our exit to it at market prices.
+SQUAREOFF_LATEST = os.getenv("SQUAREOFF_LATEST", "15:12")
+SQUAREOFF_EARLIEST = os.getenv("SQUAREOFF_EARLIEST", "09:40")
 SQUAREOFF_HOUR = int(os.getenv("SQUAREOFF_HOUR", "15"))
 SQUAREOFF_MINUTE = int(os.getenv("SQUAREOFF_MINUTE", "0"))
 
@@ -272,6 +279,7 @@ class ShortStraddleBot:
         self.tg_stop_net = None         # exit when net P&L <= this (loss side)
         self.tg_cmd_mtime = None        # mtime of the last command file we parsed
         self.tg_armed_log = []          # every arm/disarm this session, for the journal
+        self.tg_squareoff = None        # (h, m) from /stradexit time, today only
         self.margin_blocked = None      # broker-actual margin, snapshotted at entry
         self.entry_spot = None          # underlying at entry — basis for the payoff projection
         self.entry_ts = None
@@ -971,7 +979,7 @@ class ShortStraddleBot:
 
             if not open_legs:
                 now = datetime.now()
-                near_squareoff = now >= _squareoff_at(now, -2)
+                near_squareoff = now >= self._squareoff_at(now, -2)
                 reason = "EOD auto square-off" if near_squareoff else "manual exit?"
                 log(f"\n[SYNC] All tracked legs flat ({reason}) — resetting")
                 self._clear_position_state()
@@ -1177,6 +1185,26 @@ class ShortStraddleBot:
         """
         return self.margin_blocked
 
+    def _squareoff_at(self, now, offset_min=0):
+        """Square-off instant, honouring a `/stradexit time` override for TODAY.
+
+        Every exit-timing decision in this class routes through here rather than the
+        module-level _squareoff_at(), so the EOD exit, the "near square-off" window and the
+        payoff projection can never disagree about when we intend to be flat. The override is
+        day-scoped by _read_stradexit(), so it cannot leak into a later session.
+        """
+        ov = getattr(self, "tg_squareoff", None)
+        if ov:
+            base = now.replace(hour=ov[0], minute=ov[1], second=0, microsecond=0)
+            return base + timedelta(minutes=offset_min)
+        return _squareoff_at(now, offset_min)
+
+    def _squareoff_label(self):
+        ov = getattr(self, "tg_squareoff", None)
+        if ov:
+            return f"{ov[0]:02d}:{ov[1]:02d}*"        # trailing * = overridden for today
+        return f"{SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}"
+
     def _read_stradexit(self):
         """Re-read the /stradexit command file; update armed thresholds if it changed.
 
@@ -1192,6 +1220,10 @@ class ShortStraddleBot:
                 if self.tg_target_net is not None or self.tg_stop_net is not None:
                     log("[STRADEXIT] command file removed — disarming both sides")
                     self.tg_target_net = self.tg_stop_net = None
+                if self.tg_squareoff:
+                    log("[STRADEXIT] command file removed — square-off back to "
+                        f"{SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}")
+                    self.tg_squareoff = None
                 # Clear the cache unconditionally: if the file is deleted and later recreated,
                 # a stale mtime here could make us skip parsing the new payload entirely.
                 self.tg_cmd_mtime = None
@@ -1207,6 +1239,7 @@ class ShortStraddleBot:
                 if self.tg_target_net is not None or self.tg_stop_net is not None:
                     log(f"[STRADEXIT] command is dated {d.get('date')} not {today} — disarming")
                 self.tg_target_net = self.tg_stop_net = None
+                self.tg_squareoff = None      # a stale extension must never survive the day
                 return
 
             def _num(v):
@@ -1226,6 +1259,40 @@ class ShortStraddleBot:
             if stp is not None and stp > 0:
                 log(f"[STRADEXIT] ignoring positive stop_net {stp:+.0f} (use target_net)")
                 stp = None
+
+            # --- square-off time override (day-scoped, same as the numeric slots) -------
+            # Re-validated HERE and not merely at the Telegram layer: this file is plain JSON
+            # on disk and can be hand-edited, so the process that actually places the exit is
+            # the one that has to refuse an unexecutable time.
+            sq = None
+            raw_sq = d.get("squareoff_time")
+            if raw_sq:
+                try:
+                    hh, mm = (int(x) for x in str(raw_sq).strip().split(":"))
+                    cand = (hh, mm)
+                    lo = tuple(int(x) for x in SQUAREOFF_EARLIEST.split(":"))
+                    hi = tuple(int(x) for x in SQUAREOFF_LATEST.split(":"))
+                    if not (0 <= hh < 24 and 0 <= mm < 60):
+                        log(f"[STRADEXIT] ignoring squareoff_time {raw_sq!r} — not a valid time")
+                    elif cand > hi:
+                        log(f"[STRADEXIT] ignoring squareoff_time {raw_sq} — later than "
+                            f"{SQUAREOFF_LATEST}; the session ends 15:15 and an exit needs buffer")
+                    elif cand < lo:
+                        log(f"[STRADEXIT] ignoring squareoff_time {raw_sq} — earlier than "
+                            f"{SQUAREOFF_EARLIEST}")
+                    else:
+                        sq = cand
+                except (ValueError, TypeError):
+                    log(f"[STRADEXIT] ignoring squareoff_time {raw_sq!r} — expected HH:MM")
+            if sq != self.tg_squareoff:
+                if sq:
+                    log(f"[STRADEXIT] square-off moved to {sq[0]:02d}:{sq[1]:02d} for today "
+                        f"(default {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}) "
+                        f"(source={d.get('source')})")
+                else:
+                    log(f"[STRADEXIT] square-off back to default "
+                        f"{SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}")
+                self.tg_squareoff = sq
 
             if (tgt, stp) != (self.tg_target_net, self.tg_stop_net):
                 self.tg_target_net, self.tg_stop_net = tgt, stp
@@ -1352,7 +1419,7 @@ class ShortStraddleBot:
                 return None
             exp = datetime.strptime(self.traded_expiry, "%d-%b-%y").replace(hour=15, minute=15)
             t0 = self.entry_ts or datetime.now()
-            t1 = _squareoff_at(t0)
+            t1 = self._squareoff_at(t0)
             T0 = (exp - t0).total_seconds() / (365 * 24 * 3600)
             T1 = (exp - t1).total_seconds() / (365 * 24 * 3600)
             if T0 <= 0 or T1 <= 0:
@@ -1438,7 +1505,7 @@ class ShortStraddleBot:
                 lines.append(self._md("_projection assumes IV holds — vega moves it_"))
             lines.append(
                 f"Targets: PT +{PROFIT_TARGET_PCT:.0f}% / SL −{STOPLOSS_PCT:.0f}% · "
-                f"EOD {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d}"
+                f"EOD {self._squareoff_label()}"
             )
             self._tg_notify("\n".join(lines))
         except Exception as e:
@@ -1500,10 +1567,10 @@ class ShortStraddleBot:
             now = datetime.now()
 
             # Time-based square-off
-            if now >= _squareoff_at(now):
+            if now >= self._squareoff_at(now):
                 if self.is_positioned and not self.exit_in_progress:
                     self.exit_in_progress = True
-                    log(f"\n[EOD] {SQUAREOFF_HOUR:02d}:{SQUAREOFF_MINUTE:02d} — closing straddle")
+                    log(f"\n[EOD] {self._squareoff_label()} — closing straddle")
                     self.close_straddle("EOD_SQUAREOFF")
                 continue
 
@@ -1858,7 +1925,7 @@ class ShortStraddleBot:
                 if now.hour >= 16:
                     self.entry_done_today = False
 
-                if now >= _squareoff_at(now, 5):
+                if now >= self._squareoff_at(now, 5):
                     if not self.is_positioned:
                         log("\n[EOD] Post-squareoff — strategy finished for the day.")
                         self.running = False
