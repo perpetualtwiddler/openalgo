@@ -213,19 +213,36 @@ def entry_time(client, day):
 
 
 def log_lines(day):
-    files = sorted(glob.glob(LOG_GLOB.format(ymd=day.strftime("%Y%m%d"))))
-    if not files:
-        return ""
-    with open(files[-1], "rb") as f:
-        return f.read().decode("utf-8", "replace").replace("\r", "\n")
+    """All of today's strategy logs, oldest first.
+
+    Merged rather than files[-1]: restarting openalgo inside the schedule window respawns the
+    strategy and opens a fresh log, so the newest file can be an almost-empty stub. Reading
+    only that one would silently blank the MFE/MAE line and the [STRADEXIT]/[EXIT] tail --
+    i.e. the status check would look fine while telling you nothing. Seen 2026-08-20.
+    """
+    out = []
+    for f in sorted(glob.glob(LOG_GLOB.format(ymd=day.strftime("%Y%m%d")))):
+        with open(f, "rb") as fh:
+            out.append(fh.read().decode("utf-8", "replace").replace("\r", "\n"))
+    return "\n".join(out)
 
 
-def stradexit_state():
+def stradexit_state(today):
+    """The command file, plus whether the STRATEGY will actually honour it.
+
+    The file persists across days; `_read_stradexit()` is day-scoped and disarms anything not
+    dated today. Reporting the raw payload as "armed" would therefore be a lie on any day after
+    it was written -- and a dangerous one, since it invites trading on a target that cannot
+    fire. Return the staleness alongside the payload so the caller must state it.
+    """
     try:
         d = json.loads(ss.STRADEXIT_FILE.read_text())
     except Exception:
         return None
-    return d if d else None
+    if not d:
+        return None
+    d["_stale"] = d.get("date") != today.strftime("%Y-%m-%d")
+    return d
 
 
 # ---------------------------------------------------------------- report
@@ -321,13 +338,24 @@ def render(sn, client, verbose=True):
             print(f"   ceiling {best[1]:+,.0f} at {best[0]:,.0f}")
 
     # ---- armed exits and anything the strategy shouted -----------------------------
-    sx = stradexit_state()
-    if sx:
-        print(f"\n   armed /stradexit: {json.dumps(sx)[:120]}")
+    sx = stradexit_state(t)
+    if sx and sx.pop("_stale"):
+        print(f"\n   /stradexit: NOT ARMED — file is dated {sx.get('date')}, not today."
+              f" The strategy ignores it (day-scoped). Send a fresh /stradexit to arm.")
+    elif sx:
+        tgt, stp = sx.get("target_net"), sx.get("stop_net")
+        bits = [f"take-profit net {tgt:+,.0f}" for _ in (1,) if tgt] + \
+               [f"stop net {stp:+,.0f}" for _ in (1,) if stp]
+        print(f"\n   /stradexit ARMED today: {' · '.join(bits) or 'nothing (both cleared)'}")
     print(f"   targets PT +{ss.PROFIT_TARGET_PCT:.0f}% / SL -{ss.STOPLOSS_PCT:.0f}%")
+    # The strategy logs "Gross P&L: +N" per monitor pass, so these are GROSS excursions.
+    # Netting them needs the round-trip charge, which is what /stradexit actually compares
+    # against -- printing a gross MFE beside an armed NET target invites a wrong read.
     pn = [int(x) for x in re.findall(r"(?:Gross|Net) P&L: ([-+]?\d+)", raw)]
     if pn:
-        print(f"   today (log samples): MFE {max(pn):+,}  MAE {min(pn):+,}")
+        ch = sn.charges()
+        print(f"   today (log samples): MFE {max(pn):+,} gross (~{max(pn)-ch:+,.0f} net)"
+              f"  ·  MAE {min(pn):+,} gross (~{min(pn)-ch:+,.0f} net)")
     for pat, lbl in ((r"\[STRADEXIT\][^\n]*", "STRADEXIT"), (r"\[BREACH\][^\n]*", "BREACH"),
                      (r"\[FEED[^\n]*", "FEED"), (r"\[ERROR\][^\n]*", "ERROR")):
         for m in re.findall(pat, raw)[-2:]:

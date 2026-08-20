@@ -99,10 +99,20 @@ def tradebook_fills(date):
 
 
 def log_text(date):
-    f = sorted(glob.glob(os.path.join(LOGS, f"*straddle*_{date.replace('-', '')}_*")))
-    if not f:
-        return ""
-    return open(f[-1], "rb").read().decode("utf-8", "replace").replace("\r", "\n")
+    """All of the day's strategy logs, oldest first.
+
+    Merged rather than f[-1]: an openalgo restart inside the strategy's schedule window makes
+    APScheduler respawn the subprocess and open a fresh timestamped log. On 2026-08-20 that
+    left a 1.7KB stub next to the real 563KB session log, and reading only the newest meant
+    mfe/mae had "no monitor samples" and silently went unverified. An unverifiable field must
+    never look verified -- and here it did not even look skipped for the right reason.
+    """
+    fs = sorted(glob.glob(os.path.join(LOGS, f"*straddle*_{date.replace('-', '')}_*")))
+    out = []
+    for f in fs:
+        with open(f, "rb") as fh:
+            out.append(fh.read().decode("utf-8", "replace").replace("\r", "\n"))
+    return "\n".join(out)
 
 
 def main(argv):

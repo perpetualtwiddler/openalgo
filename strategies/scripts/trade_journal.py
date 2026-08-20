@@ -218,7 +218,25 @@ def build(date):
     paths = sorted(glob.glob(LOG_GLOB % date.replace("-", "")))
     if not paths:
         return None
-    raw = open(paths[-1], "rb").read().decode("utf-8", "replace").replace("\r", "\n")
+    # CONCATENATE every log for the day, oldest first -- do NOT just take paths[-1].
+    # One trading day can produce several logs: any openalgo restart while the strategy is
+    # inside its schedule window makes APScheduler respawn the subprocess, which opens a
+    # fresh timestamped file. Found 2026-08-20, when a 15:13 restart (schedule_stop 15:20)
+    # created a 1.7KB log alongside the real 563KB session log; taking the newest found no
+    # [ENTRY] and the day was silently skipped with exit status 0 -- a hole in the durable
+    # ledger, from a service restart. Unattended-upgrades has restarted openalgo mid-market
+    # before, so this is not a one-off. Joined in file order, which is chronological because
+    # the names carry HHMMSS; the regexes below all take the FIRST entry / LAST exit, so an
+    # empty tail segment is harmless and a genuine mid-day restart still parses.
+    chunks = []
+    for pth in paths:
+        with open(pth, "rb") as fh:
+            chunks.append(fh.read().decode("utf-8", "replace").replace("\r", "\n"))
+    raw = "\n".join(chunks)
+    if len(paths) > 1:
+        sizes = ", ".join(f"{os.path.basename(x).split('_')[-2]}:{os.path.getsize(x)}B"
+                          for x in paths)
+        print(f"  [note] {date} has {len(paths)} strategy logs, merged ({sizes})")
 
     r = {c: "" for c in COLS}
     r["date"] = date
