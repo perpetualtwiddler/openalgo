@@ -1433,6 +1433,15 @@ class ShortStraddleBot:
             if on_demand or sa.material_change(self._status_prev, snap,
                                                STATUS_NET_DELTA, STATUS_IV_DELTA_PP):
                 self._tg_notify(text)
+                # Log the SEND, not just the skips. Until 2026-08-21 only suppressions and
+                # stale requests were logged, so the log could not answer "did the 10:05 push
+                # fire?" -- the notification path was the one place without an audit trail
+                # while the journal and the charge model had one. The counts also tell us
+                # whether STATUS_NET_DELTA/STATUS_IV_DELTA_PP are set sanely: on day one there
+                # were 7 suppressions and an unknown number of sends.
+                _iv = f"{snap['iv'] * 100:.2f}%" if snap.get("iv") is not None else "n/a"
+                log(f"[STATUS] pushed ({'on-demand' if on_demand else 'periodic'}) — "
+                    f"net {snap['net']:+,.0f}, IV {_iv}")
                 self._status_prev = snap
             else:
                 log(f"[STATUS] suppressed — net {snap['net']:+,.0f} and IV unchanged "

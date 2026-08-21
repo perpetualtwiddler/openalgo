@@ -347,6 +347,45 @@ def render(sn, client, verbose=True):
 
 
 # ---------------------------------------------------------------- entry point
+def audit(day):
+    """Count the day's notification outcomes, so the thresholds are validated not assumed.
+
+    Reads the strategy's own log rather than any separate counter — one source of truth, and
+    it survives a strategy restart because log_lines() merges every log for the date.
+    """
+    raw = log_lines(day)
+    if not raw:
+        print(f"  no strategy log for {day:%Y-%m-%d}")
+        return 1
+    pushed = re.findall(r"\[STATUS\] pushed \((\w[\w-]*)\) — net ([-+][\d,]+), IV (\S+)", raw)
+    supp = re.findall(r"\[STATUS\] suppressed — net ([-+][\d,]+)", raw)
+    stale = re.findall(r"\[STATUS\] ignoring a stale request \((\d+)s old\)", raw)
+    print(f"\n  === status notifications · {day:%Y-%m-%d} ===\n")
+    print(f"   pushed          {len(pushed):>3}"
+          + (f"   ({sum(1 for k, *_ in pushed if k == 'periodic')} periodic, "
+             f"{sum(1 for k, *_ in pushed if k == 'on-demand')} on-demand)" if pushed else ""))
+    print(f"   suppressed      {len(supp):>3}")
+    print(f"   stale rejected  {len(stale):>3}")
+    total = len(pushed) + len(supp)
+    if total:
+        print(f"\n   send rate {100 * len(pushed) / total:.0f}% of the {total} periodic checks")
+        print(f"   thresholds in force: net ±{ss.STATUS_NET_DELTA:,.0f} · IV "
+              f"{ss.STATUS_IV_DELTA_PP}pp · every {ss.STATUS_NOTIFY_MIN}min")
+        if len(pushed) and len(supp) / total > 0.8:
+            print("   ⚠ suppressing >80% — consider lowering STATUS_NET_DELTA if you want more")
+        if total and not supp:
+            print("   ⚠ nothing suppressed — the gate may be too loose to be doing anything")
+    if pushed:
+        print("\n   sends:")
+        for kind, net, iv in pushed:
+            print(f"     {kind:<10} net {net:>8}  IV {iv}")
+    if not pushed and supp:
+        print("\n   ⚠ zero sends logged. Send-logging landed 2026-08-21 and only takes effect")
+        print("     from the next 09:15 spawn, so for 08-21 and earlier the send count is")
+        print("     UNKNOWABLE, not zero (backlog #13). Trust this figure from 08-22 on.")
+    return 0
+
+
 def sleep_until(hhmm):
     tgt = datetime.strptime(hhmm, "%H:%M").time()
     while True:
@@ -365,7 +404,12 @@ def main(argv=None):
     ap.add_argument("--alert-below", type=float)
     ap.add_argument("--alert-above", type=float)
     ap.add_argument("--quiet", action="store_true", help="one line per poll while watching")
+    ap.add_argument("--audit", action="store_true",
+                    help="count status pushes / suppressions / stale requests for the day")
     a = ap.parse_args(argv)
+
+    if a.audit:
+        return audit(now_ist())
 
     client = api(api_key=get_api_key_for_tradingview("admin"),
                  host=os.getenv("OPENALGO_HOST", "http://127.0.0.1:5000"))
