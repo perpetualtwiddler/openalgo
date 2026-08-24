@@ -91,6 +91,20 @@ a P&L threshold cannot distinguish a gain built on theta from one built on rente
 hold-to-close outcome. Until then it is one good call, not an edge. Risk of acting early is
 classic overfitting to a vivid single day.
 
+### 🧪 `test_analytics_xlsx.py` — the analytics workbook is RECALCULATED, not inspected
+
+openpyxl writes formulas as strings and never evaluates them, so a workbook can be structurally perfect and arithmetically wrong — reading the file back proves nothing. Two real defects were caught only by evaluating:
+
+- `straddle-income-growth-analysis.xlsx` once had ~600 cells missing the leading `=`; they would have opened in Excel as literal **text**. Structure looked fine.
+- The Projection taxes `MAX(0, profit)`. An earlier throwaway version of this check applied the 31.2% rate unconditionally, so it disagreed with the sheet on **2026-08-24**, our first negative projection month. **The workbook was right and the check was wrong** — and because the check lived in a scratchpad, that fix would have been lost. That is why it is now a tracked test.
+
+24 assertions, every expectation recomputed from `log/trade_journal.csv` independently of the workbook, so it is a genuine cross-check rather than the sheet agreeing with itself. `formulas` is a heavy dependency and not needed at runtime, so:
+
+    python -m venv .venv-xl && .venv-xl/bin/pip install formulas openpyxl
+    .venv-xl/bin/python strategies/scripts/test_analytics_xlsx.py
+
+Without it the run **SKIPS loudly and says the analytics were NOT verified**, exiting 3 rather than 0 — same principle as `validate_journal.py` reporting skipped checks instead of passing them. An unverified number must never look verified.
+
 ### 🔬 CORRECTION — our vol convexity is FAVOURABLE, not adverse (measured 2026-08-21)
 
 This document and my own reasoning had it backwards. Measured on the live 4-DTE position at 10:36, spot held fixed:
