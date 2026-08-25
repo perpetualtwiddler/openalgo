@@ -1,0 +1,41 @@
+algo.oftenuncertain.net {
+    # ── #11: ingress allowlist on the TRANSACTIONAL /api/v1 endpoints ────────────────
+    # Threat this closes: SEBI static-IP whitelisting means the BROKER rejects orders from
+    # anywhere but this box — so a leaked API key is useless from an attacker's machine, but
+    # perfectly usable routed THROUGH here, which holds the whitelisted IP. These 13 paths can
+    # place, modify, cancel or close real positions.
+    #
+    # Deliberately path-scoped, not a blanket /api/v1 deny. Traffic logs show the external
+    # hits are Mandar's own browser driving the UI — 66,548 /api/v1/multiquotes, 3,324
+    # /api/v1/positionbook, alongside /auth/csrf-token and /sounds/alert.mp3. A blanket deny
+    # would break the remote UI while missing the point; there has never been a single
+    # order-placing call from an external IP.
+    #
+    # Safe by construction:
+    #   * the strategy talks to 127.0.0.1:5000 DIRECTLY, never through Caddy, so no Caddy
+    #     change can affect live trading;
+    #   * the UI's Close/Close-All kill switch is POST /close_position (a session-authenticated
+    #     blueprint at root), NOT /api/v1/closeposition — so it is untouched;
+    #   * read-only endpoints stay reachable, so the UI keeps working from Mandar's rotating
+    #     ISP address (39 distinct 106.215.x IPs since May, ~1/day — which is exactly why this
+    #     does NOT try to allowlist his IP).
+    @txn_from_outside {
+        path /api/v1/placeorder* /api/v1/placesmartorder* /api/v1/basketorder* /api/v1/splitorder*
+        path /api/v1/modifyorder* /api/v1/cancelorder* /api/v1/cancelallorder*
+        path /api/v1/closeposition* /api/v1/optionsorder* /api/v1/optionsmultiorder*
+        path /api/v1/placegttorder* /api/v1/modifygttorder* /api/v1/cancelgttorder*
+        not remote_ip 127.0.0.1 ::1 109.123.248.99
+    }
+    respond @txn_from_outside "forbidden" 403
+
+    # 127.0.0.1, not `localhost`: localhost can resolve to ::1 first and the upstream may not
+    # be listening on IPv6. Same IPv6-preference trap that bit the Caddy setup on the other box.
+    reverse_proxy 127.0.0.1:5000
+
+    @websocket {
+        path /ws
+        path /ws/*
+        path /socket.io/*
+    }
+    reverse_proxy @websocket 127.0.0.1:8765
+}
