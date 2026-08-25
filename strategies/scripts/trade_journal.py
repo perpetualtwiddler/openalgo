@@ -273,12 +273,18 @@ def build(date):
         r["entry_time"] = m.group(2)
 
     # ---- premium block
-    m = re.search(r"Gross premium: (\d+) \| Hedge cost: (\d+)", raw)
+    # `\d+(?:\.\d+)?` parses BOTH the pre-2026-08-25 integer logs and the 2dp ones that
+    # replaced them. Stored as 2dp FLOATS, not ints: these three are one quantity split in
+    # two, and truncating each independently broke `premium = gross - hedge` by Rs1 on
+    # 2026-08-25 -- validate_journal.py was right to call it. int() would also raise on a
+    # decimal string, so the cast has to change with the format.
+    m = re.search(r"Gross premium: (\d+(?:\.\d+)?) \| Hedge cost: (\d+(?:\.\d+)?)", raw)
     if m:
-        r["gross_premium"], r["hedge_cost"] = int(m.group(1)), int(m.group(2))
-    m = re.search(r"Net premium collected: (\d+)", raw)
+        r["gross_premium"] = round(float(m.group(1)), 2)
+        r["hedge_cost"] = round(float(m.group(2)), 2)
+    m = re.search(r"Net premium collected: (\d+(?:\.\d+)?)", raw)
     if m:
-        r["premium_collected"] = int(m.group(1))
+        r["premium_collected"] = round(float(m.group(1)), 2)
 
     # ---- margin
     for row in _rd(MARGIN_CSV):

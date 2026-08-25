@@ -153,7 +153,22 @@ def main(argv):
         # ---- premium identity
         gp, hc, pc = num(r["gross_premium"]), num(r["hedge_cost"]), num(r["premium_collected"])
         if gp is not None and hc is not None and pc is not None:
-            R.check(d, "premium = gross - hedge", pc, gp - hc)
+            # Pre-2026-08-25 the strategy logged all three of these with :.0f, so each was
+            # rounded independently and the identity can be off by up to Rs1 (it is, on
+            # 08-06 / 08-18 / 08-25 -- 3 of 11 days). The logs are the only source and they
+            # only ever held integers, so those rows are UNREPAIRABLE. Fixed at source from
+            # 2026-08-25 (2dp logging), but the history stays. Tolerate exactly Rs1 here and
+            # SAY SO when it is used -- a validator that reports a known artefact as a
+            # MISMATCH every run teaches you to skim past it, and that is how a real
+            # mismatch eventually goes unnoticed. Nothing depends on this field: net_pnl is
+            # derived from fills, not from premium.
+            gap = abs(pc - (gp - hc))
+            if TOL < gap <= 1.01:
+                print(f"    ≈  {'premium = gross - hedge':<22} off by {pc - (gp - hc):+.2f} — "
+                      f"integer-log rounding artefact (pre-2026-08-25), tolerated")
+                R.ok += 1
+            else:
+                R.check(d, "premium = gross - hedge", pc, gp - hc)
         else:
             R.skipped(d, "premium identity", "premium fields blank (partial-entry day)")
 

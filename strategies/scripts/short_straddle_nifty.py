@@ -811,8 +811,14 @@ class ShortStraddleBot:
                 if ENABLE_HEDGE:
                     log(f"  CE BUY:  {self.hedge_ce_symbol} @ {self.hedge_ce_price:.2f}")
                     log(f"  PE BUY:  {self.hedge_pe_symbol} @ {self.hedge_pe_price:.2f}")
-                    log(f"  Gross premium: {gross_premium:.0f} | Hedge cost: {hedge_cost:.0f}")
-                log(f"  Net premium collected: {self.total_premium:.0f}")
+                    # 2dp, not :.0f — these three are the SAME quantity split in two, and
+                    # rounding each independently breaks the identity. On 2026-08-25 the log
+                    # read 34047 - 4972 = 29075 while the true net rounded to 29074, and
+                    # validate_journal.py correctly reported a MISMATCH on a Rs1 artefact. A
+                    # validator that cries wolf gets ignored, and that is how a real mismatch
+                    # eventually slips through -- so fix the precision, not the tolerance.
+                    log(f"  Gross premium: {gross_premium:.2f} | Hedge cost: {hedge_cost:.2f}")
+                log(f"  Net premium collected: {self.total_premium:.2f}")
                 log(f"  Profit target ({PROFIT_TARGET_PCT}%): +{self.total_premium * PROFIT_TARGET_PCT / 100:.0f}")
                 log(f"  Stop-loss ({STOPLOSS_PCT}%): -{self.total_premium * STOPLOSS_PCT / 100:.0f}")
                 # --- short-strike breach: re-center on the ACTUAL sold ATM strike + draw the map ---
