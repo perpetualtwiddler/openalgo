@@ -342,8 +342,16 @@ def build(date):
     # ---- /stradexit: what was armed from Telegram, and did it fire?
     # Blank on days before the feature existed, and on days nothing was armed — that is
     # meaningful (no discretionary call made), not missing data.
-    arms = re.findall(r"([\d:]{8})\s+\[STRADEXIT\] (take-profit at NET \+Rs[\d,]+|stop at NET "
-                      r"[-+][\d,]+|take-profit at NET \+Rs[\d,]+ · stop at NET [-+][\d,]+|DISARMED[^\n]*)", raw)
+    # LONGEST ALTERNATIVE FIRST. Python re is first-match-wins, not longest-match, so with the
+    # bare "take-profit …" branch listed ahead of the combined "take-profit … · stop …" branch
+    # it matched the PREFIX and silently truncated the stop away — tg_stop_net came out blank on
+    # every day both sides were armed (found 2026-08-27, when the log plainly read
+    # "take-profit at NET +Rs900 · stop at NET -1,500" and the journal recorded no stop).
+    arms = re.findall(r"([\d:]{8})\s+\[STRADEXIT\] "
+                      r"(take-profit at NET \+Rs[\d,]+ · stop at NET [-+][\d,]+"
+                      r"|take-profit at NET \+Rs[\d,]+"
+                      r"|stop at NET [-+][\d,]+"
+                      r"|DISARMED[^\n]*)", raw)
     if arms:
         r["tg_armed_at"] = arms[0][0]
         last = arms[-1][1]
