@@ -161,6 +161,49 @@ def theta_per_hour(legs, spot, T, ivs, charges_fn):
 
 
 # ──────────────────────────────────────────────────────────── Telegram formatting
+def pit_snapshot(*, now, spot, atm, dte, breach_lo, breach_hi, legs, charges_fn,
+                 exp, exit_at, entry_spot, entry_ts, armed_target=None, armed_stop=None):
+    """Every point-in-time variable we compute, as a flat dict.
+
+    Exists so the Telegram message and the PIT log are the SAME numbers rather than two
+    computations that can drift. The message renders a subset; the CSV keeps all of it.
+
+    This is the dataset for backlog #7b — a dynamic exit rule is a function from PIT state to
+    action, and fitting one needs paired observations of (state, what the day went on to do).
+    Until now the push computed 15 variables and logged 2, so every checkpoint was thrown away.
+    """
+    T_now = years_to(exp, now)
+    T_exit = years_to(exp, exit_at)
+    T_entry = years_to(exp, entry_ts)
+    marks = {lg["symbol"]: lg["mark"] for lg in legs}
+    ivs = leg_ivs(legs, spot, T_now)
+    g = gross_at(legs, marks)
+    ch = charges_fn(_roundtrip_fills(legs, marks))
+    comp = composition(legs, spot, T_now, entry_spot, T_entry, marks)
+    iv_now, iv_ent = atm_iv(legs, ivs), atm_iv(legs, comp["entry_ivs"])
+    pj = projection(legs, atm, T_exit, ivs, charges_fn)
+    base = net_at(legs, price_all(legs, spot, T_exit, ivs), charges_fn)
+    bumped = net_at(legs, price_all(legs, spot + 20, T_exit, ivs), charges_fn)
+    return {
+        "date": f"{now:%Y-%m-%d}", "time": f"{now:%H:%M:%S}", "dte": dte,
+        "spot": round(spot, 2), "atm": atm, "spot_minus_atm": round(spot - atm, 2),
+        "breach_room": round(min(abs(spot - breach_lo), abs(spot - breach_hi)), 1),
+        "gross": round(g, 2), "charges": round(ch, 2), "net": round(g - ch, 2),
+        "iv_now": round(iv_now * 100, 3) if iv_now else "",
+        "iv_entry": round(iv_ent * 100, 3) if iv_ent else "",
+        "iv_delta_pp": round((iv_now - iv_ent) * 100, 3) if (iv_now and iv_ent) else "",
+        "durable": round(comp["durable"], 2), "reversible": round(comp["reversible"], 2),
+        "vega_per_pp": round(abs(vega_per_pp(legs, spot, T_now, ivs, charges_fn)), 1),
+        "theta_per_hr": round(theta_per_hour(legs, spot, T_now, ivs, charges_fn), 1),
+        "rupees_per_point": round(abs(bumped - base) / 20, 2),
+        "ceiling": round(pj["ceiling"], 1) if pj else "",
+        "golden": pj["golden"] if pj else "", "band_lo": pj["lo"] if pj else "",
+        "band_hi": pj["hi"] if pj else "",
+        "hours_to_exit": round((exit_at - now).total_seconds() / 3600, 2),
+        "armed_target": armed_target or "", "armed_stop": armed_stop or "",
+    }
+
+
 def format_status(*, now, spot, atm, dte, breach_lo, breach_hi, legs, charges_fn,
                   exp, exit_at, entry_spot, entry_ts, armed_target=None, armed_stop=None,
                   mfe_net=None, mae_net=None, md=lambda s: s):

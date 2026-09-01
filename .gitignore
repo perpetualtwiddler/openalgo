@@ -98,3 +98,6 @@ log/straddle_command.json
 
 # Account opening balance — never in git (the mkds remote is a PUBLIC fork)
 log/opening_cash.txt
+
+# PIT snapshots — live position state, never in git (public fork)
+log/pit_snapshots.csv

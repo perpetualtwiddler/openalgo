@@ -143,6 +143,10 @@ STATUS_REQUEST_FILE = Path(os.getenv("STATUS_REQUEST_FILE",
                                      str(Path(__file__).resolve().parents[2]
                                          / "log" / "straddle_status_request.json")))
 STATUS_REQUEST_MAX_AGE = int(os.getenv("STATUS_REQUEST_MAX_AGE", "120"))
+# Point-in-time snapshots (backlog #7b). Written on EVERY status check, including the ones
+# suppressed as unchanged: suppression is about notification noise, not data value, and a
+# quiet checkpoint is exactly as useful for fitting an exit rule as a loud one.
+PIT_CSV = Path(os.getenv("PIT_CSV", str(Path(__file__).resolve().parents[2] / "log" / "pit_snapshots.csv")))
 
 # /straddle lots — per-day size override. MAX is a guard against a fat-finger, not a margin
 # calculation: the broker rejects an unaffordable basket anyway, but a mistyped "20" should be
@@ -1479,6 +1483,38 @@ class ShortStraddleBot:
             mfe_net=None, mae_net=None, md=self._md)
         return text, snap
 
+    def _log_pit(self, now, spot, net_pnl, kind):
+        """Append one PIT row. Best-effort and fully guarded — this is data collection sharing
+        a loop with the code that enforces PT/SL/breach, and must never be able to stop it."""
+        try:
+            import csv as _csv
+
+            import straddle_analytics as sa
+
+            legs = self._status_legs()
+            if not legs or not self.traded_expiry:
+                return
+            exp = datetime.strptime(self.traded_expiry, "%d-%b-%y").replace(hour=15, minute=15)
+            b = (self.atm_strike * BREACH_PCT / 100) if BREACH_PCT else 0
+            row = sa.pit_snapshot(
+                now=now, spot=spot or self.entry_spot, atm=self.atm_strike, dte=self.traded_dte,
+                breach_lo=self.atm_strike - b, breach_hi=self.atm_strike + b, legs=legs,
+                charges_fn=lambda f: __import__("charges").charges_from_fills(f, True),
+                exp=exp, exit_at=self._squareoff_at(now), entry_spot=self.entry_spot,
+                entry_ts=self.entry_ts or now, armed_target=self.tg_target_net,
+                armed_stop=self.tg_stop_net)
+            row["kind"] = kind          # periodic | on-demand | suppressed
+            row["lots"] = LOTS
+            PIT_CSV.parent.mkdir(parents=True, exist_ok=True)
+            new = not PIT_CSV.exists()
+            with open(PIT_CSV, "a", newline="") as f:
+                w = _csv.DictWriter(f, fieldnames=list(row))
+                if new:
+                    w.writeheader()
+                w.writerow(row)
+        except Exception as e:
+            log(f"[PIT] snapshot skipped (non-fatal): {e}")
+
     def _status_requested(self):
         """True once per new on-demand request file.
 
@@ -1520,6 +1556,12 @@ class ShortStraddleBot:
             text, snap = self._status_message(now, spot, net_pnl)
             if not text:
                 return
+            # Recorded before the send/suppress decision, so the dataset does not inherit the
+            # notification gate's bias toward days that moved.
+            will_send = on_demand or sa.material_change(self._status_prev, snap,
+                                                        STATUS_NET_DELTA, STATUS_IV_DELTA_PP)
+            self._log_pit(now, spot, net_pnl,
+                          "on-demand" if on_demand else ("periodic" if will_send else "suppressed"))
             # On-demand always answers. The periodic push is gated on material movement, and
             # compares against the last SENT snapshot so a slow drift still eventually reports.
             if on_demand or sa.material_change(self._status_prev, snap,
