@@ -120,8 +120,19 @@ def main():
     ck("top-2 concentration", cell("Live Status", "B39"), sum(top2) / net)
 
     print("\n  --- Monthly + equity curve ---")
-    ck("month net", cell("Monthly", "F5"), net, 0.01)
-    ck("month days", cell("Monthly", "B5"), len(rows))
+    # Row 5 is the FIRST month, not the whole journal. These asserted against the grand total
+    # and passed only while every row happened to fall in one month; they broke the moment
+    # 2026-09-01 landed. Split by month key so the check keeps meaning what it says.
+    import collections
+    by_month = collections.OrderedDict()
+    for r in rows:
+        by_month.setdefault(r["date"][:7], []).append(float(r["net_pnl"] or 0))
+    for i, (mk, vals) in enumerate(by_month.items()):
+        row = 5 + i
+        ck(f"month {mk} label", cell("Monthly", f"A{row}"), mk)
+        ck(f"month {mk} days", cell("Monthly", f"B{row}"), len(vals))
+        ck(f"month {mk} net", cell("Monthly", f"F{row}"), sum(vals), 0.01)
+    ck("months add to the total", sum(sum(v) for v in by_month.values()), net, 0.01)
     ck("final cumulative", cell("Chart · Equity", f"C{4 + len(rows)}"), net, 0.01)
 
     print("\n  --- Projection, month 1 ---")
