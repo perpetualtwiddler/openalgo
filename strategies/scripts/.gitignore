@@ -25,6 +25,7 @@
 !test_analytics_xlsx.py
 !wing_width_sweep.py
 !exit_level_sweep.py
+!dte_analysis.py
 !test_analytics_equiv.py
 !straddle_analytics.py
 !ema_crossover_banknifty_3m_20260617.py
