@@ -1289,11 +1289,21 @@ class ShortStraddleBot:
             want, why = auto, f"{self.traded_dte} DTE -> half size (backlog #17)"
         if cfg.get("lots") is not None:
             want = cfg["lots"]
-            why = (f"/straddle lots {want}" + (f" (overrides the {auto}-lot 1-DTE default)"
-                                               if auto is not None and auto != want else ""))
+            why = (f"/straddle lots {want}"
+                   + (f" — OVERRIDES the {auto}-lot {self.traded_dte}-DTE half-size rule"
+                      if auto is not None and auto != want else ""))
+        # Log whenever a RULE was applied, not only when the number changed. Otherwise the one
+        # case that most needs recording is silent: on a 1-DTE day with an explicit
+        # `/straddle lots 2`, `want` equals the default so nothing was written, and the log gave
+        # no way to tell whether the half-size rule had applied or been overridden. Found
+        # 2026-09-01 when Mandar asked exactly that question.
         if want != LOTS:
             LOTS, QUANTITY = want, LOT_SIZE * want
+        if why:
             log(f"[STRADDLE] size for today: {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty — {why}")
+        else:
+            log(f"[STRADDLE] size for today: {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty "
+                f"— configured default, no override and no DTE rule")
         return why
 
     def _squareoff_at(self, now, offset_min=0):
