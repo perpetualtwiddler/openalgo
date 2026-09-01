@@ -10,7 +10,20 @@ import charges as chg
 import short_straddle_nifty as ss
 import straddle_analytics as sa
 
-golden = json.load(open("/tmp/golden.json"))
+# GOLDEN REFERENCE — captured 2026-08-19 from short_straddle_nifty._payoff_projection()
+# BEFORE it was refactored to delegate to straddle_analytics. Embedded rather than read from
+# /tmp: the file was cleaned up and this test then died with FileNotFoundError on every run,
+# which is worse than having no test — a golden-reference check whose reference is in a temp
+# directory is a one-shot, not a regression test. These numbers must NEVER be regenerated from
+# current code; that would make the test compare the new implementation against itself.
+golden = {
+    "20260820": {"golden": 24180, "ceiling": 152.52035268288222, "lo": 24150, "hi": 24210},
+    "20260820_bs": 112.78301210671816,
+    "20260820_iv": 0.10813349580530385,
+    "20260819": {"golden": 24020, "ceiling": 279.51113173689896, "lo": 23965, "hi": 24075},
+    "20260819_bs": 112.78301210671816,
+    "20260819_iv": 0.09642978605547092,
+}
 QTY = 130
 CASES = {
  "20260820": dict(atm=24200, exp=datetime(2026,8,25,15,15), spot=24198.20,

@@ -47,6 +47,13 @@ logger = get_logger(__name__)
 # other (the strategy runs as a subprocess; the bot lives inside gunicorn). The strategy
 # re-validates independently, so a drift here can only ever be more restrictive at the
 # Telegram layer, never permissive. test_stradexit_time.py asserts the two agree.
+# /straddle — entry-parameter commands. ENTRY_* must match short_straddle_nifty.py; the
+# strategy re-validates everything independently, so a drift here can only be more restrictive.
+ENTRY_HHMM = (int(os.getenv("ENTRY_HOUR", "9")), int(os.getenv("ENTRY_MINUTE", "35")))
+LOTS_MIN = int(os.getenv("LOTS_MIN", "1"))
+LOTS_MAX = int(os.getenv("LOTS_MAX", "6"))
+DEFAULT_LOTS = int(os.getenv("LOTS", "2"))
+
 SQUAREOFF_LATEST = os.getenv("SQUAREOFF_LATEST", "15:12")
 SQUAREOFF_EARLIEST = os.getenv("SQUAREOFF_EARLIEST", "09:40")
 DEFAULT_SQUAREOFF = (f'{int(os.getenv("SQUAREOFF_HOUR", "15")):02d}:'
@@ -216,6 +223,155 @@ class TelegramBotService:
 
         logger.info("/stradexit by %s -> target=%s stop=%s", user.id, t, s)
         await update.message.reply_text(body, parse_mode=ParseMode.MARKDOWN)
+
+    async def cmd_straddle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/straddle — entry-side controls for today's trade.
+
+            /straddle                 report today's configuration and what actually traded
+            /straddle lots N          set the day's lot count      (before 09:35 only)
+            /straddle lots            report configured vs traded lots
+            /straddle skip            skip today's entry           (before 09:35 only)
+            /straddle skip off        cancel a skip                (before 09:35 only)
+
+        `skip` does NOT stop the strategy: it stays running, keeps monitoring, and resumes
+        automatically tomorrow. Stopping the strategy is a different, stickier action.
+
+        Written into the same day-stamped command file as /stradexit, so it evaporates at
+        midnight and yesterday's skip can never cancel this morning's trade. Anything that
+        changes the SIZE or WHETHER we trade is refused after 09:35 — by then the order is
+        already placed, and accepting it would imply a change we cannot make.
+        """
+        import json as _json
+        from datetime import datetime as _dt
+        from pathlib import Path as _Path
+
+        from telegram.constants import ParseMode
+
+        user = update.effective_user
+        if not get_telegram_user(user.id):
+            await update.message.reply_text("❌ Please link your account first using /link")
+            return
+
+        path = _Path(os.getenv("STRADEXIT_FILE",
+                               "/root/data/openalgo/log/straddle_command.json"))
+        today = _dt.now().strftime("%Y-%m-%d")
+        now = _dt.now()
+        before_entry = (now.hour, now.minute) < ENTRY_HHMM
+
+        def read_today():
+            try:
+                if path.exists():
+                    prev = _json.loads(path.read_text())
+                    if prev.get("date") == today:
+                        return prev
+            except Exception:
+                pass
+            return {}
+
+        def write(cur, msg):
+            cur.update({"date": today, "updated_at": _dt.now().isoformat(),
+                        "source": f"telegram:{user.id}"})
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(_json.dumps(cur, indent=2))
+            except Exception as e:
+                logger.exception(f"/straddle write failed: {e}")
+                return f"❌ Could not write the command file: {e}"
+            return msg
+
+        def too_late(what):
+            return (f"❌ *Too late for {what}.* Entry runs at "
+                    f"{ENTRY_HHMM[0]:02d}:{ENTRY_HHMM[1]:02d} and it is now "
+                    f"{now:%H:%M}. Today's position is already decided — this would only "
+                    f"pretend to change something.\n\nUse `/stradexit` to manage the exit "
+                    f"instead, or set this before 09:35 tomorrow.")
+
+        args = [a.strip().lower() for a in (context.args or [])]
+        cur = read_today()
+
+        # ---- live position, so a report can say what ACTUALLY traded -----------------
+        legs, traded_qty = [], None
+        try:
+            client = self._get_sdk_client(user.id)
+            pb = (client.positionbook().get("data") or []) if client else []
+            legs = [p for p in pb if int(float(p.get("quantity") or 0)) != 0
+                    and (p.get("symbol") or "").startswith("NIFTY")]
+            if legs:
+                traded_qty = max(abs(int(float(p["quantity"]))) for p in legs)
+        except Exception:
+            pass
+
+        # ---- bare /straddle, or /straddle lots -> report -----------------------------
+        if not args or args == ["lots"]:
+            cfg_lots = cur.get("lots")
+            body = ["🎯 *Straddle — today's setup*", ""]
+            body.append(f"Configured lots: *{cfg_lots if cfg_lots else DEFAULT_LOTS}*"
+                        + ("" if cfg_lots else " (default)"))
+            if traded_qty:
+                body.append(f"Actually trading: *{traded_qty // 65} lot(s)* = {traded_qty} qty")
+            elif cur.get("skip"):
+                body.append("Actually trading: *nothing — skipped today*")
+            else:
+                body.append("Actually trading: *flat* "
+                            + ("(entry not reached yet)" if before_entry else "(no entry today)"))
+            if cur.get("skip"):
+                body.append("\n⏭️ *SKIP is set for today.*")
+            body += ["", f"_Usage:_ `/straddle lots 1` · `/straddle skip` · `/straddle skip off`",
+                     f"_Settable until {ENTRY_HHMM[0]:02d}:{ENTRY_HHMM[1]:02d}; applies to "
+                     f"{today} only._"]
+            await update.message.reply_text("\n".join(body), parse_mode=ParseMode.MARKDOWN)
+            return
+
+        # ---- /straddle skip [off] ----------------------------------------------------
+        if args[0] == "skip":
+            off = len(args) > 1 and args[1] in ("off", "no", "false", "cancel", "default")
+            if not before_entry:
+                await update.message.reply_text(too_late("changing skip"),
+                                                parse_mode=ParseMode.MARKDOWN)
+                return
+            if off:
+                cur.pop("skip", None)
+                msg = "▶️ *Skip cancelled* — the straddle will trade today as normal."
+            else:
+                cur["skip"] = True
+                msg = ("⏭️ *Straddle will SKIP today.*\nThe strategy keeps running and "
+                       "resumes automatically tomorrow — it is not stopped.")
+            logger.info("/straddle skip%s by %s", " off" if off else "", user.id)
+            await update.message.reply_text(write(cur, msg), parse_mode=ParseMode.MARKDOWN)
+            return
+
+        # ---- /straddle lots N --------------------------------------------------------
+        if args[0] == "lots":
+            if not before_entry:
+                await update.message.reply_text(too_late("changing lot size"),
+                                                parse_mode=ParseMode.MARKDOWN)
+                return
+            try:
+                n = int(args[1])
+            except (IndexError, ValueError):
+                await update.message.reply_text(
+                    f"❌ `{' '.join(args[1:]) or '(nothing)'}` is not a whole number of lots. "
+                    f"Try `/straddle lots 1`.", parse_mode=ParseMode.MARKDOWN)
+                return
+            if not (LOTS_MIN <= n <= LOTS_MAX):
+                await update.message.reply_text(
+                    f"❌ *{n} lots refused* — allowed range is {LOTS_MIN}–{LOTS_MAX}. "
+                    f"This is a fat-finger guard, not a margin check; the broker would reject "
+                    f"an unaffordable basket anyway.", parse_mode=ParseMode.MARKDOWN)
+                return
+            cur["lots"] = n
+            logger.info("/straddle lots %s by %s", n, user.id)
+            note = ("\n\n_Note: 1-DTE days halve size automatically (backlog #17). "
+                    "This overrides that._") if n != DEFAULT_LOTS else ""
+            await update.message.reply_text(
+                write(cur, f"📐 *Today's size: {n} lot(s)* = {n * 65} qty.\n"
+                           f"_Applies to {today} only; back to {DEFAULT_LOTS} tomorrow._" + note),
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        await update.message.reply_text(
+            "❌ Unknown. Use `/straddle`, `/straddle lots N`, `/straddle skip`, "
+            "or `/straddle skip off`.", parse_mode=ParseMode.MARKDOWN)
 
     async def cmd_stradstatus(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/stradstatus — ask the running straddle for a live status push.
@@ -1079,6 +1235,7 @@ class TelegramBotService:
                 self.application.add_handler(CommandHandler("mode", self.cmd_mode))
                 self.application.add_handler(CommandHandler("stradexit", self.cmd_stradexit))
                 self.application.add_handler(CommandHandler("stradstatus", self.cmd_stradstatus))
+                self.application.add_handler(CommandHandler("straddle", self.cmd_straddle))
                 self.application.add_handler(CommandHandler("menu", self.cmd_menu))
 
                 # Add callback query handler for inline buttons

@@ -22,6 +22,7 @@
 !test_straddle_filters.py
 !test_stradexit_time.py
 !test_status_push.py
+!test_straddle_cmds.py
 !test_analytics_xlsx.py
 !wing_width_sweep.py
 !exit_level_sweep.py

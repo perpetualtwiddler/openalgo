@@ -209,6 +209,14 @@ def format_status(*, now, spot, atm, dte, breach_lo, breach_hi, legs, charges_fn
                      f"({pj['hi'] - pj['lo']:,.0f} pts)")
         else:
             L.append("  ⚠ no profitable spot at this IV")
+    try:
+        adv = exit_advice(legs=legs, spot=spot, atm=atm, dte=dte, T_now=T_now, T_exit=T_exit,
+                          ivs=ivs, charges_fn=charges_fn,
+                          breach_lo=breach_lo, breach_hi=breach_hi)
+        L += format_exit_advice(adv, dte, md)
+    except Exception:
+        pass          # advice is a nicety; never let it cost us the status message
+
     if armed_target or armed_stop:
         bits = []
         if armed_target:
@@ -224,6 +232,64 @@ def format_status(*, now, spot, atm, dte, breach_lo, breach_hi, legs, charges_fn
         L.append(f"Today: MFE {mfe_net:+,.0f} net · MAE {mae_net:+,.0f} net")
     L.append(md("_projection assumes IV holds — vega moves it_"))
     return "\n".join(L)
+
+
+def exit_advice(*, legs, spot, atm, dte, T_now, T_exit, ivs, charges_fn,
+                breach_lo, breach_hi, fill_shortfall=70.0, stop_frac=0.60):
+    """Point-in-time exit guidance (#19) — what today can actually pay, and where to cut.
+
+    Deliberately shows a LADDER rather than one number. A single "suggested target" would be a
+    fabrication: the first draft of this computed `ceiling x 0.8 + shortfall` and produced +550
+    on a day whose IV-flat ceiling was +628 and which went on to pay +841 because vol fell.
+    Showing what each level REQUIRES lets the reader price the assumption instead of inheriting
+    mine.
+
+    The stop is expressed in NIFTY POINTS, as a fraction of the breach band, because a fixed
+    rupee stop is a moving spot threshold: Rs2,000 is ~68 points at 1 DTE and ~151 at 7 DTE, so
+    the same number is a hair-trigger on one day and unreachable on another. Measured 2026-08-31
+    after a -Rs1,500 stop fired on an 18-point move.
+
+    At low DTE it recommends NO stop and half size instead, per backlog #17: on the seven
+    replayed 1-DTE days every stop level fired on 3-4 of 7 and was wrong 2-3 times, because
+    rupees-per-point is highest there. The precaution that survives the data is size.
+    """
+    rows = []
+    for shift, label in ((0.0, "IV flat"), (-0.0025, "IV -0.25pp"), (-0.005, "IV -0.50pp")):
+        iv2 = {k: max(v + shift, 1e-6) for k, v in ivs.items()}
+        pj = projection(legs, atm, T_exit, iv2, charges_fn)
+        rows.append((label, pj["ceiling"] if pj else None))
+
+    base = net_at(legs, price_all(legs, spot, T_exit, ivs), charges_fn)
+    bumped = net_at(legs, price_all(legs, spot + 20, T_exit, ivs), charges_fn)
+    per_pt = abs(bumped - base) / 20 or 1e-9
+    band_pts = (breach_hi - breach_lo) / 2
+    stop_pts = stop_frac * band_pts
+    return {"ladder": rows, "per_pt": per_pt, "stop_pts": stop_pts,
+            "stop_rupees": -per_pt * stop_pts, "shortfall": fill_shortfall,
+            "low_dte": dte is not None and dte <= 2}
+
+
+def format_exit_advice(adv, dte, md=lambda s: s):
+    """Render exit_advice() for Telegram. Kept separate so the numbers can be tested
+    without parsing a message."""
+    L = ["", "💡 *Suggested exits*", f"Reachable by the square-off, pinned at the golden point:"]
+    for label, ceil in adv["ladder"]:
+        L.append(f"   {label:<11} → {ceil:+,.0f}" if ceil is not None else f"   {label:<11} → n/a")
+    flat = adv["ladder"][0][1]
+    if flat is not None:
+        L.append(f"➜ arm ~₹{adv['shortfall']:.0f} ABOVE what you want banked "
+                 f"(measured fill shortfall)")
+        if flat <= 0:
+            L.append("⚠ no profitable spot at this IV — theta alone will not get there")
+    if adv["low_dte"]:
+        L += [f"➜ *No stop* at {dte} DTE — a rupee stop is only "
+              f"~{2000/adv['per_pt']:.0f} pts here and fires on noise.",
+              "   Use half size instead (backlog #17)."]
+    else:
+        L.append(f"➜ Stop ≈ *{adv['stop_rupees']:+,.0f}*  "
+                 f"(= {adv['stop_pts']:.0f} NIFTY pts, 60% of the breach band)")
+    L.append(md(f"_₹{adv['per_pt']:,.0f} per NIFTY point at {dte} DTE · model holds IV flat_"))
+    return L
 
 
 def material_change(prev, cur, net_delta=400.0, iv_delta_pp=0.15):

@@ -144,6 +144,16 @@ STATUS_REQUEST_FILE = Path(os.getenv("STATUS_REQUEST_FILE",
                                          / "log" / "straddle_status_request.json")))
 STATUS_REQUEST_MAX_AGE = int(os.getenv("STATUS_REQUEST_MAX_AGE", "120"))
 
+# /straddle lots — per-day size override. MAX is a guard against a fat-finger, not a margin
+# calculation: the broker rejects an unaffordable basket anyway, but a mistyped "20" should be
+# refused here rather than sent. 1-DTE days default to half size (see DTE_HALF_SIZE below).
+LOTS_MIN = int(os.getenv("LOTS_MIN", "1"))
+LOTS_MAX = int(os.getenv("LOTS_MAX", "6"))
+# backlog #17, measured 2026-09-01: 1 DTE has the HIGHEST mean of any bucket but 1.70x the
+# volatility, and tight stops make it worse (they fire on noise because rupees-per-point is
+# highest there). The precaution that survives the data is SIZE, so halve it by default.
+DTE_HALF_SIZE = int(os.getenv("DTE_HALF_SIZE", "2"))     # halve at or below this DTE; 0 = off
+
 SQUAREOFF_LATEST = os.getenv("SQUAREOFF_LATEST", "15:12")
 SQUAREOFF_EARLIEST = os.getenv("SQUAREOFF_EARLIEST", "09:40")
 SQUAREOFF_HOUR = int(os.getenv("SQUAREOFF_HOUR", "15"))
@@ -292,6 +302,7 @@ class ShortStraddleBot:
         self.tg_cmd_mtime = None        # mtime of the last command file we parsed
         self.tg_armed_log = []          # every arm/disarm this session, for the journal
         self.tg_squareoff = None        # (h, m) from /stradexit time, today only
+        self._day_cfg = {}              # /straddle lots|skip for today, read once at entry
         self._status_next = None        # when the next periodic status is due
         self._status_prev = None        # last SENT snapshot, for suppress-if-unchanged
         self._status_req_mtime = None   # last on-demand request we served
@@ -699,6 +710,9 @@ class ShortStraddleBot:
 
         mode = "iron butterfly" if ENABLE_HEDGE else "short straddle"
         self._entry_retryable = False   # set True only for clearly transient broker failures
+        # Size is fixed HERE: after the expiry (and therefore traded_dte) is known, and before
+        # a single order leaves. Idempotent, so the entry-retry loop cannot double-apply it.
+        self._apply_day_size(getattr(self, "_day_cfg", {}) or {})
         log(f"[ENTRY] Placing ATM {mode} — expiry {expiry}, qty {QUANTITY}")
 
         legs = [
@@ -1205,6 +1219,63 @@ class ShortStraddleBot:
         return would corrupt it (2026-08-14: +5.59% on defined risk vs the true +1.07%).
         """
         return self.margin_blocked
+
+    def _read_day_config(self):
+        """`/straddle lots N` and `/straddle skip` for TODAY. Never raises.
+
+        Day-scoped exactly like /stradexit: a payload dated anything but today is ignored, so
+        yesterday's skip cannot silently cancel this morning's trade. Read ONCE at the entry
+        decision, not in the monitor loop — these are entry parameters, and re-reading them
+        mid-session could change QUANTITY after orders were placed.
+        """
+        out = {"lots": None, "skip": False}
+        try:
+            if not STRADEXIT_FILE.exists():
+                return out
+            d = json.loads(STRADEXIT_FILE.read_text())
+            if d.get("date") != datetime.now().strftime("%Y-%m-%d"):
+                return out
+            raw = d.get("lots")
+            if raw is not None:
+                try:
+                    n = int(raw)
+                    if LOTS_MIN <= n <= LOTS_MAX:
+                        out["lots"] = n
+                    else:
+                        log(f"[STRADDLE] ignoring lots={raw} — outside {LOTS_MIN}..{LOTS_MAX}")
+                except (TypeError, ValueError):
+                    log(f"[STRADDLE] ignoring lots={raw!r} — not an integer")
+            out["skip"] = bool(d.get("skip"))
+        except Exception as e:
+            log(f"[STRADDLE] day-config read skipped (non-fatal): {e}")
+        return out
+
+    def _apply_day_size(self, cfg):
+        """Set the day's size, then freeze it. Returns a short reason string for the log.
+
+        Mutates the MODULE globals rather than threading a parameter through 41 call sites.
+        That is deliberate and it is safe here for a specific reason: QUANTITY is referenced at
+        module level only in its own definition — every other use is inside a function and so
+        reads the global at call time. Verified with an AST walk, and asserted by
+        test_straddle_cmds.py. The alternative, editing 41 sites, is where a missed reference
+        silently trades the wrong size.
+
+        Called ONCE, before any order is placed, and never again that day.
+        """
+        global LOTS, QUANTITY
+        want, why = LOTS, None
+        auto = None
+        if DTE_HALF_SIZE and self.traded_dte is not None and self.traded_dte <= DTE_HALF_SIZE:
+            auto = max(LOTS_MIN, LOTS // 2)
+            want, why = auto, f"{self.traded_dte} DTE -> half size (backlog #17)"
+        if cfg.get("lots") is not None:
+            want = cfg["lots"]
+            why = (f"/straddle lots {want}" + (f" (overrides the {auto}-lot 1-DTE default)"
+                                               if auto is not None and auto != want else ""))
+        if want != LOTS:
+            LOTS, QUANTITY = want, LOT_SIZE * want
+            log(f"[STRADDLE] size for today: {LOTS} lot(s) x {LOT_SIZE} = {QUANTITY} qty — {why}")
+        return why
 
     def _squareoff_at(self, now, offset_min=0):
         """Square-off instant, honouring a `/stradexit time` override for TODAY.
@@ -2012,7 +2083,18 @@ class ShortStraddleBot:
 
                     self.entry_done_today = True
 
-                    if self.check_consecutive_sl():
+                    # /straddle skip and /straddle lots — read once, here, before anything is
+                    # ordered. Checked FIRST so a manual skip beats every automatic gate and
+                    # the log says plainly that a human made the call.
+                    _cfg = self._read_day_config()
+                    self._day_cfg = _cfg
+                    if _cfg.get("skip"):
+                        log("[SKIP] /straddle skip — manual skip for today (strategy stays "
+                            "running and resumes tomorrow)")
+                        self._tg_notify(self._md(
+                            "⏭️ *Straddle skipped today* — `/straddle skip` was set.\n"
+                            "The strategy is still running and resumes automatically tomorrow."))
+                    elif self.check_consecutive_sl():
                         log("[SKIP] Consecutive SL cooldown — no trade today")
                     elif self.is_expiry_day():
                         log("[SKIP] Expiry day — no trade today")
