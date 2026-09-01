@@ -156,7 +156,28 @@ r = run(["skip"], path)
 ck("skip REFUSED after 09:35", load(path) == before and "Too late" in r, r[:60])
 tbs.ENTRY_HHMM = (9, 35)
 
-print("\n=== E. /stradexit still works alongside it ===")
+print("\n=== E. the day's size SURVIVES a mid-day restart ===")
+import tempfile as _tf
+sf = Path(_tf.mkdtemp()) / "state.json"
+ss.STATE_FILE = sf
+ss.LOTS, ss.QUANTITY = 1, 65                      # as if 1-DTE halving had applied
+b = ss.ShortStraddleBot.__new__(ss.ShortStraddleBot)
+for a, v in (("is_positioned", True), ("ce_symbol", "X"), ("pe_symbol", "Y"),
+             ("ce_entry_price", 1.0), ("pe_entry_price", 1.0), ("total_premium", 1.0),
+             ("entry_done_today", True), ("hedge_ce_symbol", "A"), ("hedge_pe_symbol", "B"),
+             ("hedge_ce_price", 1.0), ("hedge_pe_price", 1.0), ("atm_strike", 24000)):
+    setattr(b, a, v)
+b.save_state()
+ck("state file records the day's lots", json.loads(sf.read_text()).get("lots") == 1,
+   json.loads(sf.read_text()))
+ss.LOTS, ss.QUANTITY = 2, 130                     # simulate the respawn at the env default
+b2 = ss.ShortStraddleBot.__new__(ss.ShortStraddleBot)
+b2.load_state()
+ck("restart restores 1 lot, not the default 2", (ss.LOTS, ss.QUANTITY) == (1, 65),
+   (ss.LOTS, ss.QUANTITY))
+ss.LOTS, ss.QUANTITY = 2, 130
+
+print("\n=== F. /stradexit still works alongside it ===")
 path.write_text(json.dumps({"lots": 1, "skip": False, "date": TODAY}))
 svc = tbs.TelegramBotService.__new__(tbs.TelegramBotService)
 svc._get_sdk_client = lambda uid: None

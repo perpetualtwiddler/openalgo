@@ -364,6 +364,15 @@ class ShortStraddleBot:
                 "hedge_ce_price": self.hedge_ce_price,
                 "hedge_pe_price": self.hedge_pe_price,
                 "atm_strike": self.atm_strike,
+                # The day's SIZE must survive a restart. Without it a respawn after a halved
+                # 1-DTE entry comes back at the default 2 lots against a real 65-qty position,
+                # and every QUANTITY-derived number doubles: P&L, the charge estimate, the
+                # status message, and — the dangerous one — the NET that /stradexit compares
+                # its target and stop against. Order placement itself is safe (close_straddle
+                # sizes from get_open_quantities()), so this is a reporting-and-trigger bug,
+                # not a naked-leg one. Found 2026-09-01 when Mandar asked whether the 1-DTE
+                # auto-halving resets the next day.
+                "lots": LOTS,
             }
             STATE_FILE.write_text(json.dumps(state))
             log(f"[STATE] Saved: positioned={self.is_positioned}")
@@ -371,6 +380,7 @@ class ShortStraddleBot:
             log(f"[STATE ERROR] Save failed: {e}")
 
     def load_state(self):
+        global LOTS, QUANTITY   # a restart must resume at the SIZE we actually traded
         try:
             if not STATE_FILE.exists():
                 return
@@ -386,6 +396,11 @@ class ShortStraddleBot:
             self.pe_entry_price = state.get("pe_entry_price", 0.0)
             self.total_premium = state.get("total_premium", 0.0)
             self.entry_done_today = state.get("entry_done_today", False)
+            _saved_lots = state.get("lots")
+            if _saved_lots and int(_saved_lots) != LOTS:
+                LOTS, QUANTITY = int(_saved_lots), LOT_SIZE * int(_saved_lots)
+                log(f"[STATE] restored today's size: {LOTS} lot(s) = {QUANTITY} qty "
+                    f"(a restart would otherwise have resumed at the {LOTS_MIN and ''}default)")
             self.hedge_ce_symbol = state.get("hedge_ce_symbol")
             self.hedge_pe_symbol = state.get("hedge_pe_symbol")
             self.atm_strike = state.get("atm_strike")
