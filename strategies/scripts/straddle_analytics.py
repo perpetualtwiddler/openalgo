@@ -302,14 +302,31 @@ def exit_advice(*, legs, spot, atm, dte, T_now, T_exit, ivs, charges_fn,
         pj = projection(legs, atm, T_exit, iv2, charges_fn)
         rows.append((label, pj["ceiling"] if pj else None))
 
-    base = net_at(legs, price_all(legs, spot, T_exit, ivs), charges_fn)
-    bumped = net_at(legs, price_all(legs, spot + 20, T_exit, ivs), charges_fn)
-    per_pt = abs(bumped - base) / 20 or 1e-9
     band_pts = (breach_hi - breach_lo) / 2
     stop_pts = stop_frac * band_pts
+
+    # The stop is priced AT the stop distance, on the RUNNING curve (T_now) -- not by
+    # extrapolating a local slope, and not on the exit curve. Both were wrong in the first
+    # version (found live 2026-09-02):
+    #   * the payoff is CONVEX, and the slope was sampled 20 pts from the golden point where
+    #     the curve is flattest, so a straight line from there understated the loss at 79 pts
+    #     by ~1.9x (-348 quoted vs -666 real). An arm at the quoted figure would have fired at
+    #     ~45 points of movement instead of 79 -- back inside the noise band that #16 exists
+    #     to avoid.
+    #   * /stradexit compares the RUNNING net, so the stop must be evaluated at T_now. The
+    #     take-profit ladder is about net at the square-off and correctly uses T_exit.
+    # Takes the WORSE of the two directions, because a stop must hold on either side.
+    now_base = net_at(legs, price_all(legs, spot, T_now, ivs), charges_fn)
+    up = net_at(legs, price_all(legs, spot + stop_pts, T_now, ivs), charges_fn)
+    dn = net_at(legs, price_all(legs, spot - stop_pts, T_now, ivs), charges_fn)
+    stop_rupees = min(up, dn)
+
+    # Still report a per-point figure for context, but measure it over the WHOLE stop distance
+    # rather than a 20-point tangent, so it is an average gradient and not a peak-local one.
+    per_pt = abs(stop_rupees - now_base) / stop_pts if stop_pts else 1e-9
     return {"ladder": rows, "per_pt": per_pt, "stop_pts": stop_pts,
-            "stop_rupees": -per_pt * stop_pts, "shortfall": fill_shortfall,
-            "low_dte": dte is not None and dte <= 2}
+            "stop_rupees": stop_rupees, "now_net": now_base,
+            "shortfall": fill_shortfall, "low_dte": dte is not None and dte <= 2}
 
 
 def format_exit_advice(adv, dte, md=lambda s: s):
@@ -330,8 +347,9 @@ def format_exit_advice(adv, dte, md=lambda s: s):
               "   Use half size instead (backlog #17)."]
     else:
         L.append(f"➜ Stop ≈ *{adv['stop_rupees']:+,.0f}*  "
-                 f"(= {adv['stop_pts']:.0f} NIFTY pts, 60% of the breach band)")
-    L.append(md(f"_₹{adv['per_pt']:,.0f} per NIFTY point at {dte} DTE · model holds IV flat_"))
+                 f"(net if spot moves {adv['stop_pts']:.0f} pts — 60% of the breach band)")
+    L.append(md(f"_avg ₹{adv['per_pt']:,.0f}/NIFTY pt over that distance · {dte} DTE · "
+                f"IV held flat_"))
     return L
 
 

@@ -14,6 +14,12 @@ def ck(n, c, d=""):
 req = Path("/tmp/status_req.json")
 if req.exists(): req.unlink()
 ss.STATUS_REQUEST_FILE = req
+# _maybe_status() now calls _log_pit(), so this suite would otherwise append its 08-20 fixture
+# rows straight into the PRODUCTION log/pit_snapshots.csv -- which it did, 7 times, before
+# being caught on 2026-09-02. Any test that exercises a method must redirect EVERY side effect
+# that method has acquired, including ones added after the test was written.
+import tempfile as _tf
+ss.PIT_CSV = Path(_tf.mkdtemp()) / "pit.csv"
 
 def bot(marks, now, tp=None):
     b = ss.ShortStraddleBot.__new__(ss.ShortStraddleBot)

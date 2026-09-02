@@ -67,5 +67,53 @@ ck("missing expiry -> no row, no exception", len(list(csv.DictReader(open(tmp)))
 b.traded_expiry="08-SEP-26"; ss.PIT_CSV=Path("/nonexistent-dir-xyz/pit.csv")
 b._log_pit(datetime(2026,9,1,11,30), 24064.95, 347.0, "periodic")
 ck("unwritable path -> swallowed", True)
+# ---------------------------------------------------------------------------------------
+# Regression for #23: the quoted stop must equal the ACTUAL net at the stop distance.
+# The first implementation linearised a convex payoff from a tangent taken 20 pts out, beside
+# the golden point where the curve is flattest, and understated the loss at 79 pts by ~1.9x
+# (-348 quoted vs -666 real). It also priced the stop on the exit-time curve when /stradexit
+# compares the RUNNING net. This is the property any linearisation breaks.
+print("\n=== E. #23 — the stop must be PRICED at the distance, not extrapolated ===")
+adv = sa.exit_advice(legs=legs, spot=kw["spot"], atm=kw["atm"], dte=kw["dte"],
+                     T_now=sa.years_to(kw["exp"], kw["now"]),
+                     T_exit=sa.years_to(kw["exp"], kw["exit_at"]),
+                     ivs=sa.leg_ivs(legs, kw["spot"], sa.years_to(kw["exp"], kw["now"])),
+                     charges_fn=CH, breach_lo=kw["breach_lo"], breach_hi=kw["breach_hi"])
+T_now = sa.years_to(kw["exp"], kw["now"])
+ivs_now = sa.leg_ivs(legs, kw["spot"], T_now)
+sp = adv["stop_pts"]
+up = sa.net_at(legs, sa.price_all(legs, kw["spot"] + sp, T_now, ivs_now), CH)
+dn = sa.net_at(legs, sa.price_all(legs, kw["spot"] - sp, T_now, ivs_now), CH)
+ck("stop == actual net at +/-stop_pts (worse side)",
+   abs(adv["stop_rupees"] - min(up, dn)) < 1.0, (adv["stop_rupees"], min(up, dn)))
+ck("stop is priced on the RUNNING curve, not the exit curve",
+   abs(adv["stop_rupees"] - min(up, dn)) < abs(adv["stop_rupees"] - min(
+       sa.net_at(legs, sa.price_all(legs, kw["spot"] + sp, sa.years_to(kw["exp"], kw["exit_at"]), ivs_now), CH),
+       sa.net_at(legs, sa.price_all(legs, kw["spot"] - sp, sa.years_to(kw["exp"], kw["exit_at"]), ivs_now), CH))) + 1e-9)
+base_now = sa.net_at(legs, sa.price_all(legs, kw["spot"], T_now, ivs_now), CH)
+tangent = abs(sa.net_at(legs, sa.price_all(legs, kw["spot"] + 20, T_now, ivs_now), CH) - base_now) / 20
+# The tangent method only fails BADLY near the golden point, where the payoff is flattest.
+# 65 pts away (as in this fixture) it happens to be a decent approximation, so asserting the
+# two methods differ HERE would be position-dependent and meaningless. Test it where the bug
+# actually lived: place spot ON the golden point and show the tangent understates materially
+# while ours does not. This is the case that shipped wrong on 2026-09-02.
+pj_g = sa.projection(legs, kw["atm"], sa.years_to(kw["exp"], kw["exit_at"]), ivs_now, CH)
+g_spot = float(pj_g["golden"])
+ivs_g = sa.leg_ivs(legs, g_spot, T_now)
+adv_g = sa.exit_advice(legs=legs, spot=g_spot, atm=kw["atm"], dte=kw["dte"], T_now=T_now,
+                       T_exit=sa.years_to(kw["exp"], kw["exit_at"]), ivs=ivs_g, charges_fn=CH,
+                       breach_lo=kw["breach_lo"], breach_hi=kw["breach_hi"])
+g_base = sa.net_at(legs, sa.price_all(legs, g_spot, T_now, ivs_g), CH)
+g_tan = abs(sa.net_at(legs, sa.price_all(legs, g_spot + 20, T_now, ivs_g), CH) - g_base) / 20
+g_up = sa.net_at(legs, sa.price_all(legs, g_spot + adv_g["stop_pts"], T_now, ivs_g), CH)
+g_dn = sa.net_at(legs, sa.price_all(legs, g_spot - adv_g["stop_pts"], T_now, ivs_g), CH)
+g_real = min(g_up, g_dn)
+ck("AT the golden point, stop is still the real net", abs(adv_g["stop_rupees"] - g_real) < 1.0,
+   (adv_g["stop_rupees"], g_real))
+ck("  ... and the old tangent method WOULD have understated it materially",
+   abs(g_real - g_base) > 1.4 * abs(g_tan * adv_g["stop_pts"]),
+   (f"real move {g_real - g_base:+.0f}", f"tangent {-g_tan * adv_g['stop_pts']:+.0f}"))
+ck("stop_pts is 60% of the breach half-band",
+   abs(sp - 0.60 * (kw["breach_hi"] - kw["breach_lo"]) / 2) < 0.01, sp)
 print(f"\n  ════ {P[0]} passed · {P[1]} FAILED ════")
 sys.exit(1 if P[1] else 0)
