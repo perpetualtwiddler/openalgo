@@ -49,6 +49,12 @@
 !status_check.py
 !trade_analytics_xlsx.py
 
+# Forward-looking exit model + its calibration harness. Analysis only -- neither is
+# imported by the live strategy, the bot or any timer. They read the captured chain from
+# /root/data/zerodha/trade-data and embed no trade data of their own.
+!forward_model.py
+!forward_calibration.py
+
 # Keep docs
 !STRATEGIES.md
 
