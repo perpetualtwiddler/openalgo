@@ -101,3 +101,28 @@ log/opening_cash.txt
 
 # PIT snapshots — live position state, never in git (public fork)
 log/pit_snapshots.csv
+
+# Fill-level broker tradebook archives — the single most sensitive artefact we hold:
+# real order ids, per-leg fill prices and quantities. The mkds remote is a PUBLIC fork,
+# so these live only in the local-only trading-ledger repo (see ledger_snapshot.sh).
+log/tradebook/
+
+# Analysis workbooks. trade_analytics.xlsx embeds per-leg fill prices, broker margins and
+# — via the Projection corpus formula — the account's opening balance. Regenerable from
+# trade_journal.csv by trade_analytics_xlsx.py, so there is no reason to track it here.
+# The growth model is the deliberate exception: its inputs are round hypotheticals
+# (Rs50,00,000 initial), never the real account, so it is safe on a public remote.
+*.xlsx
+!log/straddle-income-growth-analysis.xlsx
+~$*.xlsx
+*.xlsx:Zone.Identifier
+*.csv:Zone.Identifier
+
+# Stray process output that can contain positions, order ids and API responses.
+nohup.out
+log/nohup.out
+
+# Local debug launcher — carries OPENALGO_API_KEY inline so it can invoke the strategy
+# outside the host. Never on a public remote. (Backlog #7c covers moving keys out of
+# scripts generally; this rule stops the accident in the meantime.)
+strategies/scripts/run_straddle_debug.sh

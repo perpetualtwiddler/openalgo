@@ -128,16 +128,22 @@ def _legs_from_tradebook(date, short_syms):
     Opening side is inferred from the leg's role: ATM shorts open on SELL and close on BUY;
     the wings open on BUY and close on SELL.
 
-    Returns (entry_prices, exit_prices, n_orders, n_fills) — empty dicts if no archive.
+    Also returns the timestamp of the LAST closing fill. A manual close writes no [EXIT]
+    lines, so the log-parsing path leaves exit_time blank on exactly the days #21 needs it
+    most — those are the "reviewed the ladder and chose" baseline. The fills carry the real
+    time (2026-09-03: 15:08:38-15:08:50), so take it from here when the log has none.
+
+    Returns (entry_prices, exit_prices, n_orders, n_fills, exit_time) — empty if no archive.
     """
     p = os.path.join(TRADEBOOK_DIR, f"{date}.json")
     if not os.path.exists(p):
-        return {}, {}, 0, 0
+        return {}, {}, 0, 0, ""
     tb = json.load(open(p)).get("trades") or []
     if not tb:
-        return {}, {}, 0, 0
+        return {}, {}, 0, 0, ""
     acc = {}
     oids = set()
+    out_ts = []
     for t in tb:
         sym = t.get("symbol") or ""
         act = (t.get("action") or "").upper()
@@ -146,12 +152,18 @@ def _legs_from_tradebook(date, short_syms):
         if t.get("orderid"):
             oids.add(str(t["orderid"]))
         opening = (act == "SELL") if sym in short_syms else (act == "BUY")
+        if not opening:
+            ts = str(t.get("timestamp") or t.get("fill_timestamp") or "")
+            # Guard the format rather than trust it: a max() over mixed or malformed
+            # strings would silently pick a nonsense "latest".
+            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", ts):
+                out_ts.append(ts)
         d = acc.setdefault((sym, "in" if opening else "out"), [0, 0.0])
         d[0] += qty
         d[1] += qty * px
     ent = {s: round(v / q, 3) for (s, side), (q, v) in acc.items() if side == "in" and q}
     ex = {s: round(v / q, 3) for (s, side), (q, v) in acc.items() if side == "out" and q}
-    return ent, ex, len(oids), len(tb)
+    return ent, ex, len(oids), len(tb), (max(out_ts) if out_ts else "")
 
 
 def _exit_from_tradebook(date, short_syms):
@@ -382,12 +394,14 @@ def build(date):
     # log/slippage values when no archive exists (days before archive_tradebook.py).
     tb_orders = tb_fills = 0
     shorts = {s for k, s in pairs[:2] if s}
-    tb_ent, tb_ex, tb_orders, tb_fills = _legs_from_tradebook(date, shorts)
+    tb_ent, tb_ex, tb_orders, tb_fills, tb_exit_at = _legs_from_tradebook(date, shorts)
     if tb_ex:
         manual = not ex                       # no [EXIT] lines => closed outside our code
         if tb_ent:
             ent = {**ent, **tb_ent}
         ex = {**ex, **tb_ex}
+        if not r.get("exit_time") and tb_exit_at:
+            r["exit_time"] = tb_exit_at       # manual close: the fills are the only record
         if manual:
             r["exit_reason"] = r["exit_reason"] or "MANUAL_ZERODHA"
             r["notes"] = ("exit fills recovered from the archived broker tradebook "

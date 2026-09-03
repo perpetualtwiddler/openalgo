@@ -10,11 +10,13 @@ its P&L reconstructed from a number read off a screen rather than from fills.
 
 Running this daily makes every day fill-verifiable regardless of HOW it was closed —
 strategy square-off, breach exit, or a manual click. trade_journal.py reads these archives
-as its exit-price fallback (see _exit_from_tradebook).
+as its exit-price fallback (see _legs_from_tradebook).
 
-Stores the raw broker payload, unmodified, plus the order count — because brokerage is
-billed per ORDER, not per fill, and a leg can partial-fill (2026-08-14: 11 fills / 8
-orders; billing the fills would have overstated charges by Rs70.80).
+Stores the raw broker payload, unmodified, plus two counts. `n_orders` is the number of
+distinct order ids among the FILLS — brokerage is billed per ORDER, not per fill, and a leg
+can partial-fill (2026-08-14: 11 fills / 8 orders; billing the fills would have overstated
+charges by Rs70.80). `n_orderbook_rows` is the orderbook's own row count, kept separately
+because a divergence flags rows that never filled or a session closed by hand.
 
 Usage:
     python archive_tradebook.py            # today -> log/tradebook/YYYY-MM-DD.json
@@ -50,18 +52,38 @@ def main(argv):
     ob = client.orderbook().get("data") or {}
     orders = (ob.get("orders") if isinstance(ob, dict) else ob) or []
 
+    # Brokerage is billed per ORDER, so the count that matters is the number of distinct
+    # order ids AMONG THE FILLS — not the orderbook's row count. The two diverge whenever
+    # the orderbook holds rows that never filled (rejects, cancels) or that the strategy
+    # did not place: on a day closed by hand in the Zerodha app the manual exits appear as
+    # extra rows, which is why 2026-08-14 and 2026-09-03 were archived as 10 orders when
+    # only 8 were billable. charges._group_orders() groups by orderid for this same reason,
+    # so P&L was never affected — but this file is the only surviving fill-level record,
+    # and a reader taking n_orders at face value would over-bill brokerage by Rs20/order.
+    billable = {t.get("orderid") or t.get("order_id") for t in trades}
+    billable.discard(None)
+    billable.discard("")
+    # If the payload carries no order ids at all, fall back to one-order-per-fill — the same
+    # convention charges._group_orders() uses, so the two never disagree. Writing 0 here
+    # would silently zero the brokerage a future reader computes from this file.
+    n_billable = len(billable) if billable else len(trades)
+
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"{date}.json")
     payload = {
         "date": date,
         "captured_at": datetime.now(IST).isoformat(),
-        "n_orders": len(orders),
+        "n_orders": n_billable,
         "n_fills": len(trades),
+        # Kept because a divergence from n_orders is a useful tell: unfilled/rejected rows,
+        # or a session closed manually rather than by the strategy.
+        "n_orderbook_rows": len(orders),
         "trades": trades,
     }
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2)
-    print(f"[ok] {date}: archived {len(trades)} fills / {len(orders)} orders -> {path}")
+    print(f"[ok] {date}: archived {len(trades)} fills / {n_billable} billable orders "
+          f"({len(orders)} orderbook rows) -> {path}")
 
     if "--print" in argv:
         legs = {}
